@@ -50,6 +50,10 @@ SCROLL_FONT = "digits"   # "digits" = the clock's own 3x5 glyphs (matches
                          # built-in 5x7 font that upstream scrolled with
 SPEAKER_VOLUME = 100     # 0..200. The firmware powers up at full blast;
                          # 150 was still "very high" here, 100 is half.
+DISPLAY_BRIGHTNESS = 255 # the matrix's own brightness (0..255). The firmware
+                         # boots at 65, which multiplies with the dimming
+                         # curve: at 65 a brightness of 0.5 is really 13%.
+                         # Set it here so the ambient curve is the only knob.
 
 # --- CPU-temperature chart on the LCD (bottom button) ----------------------
 TEMP_SAMPLE_SECONDS = 10  # take a sample this often

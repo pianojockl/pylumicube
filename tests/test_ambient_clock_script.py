@@ -39,6 +39,7 @@ class FakeDisplay:
         self.scrolls: list[tuple[str, int, float]] = []
         self.scrolled_pixels: list[tuple[list[list[int]], float]] = []
         self.fills: list[int] = []
+        self.brightness: list[int] = []
         self.flushes = 0
 
     def set_panel(self, panel, rows, show=True):
@@ -52,6 +53,9 @@ class FakeDisplay:
 
     def set_all(self, colour, show=True):
         self.fills.append(colour)
+
+    def set_brightness(self, value, **kwargs):
+        self.brightness.append(int(value))
 
     def flush(self, timeout=None):
         self.flushes += 1
@@ -406,6 +410,19 @@ def test_speaker_volume_is_pinned_at_startup(monkeypatch) -> None:
     speaker = FakeSpeaker()
     _clock(speaker=speaker)
     assert speaker.volume == 80
+
+
+def test_display_brightness_is_set_at_startup(monkeypatch) -> None:
+    """The firmware boots the matrix at 65/255, which would scale 0.5 to 13%."""
+    monkeypatch.setattr(clock, "DISPLAY_BRIGHTNESS", 255)
+    instance, cube, _curve = _clock()
+    assert cube.display.brightness == [255]
+
+
+def test_display_brightness_can_be_left_alone(monkeypatch) -> None:
+    monkeypatch.setattr(clock, "DISPLAY_BRIGHTNESS", None)
+    instance, cube, _curve = _clock()
+    assert cube.display.brightness == []
 
 
 def test_speaker_driver_wins_over_the_telemetry_namespace(monkeypatch) -> None:

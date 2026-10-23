@@ -84,6 +84,9 @@ SCROLL_SPEED = 0.7
 SCROLL_FONT = "digits"     # "digits" = the clock's own 3x5 glyphs;
                            # "firmware" = the built-in 5x7 font (taller)
 SPEAKER_VOLUME = 100       # 0..200; the firmware powers up loud, so set it
+DISPLAY_BRIGHTNESS = 255   # the matrix's own brightness (0..255): the firmware
+                           # boots at 65, which multiplies with the dimming
+                           # below — 0.5 brightness then means 13%, not 50%
 
 # CPU-temperature chart on the secondary LCD (bottom button).
 TEMP_SAMPLE_SECONDS = 10   # one sample this often
@@ -105,8 +108,9 @@ LIGHT_LOG = os.path.join(
 CONFIG_NAMES = ("BRIGHTNESS_MIN", "BRIGHTNESS_MAX", "GAMMA", "SMOOTHING", "ADAPT",
                 "LOW", "HIGH", "HUE_FOLLOWS_HOUR", "HUE", "SATURATION", "JITTER",
                 "ALLOW_REBOOT", "HOURLY_SCROLL", "HOURLY_SPEAK", "SCROLL_SPEED",
-                "SCROLL_FONT", "SPEAKER_VOLUME", "TEMP_SAMPLE_SECONDS",
-                "TEMP_HISTORY", "CHART_REFRESH", "STATUS_INTERVAL", "LIGHT_LOG")
+                "SCROLL_FONT", "SPEAKER_VOLUME", "DISPLAY_BRIGHTNESS",
+                "TEMP_SAMPLE_SECONDS", "TEMP_HISTORY", "CHART_REFRESH",
+                "STATUS_INTERVAL", "LIGHT_LOG")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = os.path.join(_HERE, "ambient_clock_config.py")
@@ -264,6 +268,23 @@ class AmbientClock:
         self._chart_mode = False
         self._chart_refresh_at: datetime.datetime | None = None
         self._configure_speaker()
+        self._configure_display()
+
+    def _configure_display(self) -> None:
+        """Set the matrix's own brightness, which the dimming multiplies with.
+
+        The firmware boots it at 65/255, so a per-pixel brightness of 0.5
+        lands at 13% — dim enough to look broken in a dark room. Setting it
+        here (once, at startup) keeps the ambient response as the only
+        thing varying.
+        """
+        if DISPLAY_BRIGHTNESS is None:
+            return
+        try:
+            self.cube.display.set_brightness(int(DISPLAY_BRIGHTNESS))
+            log.info("display brightness set to %s", DISPLAY_BRIGHTNESS)
+        except Exception:  # noqa: BLE001 — the clock still tells the time
+            log.warning("could not set the display brightness", exc_info=True)
 
     def _configure_speaker(self) -> None:
         """Pin the volume: the firmware powers up at full blast."""
