@@ -68,9 +68,48 @@ class FakeModule:
         return self.values.get(name)
 
 
+class FakeScreen:
+    """Records what the CPU-temperature chart draws on the LCD."""
+
+    def __init__(self, width: int = 320, height: int = 240) -> None:
+        self.max_width = width
+        self.max_height = height
+        self.rectangles: list[tuple[int, int, int, int, int]] = []
+        self.texts: list[tuple[int, int, str]] = []
+        self.clears: list[int] = []
+
+    def clear(self, colour: int = 0) -> None:
+        self.clears.append(colour)
+        self.rectangles.append((0, 0, self.max_width, self.max_height, colour))
+
+    def draw_rectangle(self, x, y, width, height, colour=0xFFFFFF) -> None:
+        self.rectangles.append((x, y, width, height, colour))
+
+    def write_text(self, x, y, text, size=1, colour=0xFFFFFF,
+                   background_colour=0) -> None:
+        self.texts.append((x, y, text))
+
+    @property
+    def written(self) -> list[str]:
+        return [text for _x, _y, text in self.texts]
+
+
+class FakeSpeaker:
+    """Stands in for the native `Speaker` driver."""
+
+    def __init__(self) -> None:
+        self.volume: int | None = None
+        self.said: list[str] = []
+
+    def say(self, text: str) -> None:
+        self.said.append(text)
+
+
 class FakeCube:
-    def __init__(self, modules=None) -> None:
+    def __init__(self, modules=None, *, screen=None, speaker=None) -> None:
         self.display = FakeDisplay()
+        self.screen = screen
+        self.speaker = speaker
         self._modules = dict(modules or {})
 
     @property
@@ -79,7 +118,7 @@ class FakeCube:
 
 
 def _clock(modules=None, **kwargs):
-    cube = FakeCube(modules)
+    cube = FakeCube(modules, **kwargs)
     curve = clock.build_curve()
     return clock.AmbientClock(cube, brightness=curve), cube, curve
 
@@ -252,15 +291,73 @@ def test_middle_button_does_nothing_when_reboot_is_disabled(monkeypatch) -> None
     assert calls == []
 
 
-def test_bottom_button_logs_the_temperature(caplog) -> None:
+def test_bottom_button_draws_the_temperature_chart(monkeypatch) -> None:
+    monkeypatch.setattr(clock, "_cpu_temperature_c", lambda: 45.0)
+    screen = FakeScreen()
     buttons = FakeModule({"top_pressed_count": 0, "middle_pressed_count": 0,
                           "bottom_pressed_count": 0})
-    instance, _cube, _curve = _clock({"buttons": buttons})
-    instance.poll_buttons(datetime.datetime.now())
+    instance, _cube, _curve = _clock({"buttons": buttons}, screen=screen)
+    instance.poll_buttons(datetime.datetime.now())              # baseline
     buttons.values["bottom_pressed_count"] = 1
+    instance.poll_buttons(datetime.datetime.now())
+    assert screen.clears                              # LCD blanked first
+    assert any("CPU TEMPERATURE" in text for text in screen.written)
+    assert instance._chart_mode is True
+
+
+def test_bottom_button_toggles_the_chart_off_again(monkeypatch) -> None:
+    monkeypatch.setattr(clock, "_cpu_temperature_c", lambda: 45.0)
+    screen = FakeScreen()
+    buttons = FakeModule({"bottom_pressed_count": 0})
+    instance, _cube, _curve = _clock({"buttons": buttons}, screen=screen)
+    now = datetime.datetime.now()
+    instance.poll_buttons(now)
+    buttons.values["bottom_pressed_count"] = 1
+    instance.poll_buttons(now)
+    drawn = len(screen.rectangles)
+    buttons.values["bottom_pressed_count"] = 2
+    instance.poll_buttons(now)
+    assert instance._chart_mode is False
+    assert len(screen.clears) == 2                    # blanked again
+    assert len(screen.rectangles) == drawn + 1        # only the blanking fill
+
+
+def test_chart_plots_the_sample_history(monkeypatch) -> None:
+    temperatures = iter([40.0, 50.0, 45.0])
+    monkeypatch.setattr(clock, "_cpu_temperature_c", lambda: next(temperatures))
+    screen = FakeScreen()
+    instance, _cube, _curve = _clock(screen=screen)
+    now = datetime.datetime(2026, 10, 23, 14, 5)
+    for _ in range(3):
+        instance.sample_temperature(now, force=True)
+    assert instance.draw_temperature_chart() is True
+    assert any("now 45.0C" in text for text in screen.written)
+    assert any("min 40.0C" in text for text in screen.written)
+    # One column per sample, plus the frame and the two text rows.
+    assert len(screen.rectangles) == 1 + 1 + 4 + 3
+
+
+def test_chart_without_a_screen_only_logs(caplog) -> None:
+    instance, _cube, _curve = _clock()
     with caplog.at_level("INFO"):
-        instance.poll_buttons(datetime.datetime.now())
-    assert "temperature" in caplog.text.lower()
+        assert instance.draw_temperature_chart() is False
+    assert "no screen" in caplog.text
+
+
+def test_top_button_leaves_chart_mode(monkeypatch) -> None:
+    monkeypatch.setattr(clock, "_cpu_temperature_c", lambda: 45.0)
+    screen = FakeScreen()
+    buttons = FakeModule({"top_pressed_count": 0, "bottom_pressed_count": 0})
+    instance, cube, _curve = _clock({"buttons": buttons}, screen=screen)
+    now = datetime.datetime(2026, 10, 23, 14, 5)
+    instance.poll_buttons(now)
+    buttons.values["bottom_pressed_count"] = 1
+    instance.poll_buttons(now)
+    assert instance._chart_mode is True
+    buttons.values["top_pressed_count"] = 1
+    instance.poll_buttons(now)
+    assert instance._chart_mode is False
+    assert cube.display.scrolls                       # the top button still scrolls
 
 
 def test_say_without_a_speaker_only_logs(caplog) -> None:
@@ -268,6 +365,60 @@ def test_say_without_a_speaker_only_logs(caplog) -> None:
     with caplog.at_level("INFO"):
         instance.say("hello")
     assert "speaker unavailable" in caplog.text
+
+
+# ----- speaker driver ----------------------------------------------------
+
+
+def test_speaker_volume_is_pinned_at_startup(monkeypatch) -> None:
+    monkeypatch.setattr(clock, "SPEAKER_VOLUME", 80)
+    speaker = FakeSpeaker()
+    _clock(speaker=speaker)
+    assert speaker.volume == 80
+
+
+def test_speaker_driver_wins_over_the_telemetry_namespace(monkeypatch) -> None:
+    """The clock only subscribes to the sensor board: no `speaker` module."""
+    monkeypatch.setattr(clock, "_cpu_temperature_c", lambda: 45.0)
+    driver, module = FakeSpeaker(), FakeModule()
+    instance, _cube, _curve = _clock({"speaker": module}, speaker=driver)
+    instance.say("hello")
+    assert driver.said == ["hello"]
+    assert module.said == []
+
+
+# ----- configuration -----------------------------------------------------
+
+
+def test_apply_config_ignores_unknown_names() -> None:
+    class Config:
+        SPEAKER_VOLUME = 55
+        NOT_A_SETTING = 1
+
+    applied = clock.apply_config(Config(), source="test")
+    assert applied == ["SPEAKER_VOLUME"]
+
+
+def test_config_file_overrides_the_defaults(tmp_path, monkeypatch) -> None:
+    for name in clock.CONFIG_NAMES:                  # restored by monkeypatch
+        monkeypatch.setattr(clock, name, getattr(clock, name))
+    path = tmp_path / "clock_config.py"
+    path.write_text("SPEAKER_VOLUME = 42\nADAPT = False\nLOW = 10\nHIGH = 900\n")
+    assert clock.load_config(str(path)) == str(path)
+    assert clock.SPEAKER_VOLUME == 42
+    assert clock.ADAPT is False
+    assert (clock.LOW, clock.HIGH) == (10, 900)
+    assert clock.build_curve().adapt is False
+
+
+def test_missing_config_file_is_an_error(tmp_path) -> None:
+    with pytest.raises(SystemExit):
+        clock.load_config(str(tmp_path / "nope.py"))
+
+
+def test_sibling_config_is_optional() -> None:
+    """`scripts/ambient_clock_config.py` need not exist (only the example)."""
+    assert clock.load_config() in (None, clock.DEFAULT_CONFIG)
 
 
 # ----- hourly chime ------------------------------------------------------

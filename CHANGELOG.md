@@ -74,6 +74,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The compat shim now serves `screen` and `speaker` from the native drivers
   (`ScreenShim` / `SpeakerShim`), including upstream's convention that a
   relative image/audio path resolves against `~/Desktop`.
+- **`deploy/`** — a systemd user unit (`pylumicube-clock.service`) and a
+  step-by-step guide for running the clock on the cube instead of the Java
+  daemon: venv layout, settings in `~/.config/pylumicube/clock.py`, the
+  enable/disable dance, and how to roll back.
+- **`Speaker` starts at half volume** (`DEFAULT_VOLUME = 100`, not
+  `MAX_VOLUME`): the firmware powers up at full blast, which is far too
+  loud in a room. `Speaker(volume=...)`, the demo's `--volume` and the
+  clock's `SPEAKER_VOLUME` all override it.
+- **`LumiCube.enable_telemetry(subscribe_except=...)`** — walk a node's
+  field keys without subscribing to its telemetry stream, the configuration
+  that makes audio work; the compat shim uses it so a script that reads
+  sensors *and* speaks does not lose 3/4 of its audio throughput.
+- **The clock's bottom button draws a CPU-temperature chart on the LCD**,
+  with `TEMP_SAMPLE_SECONDS` / `TEMP_HISTORY` / `CHART_REFRESH` settings,
+  instead of only logging the reading. It toggles (any other button blanks
+  the LCD) and refreshes while shown — the community script it replaces
+  looped forever on that button and never came back to the clock.
+- **`ambient_clock.py --config PATH`**, so the service's settings can live
+  outside the git checkout; `STATUS_INTERVAL` logs
+  `ambient <reading> -> brightness <value> (range low..high)` so the
+  dimming curve can be watched in the journal.
 
 ### Fixed
 - **Metadata discovery read field keys as relative offsets**, which produced
@@ -100,10 +121,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`scripts/ambient_clock.py`** — a native-API rewrite of the classic
   community clock: hours/minutes panels with the original 3x5 digits and
   hue shimmer, brightness driven by the ambient sensor, button handling
-  (scroll / reboot / CPU-temperature report), hourly chime, and a config
-  file (`scripts/ambient_clock_config.py.example`). Verified on hardware:
-  renders at the right brightness for the measured room light, adapts its
-  range, and survives the firmware's system-block decode quirks.
+  (scroll / reboot / CPU-temperature chart on the LCD), hourly chime, and a
+  config file (`scripts/ambient_clock_config.py.example`). Verified on
+  hardware: renders at the right brightness for the measured room light,
+  adapts its range, and survives the firmware's system-block decode quirks.
 - **Native coordinate and text rendering**: `Display.set_leds_xy`,
   `set_led`, `set_all`, `set_panel`, `set_3d` and `scroll_text`, plus the
   coordinate mappings (`xy_to_index`, `xyz_to_index`, `led_index`) that

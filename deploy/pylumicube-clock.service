@@ -1,0 +1,19 @@
+[Unit]
+Description=pylumicube ambient-light clock
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/git/pylumicube
+# Unbuffered so the journal shows the clock's lines as they happen.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/git/pylumicube/.venv/bin/python %h/git/pylumicube/scripts/ambient_clock.py --config %h/.config/pylumicube/clock.py
+Restart=always
+RestartSec=5s
+# SIGTERM is handled: the display is blanked and the serial port released.
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=default.target

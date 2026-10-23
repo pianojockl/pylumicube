@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", default=SERIAL_DEVICE)
     parser.add_argument("--text", default="hello from pylumicube")
-    parser.add_argument("--volume", type=int, default=150,
+    parser.add_argument("--volume", type=int, default=100,
                         help="speaker volume 0..200")
     parser.add_argument("--no-speech", action="store_true")
     parser.add_argument("--no-screen", action="store_true")

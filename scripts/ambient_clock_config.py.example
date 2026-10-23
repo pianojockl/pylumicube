@@ -6,14 +6,19 @@
 # The curve maps the raw `light_sensor.ambient_light` reading (a 32-bit
 # count: hundreds..thousands in a lit room, much lower in the dark) to a
 # display brightness. Leave LOW/HIGH as None to let it learn your room.
+#
+# Measured on this cube: dark room ~100, lit room ~1200-2000. BRIGHTNESS_MIN
+# is the floor the clock sits at in the dark -- 0.02 is a barely-visible
+# glow, so use something higher if you want to read the time at night.
 
-BRIGHTNESS_MIN = 0.02    # 0.0 = fully off in the dark, 0.02 = a faint glow
+BRIGHTNESS_MIN = 0.15    # 0.0 = fully off in the dark, 0.15 = a night glow
 BRIGHTNESS_MAX = 1.0
 GAMMA = 1.0              # <1 brightens mid-tones, >1 darkens them
 SMOOTHING = 0.25         # 0 = snap to each new value, 0.9 = very slow fade
 ADAPT = True             # learn the room's light range
-LOW = None               # e.g. 40   — pin the darkest reading instead
-HIGH = None              # e.g. 2500 — pin the brightest reading instead
+LOW = None               # e.g. 100  — pin the darkest reading instead
+HIGH = None              # e.g. 2000 — pin the brightest reading instead
+STATUS_INTERVAL = 300.0  # seconds between "ambient X -> brightness Y" log lines
 
 # --- colour ----------------------------------------------------------------
 HUE_FOLLOWS_HOUR = True  # hue cycles through the day; else use HUE
@@ -26,3 +31,10 @@ ALLOW_REBOOT = True      # middle button reboots the Pi
 HOURLY_SCROLL = True     # scroll the time at the top of each hour
 HOURLY_SPEAK = True      # ...and speak it (needs the speaker module)
 SCROLL_SPEED = 0.7       # higher = faster scroll
+SPEAKER_VOLUME = 100     # 0..200. The firmware powers up at full blast;
+                         # 150 was still "very high" here, 100 is half.
+
+# --- CPU-temperature chart on the LCD (bottom button) ----------------------
+TEMP_SAMPLE_SECONDS = 10  # take a sample this often
+TEMP_HISTORY = 60         # samples kept, and columns plotted
+CHART_REFRESH = 60.0      # seconds between redraws while the chart is shown

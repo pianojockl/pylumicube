@@ -450,16 +450,22 @@ LICENSE                  # GPL-3.0
 panel, minutes on the right, with the brightness following
 `light_sensor.ambient_light` through an auto-ranging curve
 (`pylumicube.dimming`), so it dims in a dark room. Buttons scroll the
-time (top), reboot (middle, `ALLOW_REBOOT`) and report the CPU
-temperature (bottom — the LCD chart needs the `screen` module, which is
-not implemented yet). Configuration goes in
-`scripts/ambient_clock_config.py` (copy the `.example`); run it with
+time (top), reboot (middle, `ALLOW_REBOOT`) and draw a CPU-temperature
+chart on the secondary LCD (bottom — press again, or any other button, to
+blank it). The speaker volume is pinned on startup (`SPEAKER_VOLUME`),
+because the firmware powers up at full blast. Configuration goes in
+`scripts/ambient_clock_config.py` (copy the `.example`) or in any file
+passed as `--config`; run it with
 
 ```bash
 python scripts/ambient_clock.py            # forever
 python scripts/ambient_clock.py --once     # single frame, for testing
 python scripts/ambient_clock.py --seconds 30 --debug
+python scripts/ambient_clock.py --config ~/.config/pylumicube/clock.py
 ```
+
+`deploy/` holds the systemd user unit and a step-by-step guide for running
+the clock on the cube instead of the Java daemon (`deploy/README.md`).
 
 
 `utilities/` contains helper tools used during bring-up and reverse-

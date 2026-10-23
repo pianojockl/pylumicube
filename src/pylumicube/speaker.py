@@ -42,6 +42,9 @@ SAMPLE_RATE = 32000
 CHUNK_SAMPLES = 112
 #: Speaker volume field range (`speaker.volume`, 0..200 per api.txt).
 MAX_VOLUME = 200
+#: Default volume. The firmware powers up at full blast, which is far too
+#: loud in a room, so a driver that is not told otherwise starts at half.
+DEFAULT_VOLUME = 100
 
 SINE = "sine"
 SQUARE = "square"
@@ -128,7 +131,7 @@ class Speaker:
                  run: Callable[..., object] | None = None,
                  sample_rate: int = SAMPLE_RATE,
                  chunk_samples: int = CHUNK_SAMPLES,
-                 volume: int = MAX_VOLUME,
+                 volume: int = DEFAULT_VOLUME,
                  timeout: float = 0.5,
                  pace: bool = True,
                  await_response: bool = False,
