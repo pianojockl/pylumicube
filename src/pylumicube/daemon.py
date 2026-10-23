@@ -13,6 +13,7 @@ working while it does.
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import threading
@@ -34,9 +35,42 @@ BUTTON_SOURCES = (("buttons", ("top", "middle", "bottom")),
 TEMPERATURE_INTERVAL = 30.0
 
 
+def acquire_instance_lock(socket_path: str) -> int:
+    """Take the daemon's single-instance lock, or raise `RuntimeError`.
+
+    A second daemon is not a harmless mistake. It opens `/dev/ttyAMA0` *before*
+    it discovers the socket is taken, so it disturbs the running daemon's link
+    first and fails second: frames the firmware expects from the real owner go
+    to the intruder instead, and the display shows the result. This lock is
+    taken before the cube is touched, so a duplicate fails cleanly — which
+    matters because a transient second process has been seen in practice (a
+    stray manual launch alongside the systemd unit).
+
+    The lock is an `flock` on `<socket>.lock`, so it dies with the process and
+    can never go stale. The file itself is deliberately left behind: unlinking
+    it would let a third process lock a fresh file while a second still holds
+    the old one. Returns the file descriptor, which the caller keeps open for
+    as long as it owns the daemon.
+    """
+    path = f"{socket_path}.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise RuntimeError(
+            f"another pylumicube daemon already owns {path}; "
+            "stop it before starting this one") from None
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+    except OSError:  # pragma: no cover — cosmetic; the lock is what matters
+        log.debug("could not write %s", path, exc_info=True)
+    return fd
+
+
 class Daemon:
     """Own the cube, serve the control protocol, optionally bridge to MQTT."""
-
     def __init__(self, port: str = SERIAL_DEVICE, *, socket_path: str | None = None,
                  log_ops: bool = False, subscribe_except: tuple[str, ...] = ("cube",),
                  telemetry_cadence: float = DEFAULT_CADENCE,
@@ -54,6 +88,7 @@ class Daemon:
         self._threads: list[threading.Thread] = []
         self.started_at = time.time()
         self._frames_seen = 0
+        self._lock_fd: int | None = None
 
         self.cube = LumiCube(port, telemetry=True,
                              telemetry_cadence=telemetry_cadence,
@@ -67,6 +102,9 @@ class Daemon:
     # ---------------- lifecycle ----------------
 
     def start(self) -> None:
+        # Before the cube is opened: a duplicate must fail without touching
+        # the serial port the running daemon is using.
+        self._lock_fd = acquire_instance_lock(self.socket_path)
         self.cube.start()
         counts = self.cube.walk_all_schemas()
         log.info("schemas: %s", ", ".join(
@@ -87,6 +125,9 @@ class Daemon:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
         if self.bridge is not None:
             self.bridge.stop()
         self.server.stop()

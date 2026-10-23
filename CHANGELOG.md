@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A single-instance lock on the daemon.** A second daemon used to open
+  `/dev/ttyAMA0` (the port the first one owns) and only *then* discover the
+  socket was taken, so a stray launch disturbed the running daemon's link
+  before failing — frames the firmware expected from the real owner went to
+  the intruder. `acquire_instance_lock()` takes an `flock` on
+  `<socket>.lock` before the cube is touched, so a duplicate now fails with
+  `another pylumicube daemon already owns ...` and leaves the running daemon
+  alone. Verified on the cube: the duplicate is refused and the clock does
+  not even restart.
+
 ### Fixed
 - **The MQTT bridge heard its own state as a command, and looped with Home
   Assistant.** It subscribed to `lumicube/speaker/#`, which includes
