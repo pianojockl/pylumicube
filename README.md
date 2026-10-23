@@ -20,14 +20,16 @@ Java `foundry-daemon`.
 - [x] **Node discovery** — passive harvest from `NODE_STATUS` broadcasts, plus a 3-stage dynamic node-ID allocator for cold-boot scenarios.
 - [x] **Module discovery** — `GET_PREFERRED_NAME` to pick the `cube` base board over the `button_and_light_sensor` board.
 - [x] **Schema discovery** — `ENUMERATE_FIELDS` walker (`utilities/snapshot_hardware.py`) that decodes in-line sub-dicts and resolves block floors via probing + binary search. See [`PROTOCOL.md`](./PROTOCOL.md) §4.5.1.
+- [x] **Telemetry** — `SUBSCRIBE_DEFAULT_FIELDS` with heartbeat renewal and `PUBLISHED_FIELDS` decoding into a per-node cache (`pylumicube.telemetry`), self-healing when the firmware answers a walk probe with the wrong block. Exposed as `LumiCube.light_sensor` / `.buttons` / `.modules`.
 
 **Hardware modules**
 
 - [x] **LED matrix** — `SET_FIELDS` writes covering all 192 LEDs (3 frames). Exposed as the `lumicube-leds` CLI and `LumiCube.display`.
-- [x] **Upstream-script compat shim** — `pylumicube.compat` recreates the foundry-daemon globals (`cube`, `display`, `hsv_colour`, `noise_*`, colour constants, etc.). `lumicube-run script.py` execs a community script in that namespace; display-only scripts (rainbow, rain, binary_clock, conways_game_of_life, autumn_scene, land_grab, lava_lamp, ripples, scrolling_clock — all under `scripts/original/`) run unchanged. Sensor / audio / screen modules are warn-and-no-op stubs until they land.
-- [ ] **Microphone input** — `SUBSCRIBE_DEFAULT_FIELDS` + `PUBLISHED_FIELDS` telemetry plumbing, then expose `microphone.data`.
-- [ ] **Light sensor** — colour, proximity, and gesture readings from the `button_and_light_sensor` board (telemetry-driven, builds on microphone).
-- [ ] **Secondary LCD screen** — drive the `screen` module on the cube node. Forces the move from a hardcoded display schema to runtime `ENUMERATE_FIELDS` + direct-probe discovery (see [`PROTOCOL.md`](./PROTOCOL.md) §5.1).
+- [x] **Sensor board** — `light_sensor` (ambient light, RGB, proximity, gestures) and `buttons` (presses + counters) read from telemetry, with the discovered schema grouped into modules the way the daemon's `Namespace.build` does (`pylumicube.modules`). `env_sensor` / `imu` work the same way when the add-on board is present.
+- [x] **Upstream-script compat shim** — `pylumicube.compat` recreates the foundry-daemon globals (`cube`, `display`, `hsv_colour`, `noise_*`, colour constants, etc.). `lumicube-run script.py` execs a community script in that namespace; display-only scripts (rainbow, rain, binary_clock, conways_game_of_life, autumn_scene, land_grab, lava_lamp, ripples, scrolling_clock — all under `scripts/original/`) run unchanged. Sensor scripts work too: `light_sensor` / `buttons` / `env_sensor` / `imu` are telemetry-backed and `pi` is implemented locally.
+- [ ] **Microphone input** — telemetry plumbing is in place; still missing the audio capture path (`microphone.start_recording`, voice recognition, `get_frequency_buckets`).
+- [ ] **Secondary LCD screen** — `screen.set_pixel/set_pixels/draw_image/write_text` on the cube node (320×240). Runtime schema discovery landed with telemetry; the pixel-window/rectangle/text methods are still to be reverse-engineered (`ScreenSetHalfRowMethod`, `ScreenDrawRectangleMethod`, `ScreenWriteTextMethod` in the daemon jar).
+- [ ] **Speaker** — `speaker.say/play/tone/volume`: needs a paced 32 kHz PCM stream into `speaker.data` (224 B/frame) honouring the firmware's `free_space_in_bytes` / `autoReloadPeriod`, plus TTS.
 
 **Tooling**
 
@@ -279,6 +281,46 @@ with LumiCube() as cube:
     cube.display.flush(timeout=1.0)               # or: drain any async writes
 ```
 
+### Sensors and telemetry
+
+Nodes do not answer read requests — telemetry is push-based. Reading a
+sensor means subscribing to the node's `PUBLISHED_FIELDS` stream, which
+needs that node's field schema (discovered at runtime with
+`ENUMERATE_FIELDS`). `LumiCube(telemetry=True)` does both, then groups the
+fields into modules:
+
+```python
+from pylumicube import LumiCube
+
+with LumiCube(telemetry=True) as cube:
+    light = cube.light_sensor            # FieldModule or None
+    print(sorted(light.field_names))     # ambient_light, red, green, blue, …
+    ambient = light.wait_for('ambient_light', timeout=5)   # blocks
+    print(ambient, light.red, light.within_proximity)
+
+    if cube.buttons.top_pressed:
+        print("top button", cube.buttons.top_pressed_count)
+
+    # Diagnostics
+    print(cube.telemetry.stats())        # frames, nodes, decode_errors, repairs
+```
+
+Notes:
+
+- Telemetry is **off by default**, so display-only code keeps its old
+  startup cost and behaviour.
+- Only walk/subscribe the nodes you need —
+  `LumiCube(telemetry=True, schema_node_names=("button_and_light_sensor",))`
+  (a full walk of the `cube` base board is slow: ~100–180 ms per
+  `ENUMERATE_FIELDS` round-trip).
+- The schema walk is time-budgeted (`schema_budget`, default 15 s per
+  node) and **self-healing**: a telemetry frame that references a block
+  the walk missed triggers a targeted re-probe of that key. A truncated
+  walk costs a couple of dropped frames, not a broken sensor.
+- `ambient_light` is a 32-bit raw reading (hundreds to thousands in
+  normal room light, much higher in daylight) — not 0..255. See
+  [`PROTOCOL.md`](./PROTOCOL.md) §5.2 before writing a dimming curve.
+
 ### Compat-shim API (upstream-style)
 
 ```python
@@ -335,6 +377,9 @@ src/pylumicube/
     transport.py         # Transport: transferIds, request/response
     flat_dictionary.py   # FlatDictionary TLV encoder/decoder
     metadata.py          # FieldSpec + hardcoded display schema
+    discovery.py         # ENUMERATE_FIELDS schema walker
+    telemetry.py         # SUBSCRIBE_DEFAULT_FIELDS + PUBLISHED_FIELDS cache
+    modules.py           # module namespace (light_sensor, buttons, …)
     allocator.py         # 3-stage dynamic node-ID allocator
     node.py              # LumiCube top-level API
     display.py           # Display module helpers

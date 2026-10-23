@@ -497,6 +497,29 @@ its heartbeat.
 
 Source: [SubscribeDefaultFieldsTask.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/heartbeat/SubscribeDefaultFieldsTask.java)
 
+Verified against the live cube (2026-10-23) and the daemon jar's
+`SubscribeDefaultFieldsTask`:
+
+- Payload is exactly **2 bytes**: `duration = cadence * 2` (so a missed
+  renewal leaves no gap) and `bandwidth = 255` (the firmware's maximum;
+  the Java constant is `MAX_BANDWIDTH = 255`).
+- The service returns an empty body; a node that never answers simply
+  keeps its previous subscription. Renewal is best-effort.
+- **There is no `GET_FIELDS` service.** Reads are push-only: the REST API
+  and the Python proxies both serve the daemon's cache of the last
+  `PUBLISHED_FIELDS` snapshot, which is why a field that has never been
+  published reads as `None` (and why a never-seen sensor raises
+  `AttributeError` in a user script).
+- Snapshots are **incremental**: a node publishes only the fields it
+  chooses per frame, so a decoder must merge frames into a cache rather
+  than replace it. On the sensor board ~30 frames/s arrive, each carrying
+  a subset of the 14 published fields.
+- A snapshot can only be decoded against the *publishing node's* field
+  metadata — the encoding carries no per-value width. `pylumicube`
+  discovers that metadata with `ENUMERATE_FIELDS` (see §4.5.1) and
+  re-probes individual keys when a frame references a block the walk
+  missed.
+
 ### 4.7 FieldType enum
 
 From [FieldType.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/bus/FieldType.java):
@@ -651,11 +674,16 @@ daemon-local). Two physical UAVCAN nodes are present (UUIDs ending `…3837` and
 
 The two UAVCAN nodes report their `GET_PREFERRED_NAME` as:
 
-- **`cube`** (allocated ID 124 in our captures) — the base board. Owns
-  `display`, `buttons`, `screen`, `speaker`, plus a `microphone` field
-  set. This is the node you address for LED writes.
-- **`button_and_light_sensor`** (allocated ID 125) — sensor board. Owns
-  `env_sensor`, `imu`, `light_sensor`, `microphone` controls, etc. No LEDs.
+- **`cube`** — the base board. Owns `display`, `buttons`, `screen`,
+  `speaker`, plus a `microphone` field set. This is the node you address
+  for LED writes.
+- **`button_and_light_sensor`** — sensor board. Owns `buttons`,
+  `light_sensor`, `env_sensor`, `imu` and `microphone` controls. No LEDs.
+
+The *node ids* are assigned by the allocator at each boot, so they are
+**not stable**: captures have seen `cube`=124 / sensor=125 (2026-05-14)
+and `cube`=125 / sensor=124 (2026-10-23). Resolve nodes by
+`GET_PREFERRED_NAME`, never by id.
 
 On the `cube` node, what `utilities/snapshot_hardware.py` auto-walks via
 `ENUMERATE_FIELDS` (2026-05-14 capture, in
@@ -672,6 +700,55 @@ On the `cube` node, what `utilities/snapshot_hardware.py` auto-walks via
 |  3315 |    1 | `rectangle_x`              | UINT | 2    | screen       |
 |  7412 |    1 | `button_pressed`           | BOOL | 1    | buttons      |
 | 67413 |    1 | `rdp_level`                | UINT | 4    | (system)     |
+
+### 5.2 The sensor board's schema (measured 2026-10-23)
+
+`ENUMERATE_FIELDS` on `button_and_light_sensor` yields 16 blocks. Keys
+0..13 are the published set (all `span 1`); the two `60000+` blocks are
+firmware-internal (`system = 1`) and are also published:
+
+| Floor | Field                        | Type       | Size | Module       |
+|------:|------------------------------|------------|-----:|--------------|
+|     0 | `top_pressed`                | BOOLEAN    |    1 | buttons      |
+|     1 | `top_pressed_count`          | UINT       |    4 | buttons      |
+|     2 | `middle_pressed`             | BOOLEAN    |    1 | buttons      |
+|     3 | `middle_pressed_count`       | UINT       |    4 | buttons      |
+|     4 | `bottom_pressed`             | BOOLEAN    |    1 | buttons      |
+|     5 | `bottom_pressed_count`       | UINT       |    4 | buttons      |
+|     6 | `ambient_light`              | UINT       |    4 | light_sensor |
+|     7 | `red`                        | UINT       |    4 | light_sensor |
+|     8 | `green`                      | UINT       |    4 | light_sensor |
+|     9 | `blue`                       | UINT       |    4 | light_sensor |
+|    10 | `last_gesture`               | ENUM       |    1 | light_sensor |
+|    11 | `num_gestures`               | UINT       |    4 | light_sensor |
+|    12 | `within_proximity`           | BOOLEAN    |    1 | light_sensor |
+|    13 | `num_times_within_proximity` | UINT       |    4 | light_sensor |
+| 60002 | `asserts`                    | UTF8_CHAR  |    1 | (system)     |
+| 60014 | `rdp_level`                  | UINT       |    4 | (system)     |
+
+Notes:
+
+- **The light sensor is 32-bit, not 8-bit.** `ambient_light` and the RGB
+  channels are `UINT` size 4; observed values are in the 700–2000 range in
+  a normally lit room (saturating much higher in daylight). A 0..255
+  assumption (as the upstream `standard_library.py` examples imply) makes
+  any `value / 255` dimming curve saturate immediately.
+- `ENUMERATE_FIELDS` reports `type`, `size`, `span`, `name` and `module`
+  but **omits `gettable`/`settable`/`idempotent`** — absent flags must be
+  treated as "not reported", not as false.
+- The system blocks are published at keys the walk does **not** resolve
+  consistently: probing key 14 returns `rdp_level` with a gap-skip that
+  implies floor 60014, yet the published frames carry `rdp_level` at
+  60000 and `assert_count` at 60001. The firmware's gap arithmetic and its
+  published keys disagree here, so a decoder must be able to add a block
+  for a key it actually sees (pylumicube re-probes the key and trusts the
+  probe over the arithmetic).
+- The walk can **transiently miss a block** (2026-10-23: `middle_pressed`
+  at key 2 was skipped in one session and present in the next). Observed
+  cause: the firmware answers a probe with the *next* block depending on
+  what was queried before it. A missing block shows up as an undecodable
+  telemetry frame, which is the reliable signal to re-probe that key.
+
 
 Direct probes by key (via `utilities/query_key.py`) also surface fields
 the walk steps over: `display.brightness` at **256** (UINT 1B, max
@@ -757,6 +834,8 @@ A minimal Python daemon needs to do this on startup:
    - `ENUMERATE_FIELDS` (typeId 204) chained from `(0, 0)` until exhausted →
      build the field schema
    - `SUBSCRIBE_DEFAULT_FIELDS` (typeId 200) → request telemetry
+   (`[duration, bandwidth]`, renewed every `duration / 2` seconds — see
+   §4.6)
 6. From then on:
    - Receive `PUBLISHED_FIELDS` broadcasts (typeId 20000) and decode them as
      FlatDictionaries against the per-node metadata to update a local
@@ -813,6 +892,26 @@ real photons on the panel).
    service types, and is the limit firmware-wide (one outstanding
    per-peripheral?) or per-type? Worth probing with a mixed
    SET_FIELDS + GET_FIELDS burst.
+7. **`ENUMERATE_FIELDS` stops answering after a long walk.** A full walk
+   that ends with direct probes at well-known keys gets `(no response)`
+   for every one of them (2026-10-23, ~250 probes earlier in the session),
+   while the same probes answer fine in a fresh session. Workaround in
+   `pylumicube`: probe the well-known keys **first** (`CUBE_WELL_KNOWN_KEYS`)
+   and cap the walk with a time budget. Root cause unknown — possibly a
+   firmware-side service-slot or state limit; the Java daemon only ever
+   issues these on a slow heartbeat.
+8. **Each `ENUMERATE_FIELDS` round-trip costs ~100–180 ms** on the Pi 3
+   (vs ~2 ms for SET_FIELDS), which makes a full walk of the `cube` node
+   (wide blocks + binary search) take >15 s. pylumicube therefore walks
+   with a small budget and re-probes only the keys that telemetry frames
+   actually reference. Whether the latency is firmware compute or link
+   contention is untested.
+9. **`PUBLISHED_FIELDS` field selection is opaque.** The sensor board
+   publishes keys 0..13 + the 60000+ system blocks in ~30 frames/s, but
+   *which* subset goes into a given frame is not documented and appears
+   data-dependent (a frame that contains key 2 is what surfaced the
+   missed-block bug). Worth logging a full frame dump to see the batching
+   rule.
 
 A realistic capture path: stop the Java daemon (`systemctl --user stop
 foundry-daemon.service`; if the user systemd manager isn't reachable in

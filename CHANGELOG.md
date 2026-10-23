@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Wire-protocol findings (vs. the Java daemon)
+- **Telemetry confirmed end to end on hardware.** `SUBSCRIBE_DEFAULT_FIELDS`
+  takes a 2-byte payload (`duration = cadence * 2`, `bandwidth = 255`) and
+  the node answers with incremental `PUBLISHED_FIELDS` snapshots; there is
+  **no `GET_FIELDS` service**, so reads are push-only. See PROTOCOL.md §4.6.
+- **The light sensor is 32-bit.** `ambient_light`, `red`, `green`, `blue`,
+  `num_gestures` and `num_times_within_proximity` are `UINT` size 4 on
+  `button_and_light_sensor` (measured 2026-10-23, PROTOCOL.md §5.2). The
+  commonly assumed 0..255 range is wrong, which matters for any dimming
+  curve.
+- **Node ids are not stable across boots** — captures have seen the
+  sensor board at 125 and at 124. Resolve nodes by `GET_PREFERRED_NAME`.
+- `ENUMERATE_FIELDS` omits `gettable`/`settable`/`idempotent` (absent
+  means "not reported", not false), costs ~100–180 ms per round-trip, and
+  stops answering well-known keys after a long walk. The firmware also
+  answers a probe with the *next* block depending on what was queried
+  before, so a walk can transiently miss a block, and its gap arithmetic
+  disagrees with the keys it publishes for the `60000+` system blocks.
+  All four are worked around (probe well-known keys first, time budget,
+  per-key re-probe on undecodable frames, trust the probe over the
+  arithmetic) — see PROTOCOL.md §5.2 and §7.
+
+### Added
+- **Telemetry** (`pylumicube.telemetry.TelemetryStore`): subscription with
+  heartbeat renewal, `PUBLISHED_FIELDS` decoding into a per-node value
+  cache, `get`/`snapshot`/`wait_for`/`last_update`, and self-healing
+  schemas — a frame referencing an unknown key schedules a targeted
+  re-probe (off the link's I/O thread) instead of being dropped forever.
+  Undecodable frames are counted per node and never kill the link.
+- **Runtime schema discovery** (`pylumicube.discovery`): the
+  `ENUMERATE_FIELDS` walker (previously only in
+  `utilities/snapshot_hardware.py`, which now imports it) as a library
+  function, with the well-known-key pass, the `rel == k` disambiguation,
+  the backward binary search, and a wall-clock budget.
+- **Module namespace** (`pylumicube.modules`): groups discovered fields
+  into `light_sensor`, `buttons`, `env_sensor`, `imu`, … the way the Java
+  daemon's `Namespace.build` does, including the `buttons` →
+  `system_button` rename on the cube base board. `FieldModule` gives
+  `light_sensor.ambient_light`-style reads from the telemetry cache.
+- **`LumiCube` telemetry API**: `LumiCube(telemetry=True)`,
+  `enable_telemetry(node_ids=…, node_names=…)`, `discover_schema()`,
+  `schemas`, `modules`, `module(name)`, `light_sensor`, `buttons`,
+  `node_id_for_name()`. Off by default, so display-only users see no
+  change.
+- **Compat shim parity for the sensor board**: `light_sensor`, `buttons`,
+  `env_sensor` and `imu` are now real telemetry-backed modules instead of
+  warn-and-no-op stubs. They are wired lazily (a `_LazyModule` in
+  `build_globals`), so display-only community scripts still start without
+  touching telemetry. `pi` is now implemented locally
+  (`cpu_temp`, `cpu_percent`, `ram_percent_used`, `disk_percent`,
+  `ip_address`), matching `global_service/service.py`.
+  `screen`, `speaker` and `microphone` remain stubs (see the README).
+- `flat_dictionary.deserialise()` now decodes 4-byte floats and fixed-size
+  `UTF8_CHAR` blocks, skips variable-length strings, and raises a typed
+  `UndecodablePayload` carrying the offending key.
+- `FieldSpec` carries the metadata `ENUMERATE_FIELDS` reports (module,
+  units, min/max, gettable/settable/system/debug), and `signed` now covers
+  the `ENUM`/`BOOLEAN`/`TIME` types per PROTOCOL §4.7.
+- Tests: `tests/test_discovery.py` (metadata parsing + a firmware-emulating
+  transport that pins the walk's disambiguation and budget behaviour),
+  `tests/test_telemetry.py` (subscription, decoding, unknown-key handling,
+  repair scheduling off the I/O thread), `tests/test_compat_modules.py`
+  (namespace building, shim semantics, `pi`, laziness).
+
 ### Performance
 - `Display.set_leds` / `fill` / `show` / `set_brightness` are now async
   by default (new `await_ack: bool = False` keyword). The wire I/O runs
