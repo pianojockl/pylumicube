@@ -18,6 +18,7 @@ Reference: ref_data/lumicube-daemon/.../bus/FlatDictionary.java
 
 from __future__ import annotations
 
+import struct
 from collections.abc import Iterable, Mapping
 
 from .metadata import FieldSpec
@@ -215,12 +216,60 @@ class _FloorIndex:
 
 # --------------------- minimal decoder ---------------------
 
-def deserialise(data: bytes, specs: Mapping[int, FieldSpec]) -> dict[int, int]:
-    """Decode a FlatDictionary into a `{key: value}` map. Only fixed-size
-    integral fields are supported (sufficient for PUBLISHED_FIELDS telemetry
-    on the modules we exercise)."""
+
+class UndecodablePayload(ValueError):
+    """The FlatDictionary stream cannot be decoded against these specs.
+
+    Raised for unknown keys (no metadata covers them), variable-width
+    fields we cannot skip, and truncated buffers. Callers that consume
+    telemetry treat this as "skip this frame and keep the old values" —
+    or, when `key` is set, repair the schema and retry.
+    """
+
+    def __init__(self, message: str, *, key: int | None = None) -> None:
+        super().__init__(message)
+        #: The key whose metadata was missing, when that is the cause.
+        self.key = key
+
+
+
+def _decode_value(data: bytes, offset: int, spec: FieldSpec) -> tuple[int | float | None, int]:
+    """Decode one value. Returns (value, next_offset); None = not stored."""
+    size = spec.size
+    if spec.is_string:                      # UTF8_STRING: 1-byte length prefix
+        if offset >= len(data):
+            raise UndecodablePayload("truncated string length")
+        length = data[offset]
+        end = offset + 1 + length
+        if end > len(data):
+            raise UndecodablePayload("truncated string value")
+        return None, end
+    if size <= 0:
+        # FIELD_TYPE_NULL and FIELD_TYPE_DICTIONARY have no length on the
+        # wire, so a zero-size value cannot be skipped.
+        raise UndecodablePayload(
+            f"cannot skip zero-size field type {spec.type} at key {spec.floor}")
+    if offset + size > len(data):
+        raise UndecodablePayload("truncated value")
+    raw = data[offset : offset + size]
+    if spec.is_float:
+        if size != 4:
+            raise UndecodablePayload(f"unsupported float size {size}")
+        return struct.unpack("<f", raw)[0], offset + size
+    return int.from_bytes(raw, "little", signed=spec.signed), offset + size
+
+
+def deserialise(data: bytes, specs: Mapping[int, FieldSpec]) -> dict[int, int | float]:
+    """Decode a FlatDictionary into a `{key: value}` map.
+
+    Handles the fixed-size integral types, fixed-size UTF8_CHAR blocks and
+    4-byte floats. Variable-length strings are skipped (their value is not
+    stored); a payload containing a field we have no metadata for raises
+    `UndecodablePayload`, because without a width the rest of the stream
+    cannot be parsed.
+    """
     floor_lookup = _FloorIndex(specs)
-    out: dict[int, int] = {}
+    out: dict[int, int | float] = {}
     key_acc = 0
     offset = 0
     while offset < len(data):
@@ -229,25 +278,25 @@ def deserialise(data: bytes, specs: Mapping[int, FieldSpec]) -> dict[int, int]:
         width = cmd & 0x0F
         discriminator = (cmd >> 4) & 0x0F
         if width > 4:
-            raise ValueError("invalid width")
+            raise UndecodablePayload(f"invalid parameter width {width}")
         parameter = int.from_bytes(data[offset : offset + width], "little") if width else 0
         offset += width
         if discriminator == 1:  # skip
             key_acc += parameter
             continue
         if discriminator != 0:
-            raise ValueError(f"unknown discriminator {discriminator}")
+            raise UndecodablePayload(f"unknown discriminator {discriminator}")
         run_remaining = parameter
         while run_remaining > 0:
-            spec = floor_lookup.lookup(key_acc)
+            try:
+                spec = floor_lookup.lookup(key_acc)
+            except KeyError as exc:
+                raise UndecodablePayload(str(exc), key=key_acc) from None
             block_len = min(run_remaining, spec.floor + spec.span - key_acc)
             for i in range(block_len):
-                size = spec.size
-                if size <= 0:
-                    raise ValueError("variable-width decode unsupported")
-                raw = int.from_bytes(data[offset : offset + size], "little", signed=spec.signed)
-                out[key_acc + i] = raw
-                offset += size
+                value, offset = _decode_value(data, offset, spec)
+                if value is not None:
+                    out[key_acc + i] = value
             key_acc += block_len
             run_remaining -= block_len
     return out
