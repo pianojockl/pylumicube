@@ -143,6 +143,32 @@ def test_tone_accepts_a_number_or_an_object(bridge) -> None:
                                          (880.0, 0.1, 0.25, "square")]
 
 
+def test_commands_never_subscribe_to_our_own_state_topics(bridge) -> None:
+    """The loop that made HA's volume slider bounce 0/5/10.
+
+    The bridge publishes state on `lumicube/speaker/volume` and
+    `lumicube/display/brightness`; if it also *listened* there it would hear
+    its own state as a command, and Home Assistant's number entity would
+    answer it — around and around.
+    """
+    topics = bridge._command_topics()          # noqa: SLF001
+    assert "lumicube/speaker/volume/set" in topics
+    assert "lumicube/display/brightness/set" in topics
+    assert "lumicube/speaker/volume" not in topics
+    assert "lumicube/display/brightness" not in topics
+    assert not any(topic.endswith("#") for topic in topics)
+
+
+def test_an_echo_of_our_own_state_is_ignored(bridge) -> None:
+    bridge._handle_command("speaker/volume/set", "70")      # a real command
+    assert bridge.cube.speaker.volume == 70
+    bridge.cube.speaker.volume = 70
+    bridge._last_state["lumicube/speaker/volume"] = 70      # noqa: SLF001
+    bridge.cube.speaker.volume = 99                         # would-be change
+    bridge._handle_command("speaker/volume", "70")          # our own state back
+    assert bridge.cube.speaker.volume == 99, "the echo was applied as a command"
+
+
 def test_play_stop_and_volume(bridge) -> None:
     bridge._handle_command("speaker/play", "/tmp/clip.wav")
     bridge._handle_command("speaker/stop", "1")
@@ -222,7 +248,8 @@ def test_discovery_covers_the_entities_ha_should_create(bridge) -> None:
         assert payload["availability_topic"] == "lumicube/status"
 
     volume = configs["homeassistant/number/pylumicube/volume/config"]
-    assert volume["command_topic"] == "lumicube/speaker/volume"
+    assert volume["command_topic"] == "lumicube/speaker/volume/set"
+    assert volume["state_topic"] == "lumicube/speaker/volume"
     assert (volume["min"], volume["max"]) == (0, 200)
     speak = configs["homeassistant/text/pylumicube/speak/config"]
     assert speak["command_topic"] == "lumicube/speaker/say"

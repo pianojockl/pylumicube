@@ -78,6 +78,11 @@ class RemoteTelemetry:
         with self._lock:
             return set(self._subscribed)
 
+    def reset_subscriptions(self) -> None:
+        """Forget what we asked for — the daemon lost it when it restarted."""
+        with self._lock:
+            self._subscribed.clear()
+
     def start(self) -> None:
         """No-op: the daemon's own heartbeat keeps the subscription alive."""
 
@@ -231,6 +236,7 @@ class CubeClient:
         self._speaker = None
         self._microphone = None
         self._transport = RemoteTransport(self)
+        self._reconnect_lock = threading.Lock()
         log.info("connected to the daemon on %s (%d nodes, %d modules)",
                  self.path, len(self._names), len(self.info.get("modules") or []))
 
@@ -259,6 +265,36 @@ class CubeClient:
                 return
             self._telemetry._on_values(                     # noqa: SLF001
                 int(node), {int(k): int(v) for k, v in values.items()})
+
+    def reconnect(self) -> None:
+        """Re-establish the connection after the daemon went away.
+
+        A daemon restart closes every client's socket, and a long-running
+        client (the clock) should come back rather than become a zombie that
+        fails every request. The drivers and the telemetry view hold this
+        object, not the socket, so swapping the underlying `ControlClient`
+        is enough — the schemas and subscriptions are refreshed here.
+        """
+        with self._reconnect_lock:
+            subscriptions = sorted(self._telemetry.subscribed_nodes)
+            try:
+                self.control.close()
+            except Exception:  # noqa: BLE001 — the socket is already gone
+                pass
+            control = ControlClient(self.path, timeout=self.control.timeout,
+                                    on_event=self._on_event)
+            control.connect()
+            self.control = control
+            self.info = control.info
+            self._names = {int(node): name
+                           for node, name in (self.info.get("nodes") or {}).items()}
+            self._cube_node_id = self.info.get("cube_node_id")
+            self._apply_schemas(self.info.get("schemas") or {})
+            self._telemetry.reset_subscriptions()
+            if subscriptions:
+                self._telemetry.subscribe(subscriptions)
+            log.info("reconnected to the daemon on %s (%d nodes)",
+                     self.path, len(self._names))
 
     # ---------------- telemetry ----------------
 

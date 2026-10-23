@@ -115,11 +115,18 @@ Commands are plain payloads where that makes sense:
 | `lumicube/speaker/tone` | `440` or `{"frequency": 880, "duration": 0.3, "waveform": "square"}` |
 | `lumicube/speaker/play` | a WAV path on the cube |
 | `lumicube/speaker/stop` | anything — also stops a stream another client started |
-| `lumicube/speaker/volume` | 0..200 |
+| `lumicube/speaker/volume/set` | 0..200 (state comes back on `lumicube/speaker/volume`) |
 | `lumicube/screen/text` | `{"text": "hello", "size": 2, "colour": "#ffffff"}` |
 | `lumicube/screen/image` | an image path on the cube |
 | `lumicube/screen/clear`, `lumicube/display/fill` | a colour (`#rrggbb` or a number) |
-| `lumicube/display/brightness` | 0..255 |
+| `lumicube/display/brightness/set` | 0..255 (state on `lumicube/display/brightness`) |
+
+The two settable values publish their *state* on the bare topic and take
+*commands* on `/set`. Keep it that way: a bridge that listened on both would
+hear its own state as a command, and Home Assistant's number entity would
+answer that — the pair then loops (this is what made the volume slider bounce
+between 0, 5 and 10 at ~25 Hz). Reading `lumicube/speaker/volume` still works
+and is the right way to watch the cube.
 
 So the washing machine is:
 

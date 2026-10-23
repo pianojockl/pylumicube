@@ -184,6 +184,49 @@ def test_hello_describes_the_cube(server) -> None:
         assert client.read_named("light_sensor", "ambient_light") == 1200
 
 
+def test_connected_goes_false_when_the_daemon_disappears(server) -> None:
+    """`connected` must not keep claiming life after the peer has gone."""
+    control, _cube = server
+    client = ControlClient(control.path).connect()
+    try:
+        assert client.connected
+        control.stop()
+        deadline = time.time() + 5.0
+        while client.connected and time.time() < deadline:
+            time.sleep(0.05)
+        assert not client.connected, "a dead socket still reported as connected"
+    finally:
+        client.close()
+
+
+def test_client_reconnects_after_the_daemon_restarts(server) -> None:
+    """A daemon restart must not leave a long-running client a zombie.
+
+    The clock lives across daemon restarts: without reconnection every
+    request fails with `Broken pipe` and the display silently stops updating.
+    """
+    control, cube = server
+    with CubeClient(control.path) as client:
+        assert client.read_named("light_sensor", "ambient_light") == 1200
+        assert client.enable_telemetry([124]).subscribed_nodes == {124}
+
+        control.stop()                       # the daemon goes away...
+        with pytest.raises(ControlError):
+            client.read_named("light_sensor", "ambient_light")
+
+        restarted = ControlServer(cube, control.path)     # ...and comes back
+        restarted.start()
+        try:
+            client.reconnect()
+            assert client.info["cube_node_id"] == 125
+            assert "ambient_light" in client.modules["light_sensor"].refs
+            assert client.read_named("light_sensor", "ambient_light") == 1200
+            assert client.telemetry.subscribed_nodes == {124}, \
+                "the subscription was not re-issued"
+        finally:
+            restarted.stop()
+
+
 def test_unknown_op_and_module_have_codes(server) -> None:
     control, _cube = server
     with ControlClient(control.path) as client:

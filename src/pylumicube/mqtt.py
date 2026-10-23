@@ -7,12 +7,17 @@ can publish the sentence it wants spoken:
     lumicube/speaker/tone       "440" or {"frequency": 440, "duration": 0.5}
     lumicube/speaker/play       a WAV path on the cube
     lumicube/speaker/stop       anything
-    lumicube/speaker/volume     0..200
+    lumicube/speaker/volume/set 0..200
     lumicube/screen/text        "hello" or {"text": ..., "size": 2, "colour": ...}
     lumicube/screen/image       an image path on the cube
     lumicube/screen/clear       a colour (hex like "#000000" or a number)
     lumicube/display/fill       a colour
-    lumicube/display/brightness 0..255
+    lumicube/display/brightness/set  0..255
+
+Note the `/set` suffix on the two settable values: their *state* is published
+on the bare topic (`lumicube/speaker/volume`), and a bridge that subscribed
+to both would hear its own state as a command — which is exactly the loop
+that had Home Assistant's volume slider bouncing between 0, 5 and 10.
 
 State goes the other way (retained), with MQTT Discovery payloads so Home
 Assistant creates the entities by itself — sensors for the light sensor and
@@ -133,6 +138,23 @@ class MqttBridge:
 
     # ---------------- paho callbacks ----------------
 
+    def _command_topics(self) -> tuple[str, ...]:
+        """The topics we listen on — commands only, never our own state.
+
+        Subscribing to `speaker/#` used to include `speaker/volume`, the
+        topic we *publish* the volume on, so the bridge heard its own state
+        and treated it as a command. Home Assistant's number entity then
+        answered that, and the pair sat in a loop: the broker logged 10,470
+        state changes on `number.lumicube_speaker_volume` in a few minutes,
+        with the volume cycling 0/5/10. Commands now live under `/set`, which
+        is the convention Home Assistant's MQTT entities expect anyway.
+        """
+        return tuple(self._topic(suffix) for suffix in (
+            "speaker/say", "speaker/tone", "speaker/play", "speaker/stop",
+            "speaker/volume/set", "screen/text", "screen/image", "screen/clear",
+            "display/fill", "display/brightness/set",
+        ))
+
     def _on_connect(self, client: Any, userdata: Any, flags: Any, reason_code: Any,
                     properties: Any = None) -> None:
         code = getattr(reason_code, "value", reason_code)
@@ -142,9 +164,8 @@ class MqttBridge:
         self._connected.set()
         log.info("MQTT connected to %s:%s", self.host, self.port)
         client.publish(self._topic("status"), "online", retain=True)
-        client.subscribe(self._topic("speaker/#"))
-        client.subscribe(self._topic("screen/#"))
-        client.subscribe(self._topic("display/#"))
+        for topic in self._command_topics():
+            client.subscribe(topic)
         self._publish_discovery(client)
         self._publish_all_state(client)
 
@@ -181,7 +202,6 @@ class MqttBridge:
             cube.say(str(text), voice=options.get("voice"),
                      volume=options.get("volume"))
             return
-
         if suffix in ("speaker/tone", "tone"):
             options = value if isinstance(value, dict) else {"frequency": value}
             log.info("MQTT: tone %s", options)
@@ -204,8 +224,11 @@ class MqttBridge:
             cube.speaker.stop()
             return
 
-        if suffix == "speaker/volume":
+        if suffix in ("speaker/volume/set", "speaker/volume"):
             volume = int(value)
+            if volume == self._last_state.get(self._topic("speaker/volume")):
+                return                      # our own state echoing back
+            log.info("MQTT: volume %d", volume)
             cube.speaker.volume = volume
             self._publish_state(self._topic("speaker/volume"), cube.speaker.volume)
             return
@@ -237,8 +260,11 @@ class MqttBridge:
             cube.display.fill(parse_colour(str(payload)))
             return
 
-        if suffix == "display/brightness":
+        if suffix in ("display/brightness/set", "display/brightness"):
             level = int(value)
+            if level == self._last_state.get(self._topic("display/brightness")):
+                return                      # our own state echoing back
+            log.info("MQTT: display brightness %d", level)
             cube.display.set_brightness(max(0, min(255, level)))
             self._publish_state(self._topic("display/brightness"), level)
             return
@@ -342,14 +368,14 @@ class MqttBridge:
         self._discover(client, "number", "volume", {
             "name": "Speaker volume",
             "state_topic": self._topic("speaker/volume"),
-            "command_topic": self._topic("speaker/volume"),
+            "command_topic": self._topic("speaker/volume/set"),
             "min": 0, "max": 200, "step": 5, "mode": "slider",
             "icon": "mdi:volume-high",
         })
         self._discover(client, "number", "brightness", {
             "name": "Display brightness",
             "state_topic": self._topic("display/brightness"),
-            "command_topic": self._topic("display/brightness"),
+            "command_topic": self._topic("display/brightness/set"),
             "min": 0, "max": 255, "step": 5, "mode": "slider",
             "icon": "mdi:brightness-6",
         })

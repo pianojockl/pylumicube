@@ -125,6 +125,51 @@ class FakeCube:
         return self._modules
 
 
+def test_ensure_link_is_a_no_op_without_a_control_client() -> None:
+    """Serial (no daemon) cubes have nothing to reconnect."""
+    assert clock._ensure_link(FakeCube()) is True
+
+
+class _FakeControl:
+    def __init__(self, connected: bool) -> None:
+        self.connected = connected
+
+
+class _FakeClient:
+    def __init__(self, connected: bool, *, fail: bool = False) -> None:
+        self.control = _FakeControl(connected)
+        self.reconnects = 0
+        self._fail = fail
+
+    def reconnect(self) -> None:
+        self.reconnects += 1
+        if self._fail:
+            raise RuntimeError("no daemon")
+        self.control.connected = True
+
+
+def test_ensure_link_reconnects_a_dead_client() -> None:
+    """A dead link is silent, so it must be checked for, not waited on."""
+    live = _FakeClient(True)
+    assert clock._ensure_link(live) is True
+    assert live.reconnects == 0, "reconnected while the link was healthy"
+
+    dead = _FakeClient(False)
+    assert clock._ensure_link(dead) is True
+    assert dead.reconnects == 1
+    assert dead.control.connected is True
+
+
+def test_ensure_link_force_overrides_a_stale_connected_flag() -> None:
+    client = _FakeClient(True)
+    assert clock._ensure_link(client, force=True) is True
+    assert client.reconnects == 1
+
+
+def test_ensure_link_reports_a_daemon_that_is_still_down() -> None:
+    assert clock._ensure_link(_FakeClient(False, fail=True)) is False
+
+
 def _clock(modules=None, **kwargs):
     cube = FakeCube(modules, **kwargs)
     curve = clock.build_curve()
@@ -410,6 +455,21 @@ def test_speaker_volume_is_pinned_at_startup(monkeypatch) -> None:
     speaker = FakeSpeaker()
     _clock(speaker=speaker)
     assert speaker.volume == 80
+
+
+def test_reapply_settings_restores_both_after_a_daemon_restart(monkeypatch) -> None:
+    """The volume lives in the daemon, so a restart needs it re-asserted."""
+    monkeypatch.setattr(clock, "SPEAKER_VOLUME", 20)
+    monkeypatch.setattr(clock, "DISPLAY_BRIGHTNESS", 255)
+    speaker = FakeSpeaker()
+    instance, cube, _curve = _clock(speaker=speaker)
+    assert speaker.volume == 20
+
+    cube.display.brightness.clear()          # the daemon came back at defaults
+    speaker.volume = 40
+    instance.reapply_settings()
+    assert speaker.volume == 20
+    assert cube.display.brightness == [255]
 
 
 def test_display_brightness_is_set_at_startup(monkeypatch) -> None:

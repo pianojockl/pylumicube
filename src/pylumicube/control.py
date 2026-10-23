@@ -736,7 +736,12 @@ class ControlClient:
         except OSError:
             pass
         finally:
-            self._fail_all("control connection closed")
+            # The peer has gone (EOF, reset or a daemon restart). Mark the
+            # client closed so `connected` tells the truth — otherwise a
+            # long-running client keeps writing into a dead socket and only
+            # ever sees `Broken pipe`, with no way to tell it should
+            # reconnect.
+            self.close()
 
     def _deliver(self, line: bytes) -> None:
         try:

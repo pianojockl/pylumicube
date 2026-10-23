@@ -52,7 +52,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from pylumicube import LumiCube  # noqa: E402
 from pylumicube.compat import open_or_use_hosted  # noqa: E402
 from pylumicube.constants import SERIAL_DEVICE  # noqa: E402
+from pylumicube.control import ControlError  # noqa: E402
 from pylumicube.dimming import BrightnessCurve, scale_colour  # noqa: E402
+
+#: Control errors that mean the link itself is gone, so the client should
+#: reconnect rather than merely retry: the daemon restarted, or is not up yet.
+_LINK_GONE_CODES = frozenset({"closed", "no_daemon"})
 
 log = logging.getLogger("ambient_clock")
 
@@ -295,6 +300,17 @@ class AmbientClock:
             log.info("speaker volume set to %s", SPEAKER_VOLUME)
         except Exception:  # noqa: BLE001 — audio is never worth failing over
             log.warning("could not set the speaker volume", exc_info=True)
+
+    def reapply_settings(self) -> None:
+        """Re-assert the startup settings after the daemon came back.
+
+        The matrix brightness lives in the cube's firmware, so it survives a
+        daemon restart — but the speaker volume lives in the daemon, which
+        comes back at its own default. Re-applying ours keeps a restart from
+        being audible.
+        """
+        self._configure_display()
+        self._configure_speaker()
 
     # ---------------- module access ----------------
 
@@ -600,6 +616,29 @@ def _cpu_temperature() -> str:
 # --------------------------------------------------------------------------
 
 
+def _ensure_link(cube: Any, *, force: bool = False, quiet: bool = False) -> bool:
+    """Keep the daemon connection alive across daemon restarts.
+
+    A dead link is silent: telemetry values simply freeze and display writes
+    fail inside the async worker, so the clock can run for hours drawing
+    nothing at all. That is why this checks on *every* pass rather than only
+    after an exception — the main loop may never raise. `force` is for when
+    the failure itself said the link is gone, which is more reliable than
+    asking the client; `quiet` keeps a long outage from filling the journal
+    with one line per second.
+    """
+    control = getattr(cube, "control", None)
+    if control is None or (control.connected and not force):
+        return True
+    try:
+        cube.reconnect()
+    except Exception as exc:  # noqa: BLE001 — the next pass tries again
+        if not quiet:
+            log.info("daemon is not back yet: %s", exc)
+        return False
+    return True
+
+
 def build_curve() -> BrightnessCurve:
     return BrightnessCurve(low=LOW, high=HIGH, minimum=BRIGHTNESS_MIN,
                            maximum=BRIGHTNESS_MAX, gamma=GAMMA,
@@ -644,8 +683,20 @@ def run(cube: LumiCube, *, seconds: float | None = None,
     status_at = time.monotonic() + STATUS_INTERVAL
     light_log = _open_light_log()
     _write_light_row(light_log, clock.last_raw, brightness, clock.curve.range)
+    link_lost = False
     try:
         while True:
+            if not _ensure_link(clock.cube, quiet=link_lost):
+                if not link_lost:
+                    log.warning("lost the daemon connection; reconnecting")
+                    link_lost = True
+                time.sleep(poll_interval)
+                continue
+            if link_lost:
+                log.info("reconnected to the daemon; resuming")
+                link_lost = False
+                clock.reapply_settings()
+                clock.render(datetime.datetime.now(), brightness, force=True)
             now = datetime.datetime.now()
             try:
                 clock.poll_buttons(now)
@@ -655,8 +706,16 @@ def run(cube: LumiCube, *, seconds: float | None = None,
                 fresh = clock.poll_light()
                 brightness = clock.brightness() if fresh is None else fresh
                 clock.render(now, brightness)
+            except ControlError as exc:
+                # `closed`/`no_daemon` mean the link is gone (typically a
+                # daemon restart); anything else is a hiccup in this pass.
+                log.warning("clock loop failed; retrying", exc_info=True)
+                _ensure_link(clock.cube, force=exc.code in _LINK_GONE_CODES)
+                time.sleep(poll_interval)
+                continue
             except Exception:  # noqa: BLE001 — keep the clock alive through a hiccup
                 log.warning("clock loop failed; retrying", exc_info=True)
+                _ensure_link(clock.cube)
                 time.sleep(poll_interval)
                 continue
             if time.monotonic() >= status_at:

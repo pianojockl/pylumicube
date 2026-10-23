@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The MQTT bridge heard its own state as a command, and looped with Home
+  Assistant.** It subscribed to `lumicube/speaker/#`, which includes
+  `lumicube/speaker/volume` — the topic it *publishes* the volume on. Each
+  state it published came back as a command, Home Assistant's number entity
+  answered that, and the pair settled into a loop: **10,470 state changes on
+  `number.lumicube_speaker_volume` in a few minutes**, cycling 0/5/10 at
+  ~25 Hz. Commands now live under `/set` (`lumicube/speaker/volume/set`,
+  `lumicube/display/brightness/set`) with state on the bare topic, which is
+  the convention Home Assistant's MQTT entities expect; the bridge subscribes
+  to an explicit list of command topics, never a `#` wildcard, and ignores a
+  command whose value matches the state it last published. Verified: one
+  retained message in 15 s where there had been ~25/s, and HA reports the
+  cube's real volume.
+- **A daemon restart left the clock silently dead.** Two causes, both fixed.
+  The control client's reader marked its futures failed on EOF but never
+  marked the client closed, so `connected` kept returning true for a socket
+  that could only produce `Broken pipe`; and the clock's link check ran only
+  *after* an exception, which the async display path never raises — writes
+  fail inside the worker and telemetry just freezes, so the clock could draw
+  nothing for hours while looking perfectly healthy. The client now closes
+  itself on EOF (and gained `CubeClient.reconnect()`, which rebuilds the
+  connection and re-issues the subscriptions), and the clock checks the link
+  on every pass, reconnects, re-applies its brightness and volume, and
+  redraws. Verified on hardware: a daemon restart under a running clock
+  produces one warning, ~9 s of retries, then `reconnected to the daemon;
+  resuming` — with no clock restart, so the learned dimming range survives.
+
 ### Wire-protocol findings (vs. the Java daemon)
 - **Metadata field keys are absolute, and the walk must follow the firmware's
   table order.** The response's leading skip is the field's key counted from
