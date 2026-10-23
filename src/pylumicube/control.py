@@ -139,6 +139,25 @@ def _b64decode(text: str) -> bytes:
     return base64.b64decode(text.encode("ascii"))
 
 
+def _audio_stats(cube: Any) -> dict[str, Any]:
+    """Report the speech path's counters, so smoothness stays checkable.
+
+    Dropped chunks are the audible failure mode — the firmware's audio buffer
+    is only ≈47 ms — and they were invisible from outside the process. The fix
+    that made speech smooth was found by measuring exactly these, so they
+    belong in `stats` where the next change can be checked the same way
+    instead of by ear.
+    """
+    speaker = getattr(cube, "speaker", None)
+    written = getattr(speaker, "written_chunks", None)
+    dropped = getattr(speaker, "dropped_chunks", None)
+    if written is None or dropped is None:
+        return {}
+    total = written + dropped
+    return {"written_chunks": written, "dropped_chunks": dropped,
+            "loss_percent": round(100.0 * dropped / total, 2) if total else 0.0}
+
+
 class _Connection:
     """One client, with a lock so events never interleave with replies."""
 
@@ -583,11 +602,13 @@ class ControlServer:
 
         if op == "stats":
             telemetry = cube.telemetry
-            return {"ok": True, "clients": self.client_count,
-                    "ops": self._ops_served,
-                    "uptime": round(time.time() - self._started, 1),
-                    "telemetry": telemetry.stats() if hasattr(telemetry, "stats") else {},
-                    "subscriptions": sorted(connection.subscriptions)}
+            payload = {"ok": True, "clients": self.client_count,
+                       "ops": self._ops_served,
+                       "uptime": round(time.time() - self._started, 1),
+                       "telemetry": telemetry.stats() if hasattr(telemetry, "stats") else {},
+                       "subscriptions": sorted(connection.subscriptions)}
+            payload["audio"] = _audio_stats(cube)
+            return payload
 
         raise ControlError(f"unknown op {op!r}", code="no_op")
 

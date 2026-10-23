@@ -227,6 +227,26 @@ def test_client_reconnects_after_the_daemon_restarts(server) -> None:
             restarted.stop()
 
 
+def test_stats_report_the_audio_counters(server) -> None:
+    """Dropped chunks are the audible failure mode; keep them visible."""
+    control, cube = server
+    speaker = FakeSpeaker()
+    speaker.written_chunks = 2600
+    speaker.dropped_chunks = 14
+    cube.speaker = speaker
+    with ControlClient(control.path) as client:
+        audio = client.request("stats")["audio"]
+    assert audio["written_chunks"] == 2600
+    assert audio["dropped_chunks"] == 14
+    assert audio["loss_percent"] == pytest.approx(0.54, abs=0.01)
+
+
+def test_stats_omit_audio_when_there_is_no_speaker(server) -> None:
+    control, _cube = server
+    with ControlClient(control.path) as client:
+        assert client.request("stats")["audio"] == {}
+
+
 def test_unknown_op_and_module_have_codes(server) -> None:
     control, _cube = server
     with ControlClient(control.path) as client:

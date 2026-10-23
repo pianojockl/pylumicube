@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The `stats` op reports the speech path's counters** (`audio`:
+  `written_chunks`, `dropped_chunks`, `loss_percent`), so smoothness is
+  checkable from a running daemon — `lumicube-do stats` — instead of only by
+  ear. Dropped chunks are the audible failure mode (the firmware's audio
+  buffer is ≈47 ms) and were previously invisible from outside the process;
+  the fix that made speech smooth was found by measuring exactly these.
 - **A single-instance lock on the daemon.** A second daemon used to open
   `/dev/ttyAMA0` (the port the first one owns) and only *then* discover the
   socket was taken, so a stray launch disturbed the running daemon's link
@@ -206,7 +212,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gap **52-66 ms → 13-25 ms** (the firmware's own buffer is ≈47 ms, so it no
   longer underruns), stalls over 20 ms **6-55 → 0-1**, and loop time outside
   the write **20-78% → 5-8%**. A nine-second announcement through the daemon
-  now reports **0% loss** (2 chunks of 2614).
+  now reports **0% loss** (2 chunks of 2614). Confirmed by ear on the cube
+  (the numbers can show gaps closing, but only listening says whether what is
+  left is audible), and a fresh 7-second sentence through the *running*
+  daemon reports **0 dropped of 1499 chunks** via `lumicube-do stats`.
 - **Choppy speech.** The stream was paced to exactly real time, which leaves
   the firmware's small audio buffer empty: measured on the cube, the p50 gap
   between chunks was spot on (3.5 ms) but the p95 was 8.6 ms and spikes
