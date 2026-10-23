@@ -1,0 +1,28 @@
+# Copy this file to `ambient_clock_config.py` (same directory) and edit.
+# Every name is optional — anything omitted keeps the default from
+# `ambient_clock.py`.
+
+# --- ambient-light dimming -------------------------------------------------
+# The curve maps the raw `light_sensor.ambient_light` reading (a 32-bit
+# count: hundreds..thousands in a lit room, much lower in the dark) to a
+# display brightness. Leave LOW/HIGH as None to let it learn your room.
+
+BRIGHTNESS_MIN = 0.02    # 0.0 = fully off in the dark, 0.02 = a faint glow
+BRIGHTNESS_MAX = 1.0
+GAMMA = 1.0              # <1 brightens mid-tones, >1 darkens them
+SMOOTHING = 0.25         # 0 = snap to each new value, 0.9 = very slow fade
+ADAPT = True             # learn the room's light range
+LOW = None               # e.g. 40   — pin the darkest reading instead
+HIGH = None              # e.g. 2500 — pin the brightest reading instead
+
+# --- colour ----------------------------------------------------------------
+HUE_FOLLOWS_HOUR = True  # hue cycles through the day; else use HUE
+HUE = 0.25               # 0..1 (0.25 = greenish, 0.5 = cyan, 0 = red)
+SATURATION = 1.0
+JITTER = 1.0             # per-pixel hue shimmer; 0 = steady colour
+
+# --- behaviour -------------------------------------------------------------
+ALLOW_REBOOT = True      # middle button reboots the Pi
+HOURLY_SCROLL = True     # scroll the time at the top of each hour
+HOURLY_SPEAK = True      # ...and speak it (needs the speaker module)
+SCROLL_SPEED = 0.7       # higher = faster scroll

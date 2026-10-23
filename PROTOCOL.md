@@ -806,6 +806,72 @@ the auto-walk yields 15 fields packed at keys 0..14:
 
 ---
 
+## 5.3 SET_FIELDS recipes for the daemon's module methods
+
+The daemon's user-facing *methods* (`display.set`, `screen.*`, `speaker.*`)
+are thin wrappers that write fields with `SET_FIELDS`. The recipes below
+are transcribed from the full Java source tree kept at
+`~/git/lumicube-daemon-2024` (the tree `Daemon-2.0` was built from), under
+`src/main/java/com/abstractfoundry/daemon/server/method/node/` — they are
+what a reimplementation has to reproduce.
+
+All of them look the module up in the namespace and resolve field keys by
+name (`module.getKey("pixel_window_x")`), i.e. the keys are discovered, not
+hardcoded — exactly what `pylumicube.discovery` produces.
+
+**`display.set`** (`display/DisplaySetMethod.java`) — one key per LED,
+`led_colour + index` = 0xRRGGBB (24-bit, not RGB565), plus `show = 1`.
+
+**`screen.set_half_row` / `screen.set_pixels`**
+(`screen/ScreenSetHalfRowMethod.java`) — the pixel-window stream:
+
+| Key | Value |
+|-----|-------|
+| `pixel_window_x` | `x + batchStart` |
+| `pixel_window_y` | `y` |
+| `pixel_window_width` | number of pixels in this batch |
+| `pixel_window_height` | `1` |
+| `start_pixel_streaming` | `1` |
+| `pixel_data_stream + n` | pixel `n` as **RGB565** |
+| `stop_pixel_streaming` | `1` |
+
+Constraints: at most **160 pixels** per call (half the 320-pixel screen
+width), split into batches of **80**; the daemon parks 8 ms before issuing
+the request so the firmware can process the previous row. Colour
+conversion is `((rgb >> 19) & 0x1F) << 11 | ((rgb >> 10) & 0x3F) << 5 |
+((rgb >> 3) & 0x1F)`. `set_pixel` is just a 1x1 `draw_rectangle`.
+
+**`screen.draw_rectangle`** (`screen/ScreenDrawRectangleMethod.java`) —
+`rectangle_x`, `rectangle_y`, `rectangle_width`, `rectangle_height`,
+`rectangle_colour` (RGB565), `rectangle_draw = 1`.
+
+**`screen.write_text`** (`screen/ScreenWriteTextMethod.java`) — up to 127
+characters written **one key per character** starting at the `text` floor
+(`text + n` = the character code), terminated by a `0` byte, followed by
+`text_x`, `text_y`, `text_size`, `text_colour` (RGB565),
+`text_background_colour` (RGB565), `text_draw = 1`.
+
+**`speaker` audio** (`audio/SpeakerThread.java`) — the daemon captures its
+PulseAudio default sink's `.monitor` with `pamon --format=s16le --channels=1
+--rate=32000` and streams the samples into `speaker.data`:
+
+- 3 batches of **112 samples** (224 bytes) per read, each batch a
+  `FlatDictionary` with 112 consecutive keys from the `speaker.data` floor
+  and 2-byte signed little-endian samples, sent as one request carrying 3
+  buffers;
+- `speaker.volume` (0..200) scales playback; the firmware also exposes
+  `free_space_in_bytes` and `autoReloadPeriod` for flow control;
+- samples are skipped (never queued) when the link reports backpressure.
+
+`speaker.say` / `play` are *not* Java: they live in the daemon's bundled
+Python (`META-INF/resources/python/global_service/service.py`) and simply
+play audio on the Pi (pyttsx3 for `say`, ffplay for `play`), which the
+speaker thread then mirrors to the cube. A reimplementation can bypass
+PulseAudio entirely by generating PCM itself and writing it to
+`speaker.data`.
+
+---
+
 ## 6. Bring-up sequence (daemon perspective)
 
 A minimal Python daemon needs to do this on startup:

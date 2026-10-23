@@ -85,26 +85,27 @@ def _set_hosted_cube(cube: LumiCube | None) -> None:
 
 
 @contextlib.contextmanager
-def open_or_use_hosted(port: str = SERIAL_DEVICE) -> Iterator[LumiCube]:
+def open_or_use_hosted(port: str = SERIAL_DEVICE,
+                       **lumi_kwargs: Any) -> Iterator[LumiCube]:
     """Yield a started ``LumiCube``, owning it iff we opened it.
 
     Usage in a native-API script:
 
         from pylumicube.compat import open_or_use_hosted
 
-        with open_or_use_hosted(args.port) as cube:
+        with open_or_use_hosted(args.port, telemetry=True) as cube:
             cube.display.fill(0xFF0000)
 
     When called under `lumicube-run`, this yields the runner's cube
     unchanged and does not close it on exit. Otherwise it opens a fresh
-    ``LumiCube(port)`` and tears it down on exit, just like the bare
-    `with LumiCube(port) as cube:` form.
+    ``LumiCube(port, **lumi_kwargs)`` and tears it down on exit, just like
+    the bare ``with LumiCube(port) as cube:`` form.
     """
     hosted = get_hosted_cube()
     if hosted is not None:
         yield hosted
         return
-    with LumiCube(port) as cube:
+    with LumiCube(port, **lumi_kwargs) as cube:
         yield cube
 
 

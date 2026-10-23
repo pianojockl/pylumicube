@@ -410,12 +410,28 @@ LICENSE                  # GPL-3.0
   foundry-daemon globals. Run with
   `lumicube-run scripts/original/<script.py>`.
 - **Native-API examples** at the top level (`scripts/digital_clock.py`,
-  `scripts/plasma.py`) — use `pylumicube.LumiCube` directly and are
-  launched as plain Python scripts
+  `scripts/plasma.py`, `scripts/ambient_clock.py`) — use
+  `pylumicube.LumiCube` directly and are launched as plain Python scripts
   (`python scripts/<script.py>`). They also work under `lumicube-run`
   via `pylumicube.compat.open_or_use_hosted`. The clock's optional
   weather feature depends on the `[extras]` install group; see the CLI
   section above.
+
+`scripts/ambient_clock.py` is the ambient-light clock: hours on the left
+panel, minutes on the right, with the brightness following
+`light_sensor.ambient_light` through an auto-ranging curve
+(`pylumicube.dimming`), so it dims in a dark room. Buttons scroll the
+time (top), reboot (middle, `ALLOW_REBOOT`) and report the CPU
+temperature (bottom — the LCD chart needs the `screen` module, which is
+not implemented yet). Configuration goes in
+`scripts/ambient_clock_config.py` (copy the `.example`); run it with
+
+```bash
+python scripts/ambient_clock.py            # forever
+python scripts/ambient_clock.py --once     # single frame, for testing
+python scripts/ambient_clock.py --seconds 30 --debug
+```
+
 
 `utilities/` contains helper tools used during bring-up and reverse-
 engineering (require a connected cube):

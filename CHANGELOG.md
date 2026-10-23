@@ -30,7 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arithmetic) — see PROTOCOL.md §5.2 and §7.
 
 ### Added
-- **Telemetry** (`pylumicube.telemetry.TelemetryStore`): subscription with
+- **Ambient-light dimming** (`pylumicube.dimming`): `BrightnessCurve` maps
+  a raw `light_sensor.ambient_light` reading to a 0..1 brightness with an
+  auto-ranging, decaying range (so it learns the room), optional gamma and
+  output smoothing; `scale_colour()` dims a 0xRRGGBB colour per channel so
+  the matrix's 8-bit precision survives (unlike the 0..100 global
+  brightness field).
+- **`scripts/ambient_clock.py`** — a native-API rewrite of the classic
+  community clock: hours/minutes panels with the original 3x5 digits and
+  hue shimmer, brightness driven by the ambient sensor, button handling
+  (scroll / reboot / CPU-temperature report), hourly chime, and a config
+  file (`scripts/ambient_clock_config.py.example`). Verified on hardware:
+  renders at the right brightness for the measured room light, adapts its
+  range, and survives the firmware's system-block decode quirks.
+- **Native coordinate and text rendering**: `Display.set_leds_xy`,
+  `set_led`, `set_all`, `set_panel`, `set_3d` and `scroll_text`, plus the
+  coordinate mappings (`xy_to_index`, `xyz_to_index`, `led_index`) that
+  used to live only in the compat shim. The shim now delegates, so there
+  is a single implementation. The 5x7 font moved to `pylumicube.font`
+  (`compat.font` re-exports it).
+- `open_or_use_hosted()` forwards `LumiCube` keyword arguments, so a
+  native script can ask for telemetry and still run under `lumicube-run`.
+
   heartbeat renewal, `PUBLISHED_FIELDS` decoding into a per-node value
   cache, `get`/`snapshot`/`wait_for`/`last_update`, and self-healing
   schemas — a frame referencing an unknown key schedules a targeted
