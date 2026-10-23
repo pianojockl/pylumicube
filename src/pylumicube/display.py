@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Mapping
+import time
+from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Optional
+from typing import Any, Optional
 
 from . import flat_dictionary
+from . import font
 from .constants import MAX_UAVCAN_PAYLOAD, TYPE_SET_FIELDS
 from .metadata import display_specs
 from .transport import Transport
@@ -41,6 +43,68 @@ LED_KEY_OFFSET = 266
 NUM_LEDS = 192
 SHOW_KEY = 1266
 BRIGHTNESS_KEY = 256
+
+
+# ----------------------------------------------------------------------
+# Coordinate mappings — verbatim from the upstream daemon's
+# `foundry_api/standard_library.py` (`_Display.set_leds` / `.set_3d`).
+# Community scripts address LEDs by coordinate, so these formulae are the
+# compatibility contract; `tests/test_compat_mappings.py` pins them.
+# ----------------------------------------------------------------------
+
+
+def xy_to_index(x: int, y: int) -> int | None:
+    """Map a 2D (x, y) coordinate to a 0..191 LED index, or None if off-cube.
+
+    The 16x16 coordinate space covers three of the cube's panels:
+
+    * ``x < 8 and y < 8``   — left panel
+    * ``8 <= x < 16, y < 8`` — top panel
+    * ``x < 8, 8 <= y < 16`` — right panel
+    """
+    if x < 0 or y < 0:
+        return None
+    if x < 8 and y < 8:
+        return 63 - x - 8 * y
+    if x < 16 and y < 8:
+        return 7 - y + 8 * x
+    if x < 8 and y < 16:
+        return 176 + y - 8 * x
+    return None
+
+
+def xyz_to_index(x: int, y: int, z: int) -> int | None:
+    """Map a 3D (x, y, z) face coordinate to a 0..191 LED index.
+
+    Face coordinates sit on the 8x8x8 cube's surface: ``z == 8`` is the
+    left panel, ``x == 8`` the right panel, ``y == 8`` the top panel.
+    """
+    if x < 0 or y < 0 or z < 0:
+        return None
+    if x < 8 and y < 8 and z == 8:
+        return 63 - x - 8 * y
+    if y < 8 and z < 8 and x == 8:
+        return 127 - y - 8 * z
+    if z < 8 and x < 8 and y == 8:
+        return 191 - z - 8 * x
+    return None
+
+
+def led_index(key: object) -> int | None:
+    """Normalise a coordinate key into a 0..191 LED index.
+
+    Accepts an ``int`` (used as an index directly), an ``(x, y)`` tuple, or
+    an ``(x, y, z)`` tuple. Anything else — including off-cube coordinates
+    — returns None, matching upstream's "silently ignore" behaviour.
+    """
+    if isinstance(key, int):
+        return key if 0 <= key < NUM_LEDS else None
+    if isinstance(key, tuple):
+        if len(key) == 2:
+            return xy_to_index(int(key[0]), int(key[1]))
+        if len(key) == 3:
+            return xyz_to_index(int(key[0]), int(key[1]), int(key[2]))
+    return None
 
 
 class Display:
@@ -100,6 +164,128 @@ class Display:
             raise ValueError("brightness must be 0..255")
         return self._dispatch({BRIGHTNESS_KEY: brightness},
                               await_ack=await_ack, timeout=timeout)
+
+    # ------------------------------------------------------------------
+    # Coordinate writers (upstream-compatible)
+    # ------------------------------------------------------------------
+
+    def set_leds_xy(self, mapping: Mapping[Any, int], show: bool = True,
+                    *, await_ack: bool = False,
+                    timeout: float = 2.0) -> Optional[Future]:
+        """Set LEDs keyed by coordinate: an int index, ``(x, y)``, or ``(x, y, z)``.
+
+        Off-cube coordinates are dropped silently, as upstream does.
+        """
+        leds: dict[int, int] = {}
+        for key, colour in mapping.items():
+            idx = led_index(key)
+            if idx is None:
+                continue
+            leds[idx] = colour & 0xFFFFFF
+        if not leds:
+            return None
+        return self.set_leds(leds, show=show, await_ack=await_ack, timeout=timeout)
+
+    def set_led(self, x: int, y: int, colour: int, show: bool = True,
+                *, await_ack: bool = False,
+                timeout: float = 2.0) -> Optional[Future]:
+        """Set one LED by 2D panel coordinate."""
+        return self.set_leds_xy({(x, y): colour}, show=show,
+                                await_ack=await_ack, timeout=timeout)
+
+    def set_all(self, colour: int, show: bool = True,
+                *, await_ack: bool = False,
+                timeout: float = 2.0) -> Optional[Future]:
+        """Fill every LED (upstream's ``display.set_all``)."""
+        return self.fill(colour, show=show, await_ack=await_ack, timeout=timeout)
+
+    def set_panel(self, panel: str, colour_array: Sequence[Sequence[int]],
+                  show: bool = True, *, await_ack: bool = False,
+                  timeout: float = 2.0) -> Optional[Future]:
+        """Draw an 8x8 grid onto one panel: ``"left"``, ``"right"`` or ``"top"``.
+
+        ``colour_array`` is a list of 8 rows of 8 colours. Row 0 is the
+        panel's top row. Matches upstream's `set_panel` layout (left panel
+        starts at y=7 descending, right at x=8, top at y=15).
+        """
+        start_x = 0
+        y = 7
+        if panel == "top":
+            y += 8
+        elif panel == "right":
+            start_x += 8
+        elif panel != "left":
+            raise ValueError("The panel must be 'left', 'right', or 'top'")
+        leds: dict[tuple[int, int], int] = {}
+        for row in colour_array:
+            x = start_x
+            for colour in row:
+                leds[(x, y)] = colour
+                x += 1
+            y -= 1
+        return self.set_leds_xy(leds, show=show, await_ack=await_ack, timeout=timeout)
+
+    def set_3d(self, mapping: Mapping[tuple[int, int, int], int], show: bool = True,
+               *, await_ack: bool = False,
+               timeout: float = 2.0) -> Optional[Future]:
+        """Set LEDs by 3D face coordinate (upstream's ``display.set_3d``)."""
+        leds: dict[int, int] = {}
+        for key, colour in mapping.items():
+            if not isinstance(key, tuple) or len(key) != 3:
+                continue
+            idx = xyz_to_index(int(key[0]), int(key[1]), int(key[2]))
+            if idx is None:
+                continue
+            leds[idx] = colour & 0xFFFFFF
+        if not leds:
+            return None
+        return self.set_leds(leds, show=show, await_ack=await_ack, timeout=timeout)
+
+    def scroll_text(self, text: str, colour: int = 0xFFFFFF,
+                    background_colour: int = 0x000000, speed: float = 1.0,
+                    with_gap: bool = True, *, timeout: float = 2.0) -> None:
+        """Scroll ``text`` once across the 16x8 LED area (blocking).
+
+        Lays the rendered glyphs into a row buffer 16 columns wider than
+        the visible area (so text enters from the right and exits to the
+        left), then walks an 8-row window across it at ``0.05 / speed``
+        seconds per column. Uses the built-in 5x7 font (`pylumicube.font`)
+        rather than upstream's PIL-rendered ``slkscr.ttf``.
+
+        This is a timed animation, so it blocks for its duration and
+        returns once the last frame has been ACK'd.
+        """
+        glyph_rows = font.render_text(text)
+        if not glyph_rows or not glyph_rows[0]:
+            return
+        text_width = len(glyph_rows[0])
+        pad = 16
+        width = text_width + pad * 2
+        rows = [[0] * width for _ in range(8)]
+        for r, glyph_row in enumerate(glyph_rows):
+            target_row = r + 1  # one-pixel top margin, fits the 8-tall area
+            if target_row >= 8:
+                continue
+            for x, pixel in enumerate(glyph_row):
+                rows[target_row][pad + x] = pixel
+
+        period = 0.05 / max(speed, 0.0001)
+        for shift in range(width - 16):
+            frame_start = time.monotonic()
+            window = [row[shift : shift + 17] for row in rows]
+            leds: dict[tuple[int, int], int] = {}
+            for r, row in enumerate(window):
+                for x, pixel in enumerate(row):
+                    plotted_x = x - 1 if (with_gap and x > 8) else x
+                    if plotted_x >= 16:
+                        continue
+                    leds[(plotted_x, 7 - r)] = colour if pixel else background_colour
+            self.set_leds_xy(leds, timeout=timeout)
+            elapsed = time.monotonic() - frame_start
+            if elapsed < period:
+                time.sleep(period - elapsed)
+        # Ensure the last frame is on the wire before returning.
+        self.flush(timeout=timeout)
 
     # ------------------------------------------------------------------
     # Async lifecycle

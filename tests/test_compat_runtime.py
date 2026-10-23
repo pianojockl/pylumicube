@@ -34,57 +34,60 @@ def _make_shim() -> tuple[DisplayShim, MagicMock]:
 def test_set_led_calls_set_leds_with_correct_index() -> None:
     shim, fake = _make_shim()
     shim.set_led(0, 0, 0xFF0000)
-    # (0,0) maps to LED index 63 per upstream.
-    fake.set_leds.assert_called_once_with({63: 0xFF0000}, show=True)
+    # (0,0) maps to LED index 63 per upstream; the mapping happens in the
+    # native Display, so the shim forwards the coordinate unchanged.
+    fake.set_leds_xy.assert_called_once_with({(0, 0): 0xFF0000}, show=True)
 
 
 def test_set_leds_dict_int_keys_pass_through() -> None:
     shim, fake = _make_shim()
     shim.set_leds({0: 0x123456, 191: 0x654321})
-    fake.set_leds.assert_called_once_with({0: 0x123456, 191: 0x654321}, show=True)
+    fake.set_leds_xy.assert_called_once_with({0: 0x123456, 191: 0x654321}, show=True)
 
 
 def test_set_leds_dict_2tuple_keys() -> None:
     shim, fake = _make_shim()
     shim.set_leds({(0, 0): 0xFF0000, (7, 7): 0x00FF00})
-    fake.set_leds.assert_called_once_with({63: 0xFF0000, 0: 0x00FF00}, show=True)
+    # The coordinate→index mapping lives in the native Display now; the shim
+    # passes the mapping through unchanged.
+    fake.set_leds_xy.assert_called_once_with({(0, 0): 0xFF0000, (7, 7): 0x00FF00},
+                                             show=True)
 
 
 def test_set_leds_dict_3tuple_keys() -> None:
     shim, fake = _make_shim()
     shim.set_leds({(0, 0, 8): 0xAABBCC, (8, 0, 0): 0xDDEEFF})
-    fake.set_leds.assert_called_once_with({63: 0xAABBCC, 127: 0xDDEEFF}, show=True)
+    fake.set_leds_xy.assert_called_once_with({(0, 0, 8): 0xAABBCC, (8, 0, 0): 0xDDEEFF},
+                                             show=True)
 
 
 def test_set_leds_drops_invalid_coords() -> None:
     shim, fake = _make_shim()
-    # (8, 8) is the unmapped quadrant — should be silently dropped.
     shim.set_leds({(0, 0): 0xFF0000, (8, 8): 0x00FF00})
-    fake.set_leds.assert_called_once_with({63: 0xFF0000}, show=True)
+    fake.set_leds_xy.assert_called_once_with({(0, 0): 0xFF0000, (8, 8): 0x00FF00},
+                                             show=True)
 
 
-def test_set_all_uses_fill() -> None:
+def test_set_all_delegates_to_set_all() -> None:
     shim, fake = _make_shim()
     shim.set_all(0x00FF00)
-    fake.fill.assert_called_once_with(0x00FF00, show=True)
+    fake.set_all.assert_called_once_with(0x00FF00, show=True)
 
 
-def test_set_panel_left_anchor() -> None:
-    """Upstream: ``set_panel('left', rows)`` starts at (0, 7) and y descends.
-    First row goes to y=7 (LEDs 56..63 in (x,y) space)."""
+def test_set_panel_delegates_to_native() -> None:
     shim, fake = _make_shim()
-    # 8 rows of 8 colours, all = 0xAAA so we can pick the indices off.
     rows = [[0xAAAAAA] * 8 for _ in range(8)]
     shim.set_panel("left", rows)
-    sent = fake.set_leds.call_args[0][0]
-    # All 64 LEDs on the left panel (indices 0..63) should be lit.
-    assert set(sent.keys()) == set(range(64))
+    fake.set_panel.assert_called_once_with("left", rows, show=True)
 
 
 def test_set_panel_invalid_name() -> None:
-    shim, _ = _make_shim()
+    """Validation lives in the native writer; a real Display rejects it."""
+    shim, fake = _make_shim()
+    fake.set_panel.side_effect = ValueError("The panel must be 'left', 'right', or 'top'")
     with pytest.raises(ValueError):
         shim.set_panel("nope", [[0]])
+
 
 
 def test_brightness_round_trip_via_property() -> None:
@@ -221,15 +224,14 @@ def test_build_globals_display_alias_matches_cube_display() -> None:
 # ---- scroll_text smoke test --------------------------------------------
 
 
-def test_scroll_text_emits_frames_and_clears() -> None:
-    """scroll_text should call set_leds at least once per shifted column.
-
-    We don't validate the exact pixel layout (font choice is internal),
-    just that the loop executes and the wrapped Display sees writes.
-    """
+def test_scroll_text_delegates_to_the_display() -> None:
+    """scroll_text is part of the native Display API now; the shim forwards."""
     shim, fake = _make_shim()
-    shim.scroll_text("A", speed=1000)  # speed=1000 → near-zero sleep
-    assert fake.set_leds.call_count > 0
+    shim.scroll_text("A", colour=0x00FF00, speed=1000)
+    fake.scroll_text.assert_called_once_with("A", colour=0x00FF00,
+                                            background_colour=0x000000,
+                                            speed=1000, with_gap=True)
+
 
 
 # ---- Hosted-cube registry ----------------------------------------------

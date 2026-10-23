@@ -23,10 +23,10 @@ from colorsys import hsv_to_rgb
 from typing import Any, Callable, Iterator, Mapping
 
 from ..constants import SERIAL_DEVICE
-from ..display import NUM_LEDS, Display
+from ..display import NUM_LEDS, Display, led_index, xy_to_index, xyz_to_index
 from ..modules import FieldModule
 from ..node import LumiCube
-from . import font as _font
+from . import font as _font  # noqa: F401 — kept for compatibility
 
 log = logging.getLogger(__name__)
 
@@ -182,44 +182,12 @@ white_noise = "white_noise"
 
 # ----- Display shim --------------------------------------------------------
 
-
-def _xy_to_index(x: int, y: int) -> int | None:
-    """Map a 16x16 logical (x, y) coordinate to a 0..191 LED index.
-
-    Pinned to upstream `_Display.set_leds`:
-        if x < 8 and y < 8:    63 - x - 8*y
-        elif x < 16 and y < 8: 7 - y + 8*x
-        elif x < 8 and y < 16: 176 + y - 8*x
-        else:                  (silently ignored)
-    """
-    if x < 0 or y < 0:
-        return None
-    if x < 8 and y < 8:
-        return 63 - x - 8 * y
-    if x < 16 and y < 8:
-        return 7 - y + 8 * x
-    if x < 8 and y < 16:
-        return 176 + y - 8 * x
-    return None
-
-
-def _xyz_to_index(x: int, y: int, z: int) -> int | None:
-    """Map a 3D (x, y, z) coordinate on a face of the cube to a 0..191 index.
-
-    Pinned to upstream `_Display.set_3d`:
-        if x<8 and y<8 and z==8:   63  - x - 8*y
-        elif y<8 and z<8 and x==8: 127 - y - 8*z
-        elif z<8 and x<8 and y==8: 191 - z - 8*x
-    """
-    if x < 0 or y < 0 or z < 0:
-        return None
-    if x < 8 and y < 8 and z == 8:
-        return 63 - x - 8 * y
-    if y < 8 and z < 8 and x == 8:
-        return 127 - y - 8 * z
-    if z < 8 and x < 8 and y == 8:
-        return 191 - z - 8 * x
-    return None
+# The coordinate mappings now live in the native API (`pylumicube.display`).
+# These aliases keep the shim — and tests/test_compat_mappings.py, which pins
+# them to the upstream formulae — pointing at a single implementation.
+_xy_to_index = xy_to_index
+_xyz_to_index = xyz_to_index
+_coerce_index = led_index
 
 
 class DisplayShim:
@@ -259,103 +227,37 @@ class DisplayShim:
         self.set_leds({(x, y): colour}, show=show)
 
     def set_leds(self, xy_to_colour: Mapping[Any, int], show: bool = True) -> None:
-        leds: dict[int, int] = {}
-        for key, colour in xy_to_colour.items():
-            idx = _coerce_index(key)
-            if idx is None:
-                continue
-            leds[idx] = colour & 0xFFFFFF
-        if not leds:
-            return
-        self._display.set_leds(leds, show=show)
+        self._display.set_leds_xy(xy_to_colour, show=show)
 
     def set_all(self, colour: int, show: bool = True) -> None:
-        self._display.fill(colour, show=show)
+        self._display.set_all(colour, show=show)
 
     def set_panel(self, panel: str, colour_array: list[list[int]], show: bool = True) -> None:
-        # Verbatim layout from upstream:
-        #   left  → start_x = 0, y starts at 7 (descending)
-        #   right → start_x = 8, y starts at 7
-        #   top   → start_x = 0, y starts at 15
-        start_x = 0
-        y = 7
-        if panel == "top":
-            y += 8
-        elif panel == "right":
-            start_x += 8
-        elif panel != "left":
-            raise ValueError("The panel must be 'left', 'right', or 'top'")
-        leds: dict[tuple[int, int], int] = {}
-        for row in colour_array:
-            x = start_x
-            for colour in row:
-                leds[(x, y)] = colour
-                x += 1
-            y -= 1
-        self.set_leds(leds, show=show)
+        self._display.set_panel(panel, colour_array, show=show)
 
     def set_3d(self, xyz_to_colour: Mapping[tuple[int, int, int], int],
                show: bool = True) -> None:
-        leds: dict[int, int] = {}
-        for key, colour in xyz_to_colour.items():
-            if not isinstance(key, tuple) or len(key) != 3:
-                continue
-            idx = _xyz_to_index(*key)
-            if idx is None:
-                continue
-            leds[idx] = colour & 0xFFFFFF
-        if not leds:
-            return
-        self._display.set_leds(leds, show=show)
+        self._display.set_3d(xyz_to_colour, show=show)
 
     # ----- text scroller -----
 
     def scroll_text(self, text: str, colour: int = WHITE,
                     background_colour: int = BLACK, speed: float = 1.0,
                     with_gap: bool = True) -> None:
-        """Scroll ``text`` once across the 16×8 LED area.
+        """Scroll ``text`` once across the 16x8 LED area."""
+        self._display.scroll_text(text, colour=colour,
+                                  background_colour=background_colour,
+                                  speed=speed, with_gap=with_gap)
 
-        Lays the rendered glyphs into a row buffer 16 columns wider than
-        the visible area (so the text enters from the right and exits to
-        the left), then walks an 8-row window across it at
-        ``0.05 / speed`` seconds per column. Matches the upstream
-        ``display_scroll_text`` (PIL-based) behaviour closely enough for
-        community-script use.
-        """
-        # Top padding so the 7-row glyph sits on rows 1..7 (row 0 stays blank);
-        # upstream draws into an 8-row image with text at y = 7-height.
-        glyph_rows = _font.render_text(text)
-        text_width = len(glyph_rows[0])
-        # Empty image is wider than visible area on both sides so text
-        # enters/exits cleanly.
-        pad = 16
-        width = text_width + pad * 2
-        rows = [[0] * width for _ in range(8)]
-        for r, glyph_row in enumerate(glyph_rows):
-            target_row = r + 1  # one-pixel top margin → fits in 8-tall area
-            if target_row >= 8:
-                continue
-            for x, pixel in enumerate(glyph_row):
-                rows[target_row][pad + x] = pixel
+    # ----- text scroller -----
 
-        period = 0.05 / max(speed, 0.0001)
-        for shift in range(width - 16):
-            frame_start = time.time()
-            window = [row[shift : shift + 17] for row in rows]
-            leds: dict[tuple[int, int], int] = {}
-            for r, row in enumerate(window):
-                for x, pixel in enumerate(row):
-                    if with_gap and x > 8:
-                        plotted_x = x - 1
-                    else:
-                        plotted_x = x
-                    if plotted_x >= 16:
-                        continue
-                    leds[(plotted_x, 7 - r)] = colour if pixel else background_colour
-            self.set_leds(leds)
-            dt = time.time() - frame_start
-            if dt < period:
-                time.sleep(period - dt)
+    def scroll_text(self, text: str, colour: int = WHITE,
+                    background_colour: int = BLACK, speed: float = 1.0,
+                    with_gap: bool = True) -> None:
+        """Scroll ``text`` once across the 16x8 LED area."""
+        self._display.scroll_text(text, colour=colour,
+                                  background_colour=background_colour,
+                                  speed=speed, with_gap=with_gap)
 
 
 def _coerce_index(key: Any) -> int | None:
