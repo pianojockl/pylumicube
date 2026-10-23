@@ -12,7 +12,9 @@ import concurrent.futures as _cf
 import contextlib
 import logging
 import math
+import os
 import random
+import socket
 import sys
 import threading
 import time
@@ -22,6 +24,7 @@ from typing import Any, Callable, Iterator, Mapping
 
 from ..constants import SERIAL_DEVICE
 from ..display import NUM_LEDS, Display
+from ..modules import FieldModule
 from ..node import LumiCube
 from . import font as _font
 
@@ -376,10 +379,146 @@ def _coerce_index(key: Any) -> int | None:
     return None
 
 
+# ----- Telemetry-backed modules -------------------------------------------
+
+
+class TelemetryModuleShim:
+    """Read-only module backed by the telemetry cache (upstream field API).
+
+    ``light_sensor.ambient_light`` and friends. Semantics mirror the
+    foundry-daemon proxies:
+
+      * an unknown field name raises AttributeError (upstream raises too),
+      * a field the node has published reads as its current value,
+      * while the backing node has published *nothing* yet, reads raise
+        AttributeError as well — that is what makes the upstream idiom
+        ``while True: try: x = light_sensor.ambient_light except: sleep()``
+        work, and it keeps scripts from acting on a bogus 0/None.
+    """
+
+    def __init__(self, module: FieldModule) -> None:
+        object.__setattr__(self, "_module", module)
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        module: FieldModule = object.__getattribute__(self, "_module")
+        try:
+            ref = module.ref(name)
+        except AttributeError:
+            raise AttributeError(
+                f"'{module.name}' module has no field '{name}'") from None
+        value = module.get(name)
+        if value is None and not module.has_data():
+            raise AttributeError(
+                f"'{module.name}.{name}' is not available yet "
+                f"(no telemetry from node {ref.node_id})")
+        return value
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+            return
+        raise AttributeError(f"'{self._module.name}' fields are read-only")
+
+    @property
+    def field_names(self) -> list[str]:
+        return self._module.field_names
+
+    def wait_for(self, name: str, timeout: float | None = None,
+                 default: int | None = None) -> int | None:
+        """Block until `name` has been published (compat extension)."""
+        return self._module.wait_for(name, timeout, default)
+
+    def __repr__(self) -> str:
+        return f"<TelemetryModuleShim {self._module.name!r}>"
+
+
+class PiModule:
+    """The daemon-local ``pi`` pseudo-module (no hardware involved).
+
+    Mirrors ``global_service/service.py``'s ``pi_*`` helpers: the same
+    methods, reading the same Linux interfaces.
+    """
+
+    _THERMAL = "/sys/class/thermal/thermal_zone0/temp"
+
+    def cpu_temp(self) -> float:
+        """CPU temperature in degrees Celsius."""
+        with open(self._THERMAL) as fh:
+            return int(fh.read().strip()) / 1000.0
+
+    def cpu_percent(self) -> float:
+        """CPU utilisation percentage since the previous call (0..100)."""
+        fields = self._read_proc_stat()
+        if fields is None:
+            return 0.0
+        total = sum(fields)
+        idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
+        prev = getattr(self, "_prev_stat", None)
+        self._prev_stat = (total, idle)
+        if prev is None:
+            return 0.0
+        total_delta = total - prev[0]
+        idle_delta = idle - prev[1]
+        if total_delta <= 0:
+            return 0.0
+        return max(0.0, min(100.0, 100.0 * (total_delta - idle_delta) / total_delta))
+
+    def ram_percent_used(self) -> float:
+        """Used RAM as a percentage of total."""
+        info: dict[str, int] = {}
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].endswith(":"):
+                    info[parts[0][:-1]] = int(parts[1])
+        total = info.get("MemTotal", 0)
+        available = info.get("MemAvailable", info.get("MemFree", 0))
+        if total <= 0:
+            return 0.0
+        return 100.0 * (total - available) / total
+
+    def disk_percent(self, path: str = "/") -> float:
+        """Used disk space on the filesystem holding `path`, as a percentage."""
+        stat = os.statvfs(path)
+        total = stat.f_blocks * stat.f_frsize
+        free = stat.f_bavail * stat.f_frsize
+        if total <= 0:
+            return 0.0
+        return 100.0 * (total - free) / total
+
+    def ip_address(self) -> str:
+        """Primary outbound IP address (no packets are actually sent)."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
+        finally:
+            sock.close()
+
+    @staticmethod
+    def _read_proc_stat() -> list[int] | None:
+        try:
+            with open("/proc/stat") as fh:
+                first = fh.readline().split()
+        except OSError:
+            return None
+        if not first or first[0] != "cpu":
+            return None
+        try:
+            return [int(value) for value in first[1:]]
+        except ValueError:
+            return None
+
+
 # ----- Stubs for not-yet-implemented modules ------------------------------
 
 
 class StubModule:
+
     """Placeholder for a hardware module we haven't wired up yet.
 
     Attribute lookups split on the ``available_fields`` allowlist:
@@ -452,6 +591,45 @@ class _StubCallable:
         return hash((self._module, self._attr))
 
 
+class _LazyModule:
+    """Defers building a compat module until the script first touches it.
+
+    ``build_globals`` pre-populates every module name, but a display-only
+    community script must not pay for telemetry setup (schema discovery +
+    subscription) just because ``light_sensor`` exists in its namespace.
+    """
+
+    def __init__(self, factory: Callable[[], Any], name: str) -> None:
+        object.__setattr__(self, "_factory", factory)
+        object.__setattr__(self, "_module_name", name)
+        object.__setattr__(self, "_resolved", None)
+
+    def _resolve(self) -> Any:
+        resolved = object.__getattribute__(self, "_resolved")
+        if resolved is None:
+            factory = object.__getattribute__(self, "_factory")
+            resolved = factory()
+            object.__setattr__(self, "_resolved", resolved)
+        return resolved
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._resolve(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._resolve(), name, value)
+
+    def __repr__(self) -> str:
+        name = object.__getattribute__(self, "_module_name")
+        resolved = object.__getattribute__(self, "_resolved")
+        state = "resolved" if resolved is not None else "lazy"
+        return f"<LazyModule {name!r} ({state})>"
+
+
 # ----- Top-level facade ----------------------------------------------------
 
 
@@ -460,43 +638,73 @@ class LumiCubeCompat:
 
     Attributes match upstream's ``LumiCube``: ``display``, ``microphone``,
     ``speaker``, ``screen``, ``buttons``, ``light_sensor``, ``imu``,
-    ``env_sensor``, ``pi``. Only ``display`` is hardware-backed for now;
-    the rest are warn+no-op stubs (see [README.md] Todo list).
+    ``env_sensor``, ``pi``.
+
+    ``display`` is hardware-backed directly. The sensor modules
+    (``light_sensor``, ``buttons``, ``env_sensor``, ``imu``) are backed by
+    node telemetry: the first access to one of them enables telemetry on
+    the cube (schema discovery + subscription), so display-only scripts
+    never pay for it. ``pi`` is implemented locally. ``screen``,
+    ``speaker`` and ``microphone`` remain warn+no-op stubs.
     """
+
+    #: Modules served from node telemetry (lazy: enabled on first access).
+    _TELEMETRY_MODULES = ("light_sensor", "buttons", "env_sensor", "imu")
+
+    #: Wall-clock budget per node for the initial schema walk. Deliberately
+    #: small: the cube base board's walk is slow (many probes, wide blocks)
+    #: and any block it misses is re-probed on demand when a telemetry
+    #: frame references it. Display-only scripts never pay this at all.
+    _SCHEMA_BUDGET = 6.0
 
     def __init__(self, cube: LumiCube) -> None:
         self._cube = cube
         self.display = DisplayShim(cube.display)
-        self.buttons = StubModule(
-            "buttons",
-            available_fields=(
-                "top_pressed", "middle_pressed", "bottom_pressed",
-                "top_pressed_count", "middle_pressed_count", "bottom_pressed_count",
-            ),
-        )
-        self.light_sensor = StubModule(
-            "light_sensor",
-            available_fields=(
-                "ambient_light", "red", "green", "blue", "last_gesture",
-                "num_gestures", "within_proximity", "num_times_within_proximity",
-            ),
-        )
-        self.env_sensor = StubModule(
-            "env_sensor", available_fields=("temperature", "pressure", "humidity"),
-        )
-        self.imu = StubModule(
-            "imu",
-            available_fields=(
-                "pitch", "roll", "yaw",
-                "acceleration_x", "acceleration_y", "acceleration_z",
-                "angular_velocity_x", "angular_velocity_y", "angular_velocity_z",
-                "gravity_x", "gravity_y", "gravity_z",
-            ),
-        )
+        # Telemetry-backed modules are installed on first access; until
+        # then the attribute is absent from __dict__ and __getattr__ builds
+        # it (which is also where telemetry gets switched on).
         self.screen = StubModule("screen")
         self.speaker = StubModule("speaker", available_fields=("volume",))
         self.microphone = StubModule("microphone", available_fields=("enable",))
-        self.pi = StubModule("pi")
+        self.pi = PiModule()
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if name not in self._TELEMETRY_MODULES:
+            raise AttributeError(name)
+        module = self._telemetry_module(name)
+        object.__setattr__(self, name, module)
+        return module
+
+    def lazy(self, name: str) -> _LazyModule:
+        """A module handle that only enables telemetry when actually used."""
+        if name not in self._TELEMETRY_MODULES:
+            return _LazyModule(lambda: getattr(self, name), name)
+        return _LazyModule(lambda: self._telemetry_module(name), name)
+
+    def _telemetry_module(self, name: str):
+        cube: LumiCube = object.__getattribute__(self, "_cube")
+        if cube.telemetry is None:
+            log.info("compat: enabling telemetry for '%s' access", name)
+            try:
+                cube.enable_telemetry(budget=self._SCHEMA_BUDGET)
+            except Exception:  # noqa: BLE001 — fall back to a stub below
+                log.exception("compat: telemetry unavailable; '%s' stays stubbed", name)
+        field_module: FieldModule | None = None
+        if cube.telemetry is not None:
+            try:
+                field_module = cube.modules.get(name)
+            except Exception:  # noqa: BLE001
+                log.exception("compat: could not build the module namespace")
+        if field_module is None:
+            warnings.warn(
+                f"pylumicube compat: module '{name}' is not available on this "
+                f"cube; returning a no-op stub. Script may not behave correctly.",
+                RuntimeWarning, stacklevel=3)
+            return StubModule(name)
+        return TelemetryModuleShim(field_module)
+
 
 
 # ----- Globals builder + runner -------------------------------------------
@@ -512,13 +720,15 @@ def build_globals(cube: LumiCube | LumiCubeCompat) -> dict[str, Any]:
         "time": time,
         "math": math,
         "random": random,
-        # Hardware facade + per-module top-level aliases.
+        # Hardware facade + per-module top-level aliases. The sensor
+        # modules are lazy handles: touching one is what switches
+        # telemetry on, so display-only scripts stay cheap.
         "cube": compat,
         "display": compat.display,
-        "buttons": compat.buttons,
-        "light_sensor": compat.light_sensor,
-        "env_sensor": compat.env_sensor,
-        "imu": compat.imu,
+        "buttons": compat.lazy("buttons"),
+        "light_sensor": compat.lazy("light_sensor"),
+        "env_sensor": compat.lazy("env_sensor"),
+        "imu": compat.lazy("imu"),
         "screen": compat.screen,
         "speaker": compat.speaker,
         "microphone": compat.microphone,

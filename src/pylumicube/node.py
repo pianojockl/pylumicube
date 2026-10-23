@@ -13,7 +13,9 @@ import logging
 import threading
 import time
 import uuid
+from collections.abc import Iterable
 
+from . import discovery as _discovery
 from . import uavcan as u
 from .allocator import Allocator
 from .constants import (
@@ -26,6 +28,9 @@ from .constants import (
 )
 from .display import Display
 from .link import SerialLink
+from .metadata import FieldSpec, display_specs
+from .modules import CUBE_NODE_NAMES, FieldModule, build_namespace
+from .telemetry import DEFAULT_CADENCE, TelemetryStore
 from .transport import Transport
 
 log = logging.getLogger(__name__)
@@ -37,12 +42,25 @@ class LumiCube:
     def __init__(self, port: str = SERIAL_DEVICE, *, baudrate: int = BAUD,
                  source_id: int = DAEMON_NODE_ID,
                  handshake_timeout: float = 5.0,
-                 discovery_timeout: float = 3.0) -> None:
+                 discovery_timeout: float = 3.0,
+                 telemetry: bool = False,
+                 telemetry_cadence: float = DEFAULT_CADENCE,
+                 schema_timeout: float = 1.5,
+                 schema_budget: float = 15.0,
+                 schema_nodes: Iterable[int] | None = None,
+                 schema_node_names: Iterable[str] | None = None) -> None:
         self._port = port
         self._baudrate = baudrate
         self._source_id = source_id
         self._handshake_timeout = handshake_timeout
         self._discovery_timeout = discovery_timeout
+        self._telemetry_enabled = telemetry
+        self._telemetry_cadence = telemetry_cadence
+        self._schema_timeout = schema_timeout
+        self._schema_budget = schema_budget
+        self._schema_nodes = list(schema_nodes) if schema_nodes is not None else None
+        self._schema_node_names = (list(schema_node_names)
+                                   if schema_node_names is not None else None)
 
         self._link: SerialLink | None = None
         self._transport: Transport | None = None
@@ -55,6 +73,13 @@ class LumiCube:
         # Held for the lifetime of the LumiCube so its async worker
         # thread and pending-write state persist across calls.
         self._display_instance: Display | None = None
+        # Telemetry: per-node field schemas (from ENUMERATE_FIELDS), the
+        # value cache fed by PUBLISHED_FIELDS broadcasts, and the module
+        # namespace built from them.
+        self._schemas: dict[int, dict[int, FieldSpec]] = {}
+        self._telemetry: TelemetryStore | None = None
+        self._namespace: dict[str, FieldModule] | None = None
+
 
     # ---------------- lifecycle ----------------
 
@@ -80,8 +105,18 @@ class LumiCube:
         self._wait_for_nodes()
         self._discover_names()
         self._display_node_id = self._pick_display_node()
+        if self._telemetry_enabled:
+            self.enable_telemetry()
 
     def stop(self) -> None:
+        # Stop the telemetry heartbeat before closing the wire, so the
+        # renewal thread can't race with link teardown.
+        if self._telemetry is not None:
+            try:
+                self._telemetry.stop()
+            except Exception:  # noqa: BLE001
+                log.exception("error stopping telemetry")
+            self._telemetry = None
         # Drain pending async display writes before closing the wire so
         # the last frame the script asked for actually lands.
         if self._display_instance is not None:
@@ -127,6 +162,172 @@ class LumiCube:
         if self._display_instance is None:
             self._display_instance = Display(self._transport, self._display_node_id)
         return self._display_instance
+
+    # ---------------- telemetry ----------------
+
+    def enable_telemetry(self, node_ids: Iterable[int] | None = None,
+                         node_names: Iterable[str] | None = None, *,
+                         subscribe: bool = True,
+                         budget: float | None = None) -> TelemetryStore:
+        """Discover field schemas, subscribe to telemetry, build the namespace.
+
+        Idempotent — repeated calls return the existing store. `node_ids` /
+        `node_names` restrict which nodes get walked and subscribed to;
+        both default to the constructor's `schema_nodes` /
+        `schema_node_names`, and to every discovered node when those are
+        unset too. `budget` overrides `schema_budget` for this call.
+        """
+        if self._telemetry is not None:
+            return self._telemetry
+        store = TelemetryStore(self.transport, cadence=self._telemetry_cadence,
+                               repair_schema=self._repair_schema)
+        targets = self._resolve_nodes(node_ids, node_names)
+        if not targets:
+            log.warning("enable_telemetry: no nodes discovered to subscribe to")
+        for node_id in targets:
+            specs = self.discover_schema(node_id, budget=budget)
+            if specs:
+                store.set_schema(node_id, specs)
+        self._telemetry = store
+        self._namespace = None
+        if subscribe:
+            store.subscribe()
+        store.start()
+        return store
+
+    def _resolve_nodes(self, node_ids: Iterable[int] | None,
+                       node_names: Iterable[str] | None) -> list[int]:
+        if node_ids is None and node_names is None:
+            node_ids, node_names = self._schema_nodes, self._schema_node_names
+        if node_ids is not None:
+            return sorted({int(node_id) for node_id in node_ids})
+        if node_names is not None:
+            wanted = [name.lower() for name in node_names]
+            return sorted(node_id for node_id, name in self._names.items()
+                          if any(w in name.lower() for w in wanted))
+        return sorted(self._allocated)
+
+    def discover_schema(self, node_id: int, *,
+                        budget: float | None = None) -> dict[int, FieldSpec]:
+        """Walk node `node_id`'s ENUMERATE_FIELDS schema (cached per node).
+
+        For the `cube` base board the hardcoded display schema is merged
+        in, because the firmware's "next field at floor >= k" hints step
+        over the display block's non-LED fields (see PROTOCOL.md §5.1).
+
+        `budget` caps the wall-clock time spent walking (default:
+        `schema_budget`). A truncated walk is safe: telemetry frames that
+        reference a block the walk missed trigger a targeted re-probe (see
+        `TelemetryStore`), so a small budget mostly trades a few dropped
+        frames for a much faster start.
+        """
+        cached = self._schemas.get(node_id)
+        if cached is not None:
+            return cached
+        name = self._names.get(node_id, "")
+        is_cube = name.lower() in CUBE_NODE_NAMES
+        started = time.monotonic()
+        try:
+            specs = _discovery.enumerate_fields(
+                self.transport, node_id,
+                extra_probe_keys=_discovery.CUBE_WELL_KNOWN_KEYS if is_cube else (),
+                timeout=self._schema_timeout,
+                max_seconds=self._schema_budget if budget is None else budget,
+            )
+        except Exception:  # noqa: BLE001 — a partial schema is still useful
+            log.exception("schema discovery failed for node %d", node_id)
+            specs = {}
+        if is_cube:
+            merged = display_specs()
+            merged.update(specs)
+            specs = merged
+        self._schemas[node_id] = specs
+        log.info("node %d (%s): %d field block(s) discovered in %.1fs",
+                 node_id, name or "?", len(specs), time.monotonic() - started)
+        return specs
+
+    @property
+    def schemas(self) -> dict[int, dict[int, FieldSpec]]:
+        """Discovered per-node schemas: ``{node_id: {floor: FieldSpec}}``."""
+        return {node_id: dict(specs) for node_id, specs in self._schemas.items()}
+
+    def _repair_schema(self, node_id: int, key: int) -> bool:
+        """Probe one key and add it to a node's schema (telemetry callback).
+
+        Called when a `PUBLISHED_FIELDS` frame references a key the walk
+        did not discover — the firmware has been observed to answer a walk
+        probe with the *next* block, so a block can be transiently missed.
+        """
+        specs = self._schemas.get(node_id)
+        if specs is None or self._transport is None:
+            return False
+        result = _discovery.probe_key(self._transport, node_id, key,
+                                      timeout=self._schema_timeout)
+        if result is None:
+            return False
+        meta, rel = result
+        floor = _discovery._resolve_floor(self._transport, node_id, key, rel,
+                                         _discovery._signature(meta),
+                                         self._schema_timeout)
+        spec = _discovery.spec_from_metadata(floor, meta)
+        if not spec.covers(key):
+            # The firmware's gap arithmetic is not always consistent with
+            # the keys it actually publishes (observed for the system
+            # blocks at 60000+/2183+), so trust the probe: it answered for
+            # exactly this key.
+            spec = _discovery.spec_from_metadata(key, meta)
+        specs[spec.floor] = spec
+        store = self._telemetry
+        if store is not None:
+            store.set_schema(node_id, specs)
+        return True
+
+    @property
+    def telemetry(self) -> TelemetryStore | None:
+        return self._telemetry
+
+    @property
+    def node_names(self) -> dict[int, str]:
+        return dict(self._names)
+
+    def node_id_for_name(self, name: str) -> int | None:
+        """Resolve a preferred name (case-insensitive substring) to a node id."""
+        needle = name.lower()
+        for node_id, node_name in sorted(self._names.items()):
+            if needle in node_name.lower():
+                return node_id
+        return None
+
+    @property
+    def modules(self) -> dict[str, FieldModule]:
+        """Module namespace built from the discovered schemas.
+
+        Requires telemetry: the module objects read the telemetry cache.
+        """
+        if self._namespace is None:
+            if self._telemetry is None:
+                raise RuntimeError(
+                    "telemetry not enabled — construct with LumiCube(telemetry=True) "
+                    "or call enable_telemetry()")
+            self._namespace = build_namespace(self._schemas, self._names, self._telemetry)
+        return self._namespace
+
+    def module(self, name: str) -> FieldModule:
+        try:
+            return self.modules[name]
+        except KeyError:
+            raise KeyError(
+                f"no module {name!r}; known modules: {sorted(self.modules)}") from None
+
+    @property
+    def light_sensor(self) -> FieldModule | None:
+        """The `light_sensor` module (ambient_light, red/green/blue, gestures)."""
+        return self.modules.get("light_sensor") if self._telemetry is not None else None
+
+    @property
+    def buttons(self) -> FieldModule | None:
+        """The `buttons` module (top/middle/bottom pressed + counters)."""
+        return self.modules.get("buttons") if self._telemetry is not None else None
 
     # ---------------- discovery ----------------
 
