@@ -28,8 +28,8 @@ Java `foundry-daemon`.
 - [x] **Sensor board** — `light_sensor` (ambient light, RGB, proximity, gestures) and `buttons` (presses + counters) read from telemetry, with the discovered schema grouped into modules the way the daemon's `Namespace.build` does (`pylumicube.modules`). `env_sensor` / `imu` work the same way when the add-on board is present.
 - [x] **Upstream-script compat shim** — `pylumicube.compat` recreates the foundry-daemon globals (`cube`, `display`, `hsv_colour`, `noise_*`, colour constants, etc.). `lumicube-run script.py` execs a community script in that namespace; display-only scripts (rainbow, rain, binary_clock, conways_game_of_life, autumn_scene, land_grab, lava_lamp, ripples, scrolling_clock — all under `scripts/original/`) run unchanged. Sensor scripts work too: `light_sensor` / `buttons` / `env_sensor` / `imu` are telemetry-backed and `pi` is implemented locally.
 - [ ] **Microphone input** — telemetry plumbing is in place; still missing the audio capture path (`microphone.start_recording`, voice recognition, `get_frequency_buckets`).
-- [ ] **Secondary LCD screen** — `screen.set_pixel/set_pixels/draw_image/write_text` on the cube node (320×240). Runtime schema discovery landed with telemetry; the pixel-window/rectangle/text methods are still to be reverse-engineered (`ScreenSetHalfRowMethod`, `ScreenDrawRectangleMethod`, `ScreenWriteTextMethod` in the daemon jar).
-- [ ] **Speaker** — `speaker.say/play/tone/volume`: needs a paced 32 kHz PCM stream into `speaker.data` (224 B/frame) honouring the firmware's `free_space_in_bytes` / `autoReloadPeriod`, plus TTS.
+- [x] **Secondary LCD screen** — `LumiCube.screen`: `set_pixel`, `set_pixels`, `draw_rectangle`, `clear`, `write_text`, `draw_image` (Pillow, `[screen]` extra), plus `rotation` / `invert_colours` / `resolution_scaling`. Recipes transcribed from `ScreenSetHalfRowMethod` / `ScreenDrawRectangleMethod` / `ScreenWriteTextMethod`; verified on hardware.
+- [x] **Speaker** — `LumiCube.speaker`: `tone`, `play` (WAV), `say` (espeak-ng), `volume`, streaming 32 kHz mono PCM into `speaker.data` in the firmware's 112-sample chunks, pipelined and paced (no PulseAudio needed). Verified on hardware.
 
 **Tooling**
 
@@ -173,14 +173,19 @@ lumicube-run --no-clear scripts/original/rainbow.py
 ```
 
 Sensor / audio / screen modules (`microphone`, `speaker`, `screen`,
-`buttons`, `light_sensor`, `imu`, `env_sensor`, `pi`) are warn-and-no-op
-stubs for now — scripts that only poke the LED matrix run end to end;
-scripts that read sensors or play sounds will print a one-time
-`RuntimeWarning` per attribute and silently skip those calls.
+`buttons`, `light_sensor`, `imu`, `env_sensor`, `pi`): `buttons`,
+`light_sensor`, `env_sensor` and `imu` are served from real telemetry, and
+`screen` / `speaker` are served by the native drivers — so
+`screen.draw_image(...)`, `screen.write_text(...)`, `speaker.say(...)`,
+`speaker.tone(...)` and `speaker.volume` work in upstream-style scripts.
+`microphone` remains a warn-and-no-op stub (capturing audio would need the
+Pi's own sound input), and `pi` is a thin wrapper over local sensors.
+Anything a script pokes that is still a stub prints a one-time
+`RuntimeWarning` per attribute and silently skips the call.
 
 ### Native-API scripts
 
-The top-level `scripts/` directory ships two native-API examples:
+The top-level `scripts/` directory ships three native-API examples:
 
 - `scripts/digital_clock.py` — a "from scratch" clock that shows how to
   compute (x, y) → LED-index yourself and push frames via
@@ -190,6 +195,30 @@ The top-level `scripts/` directory ships two native-API examples:
   `scripts/original/lava_lamp.py`, but with precomputed surface
   geometry, vectorised HSV→RGB, and the async display path so the next
   frame's compute overlaps the previous frame's wire push.
+- `scripts/ambient_clock.py` — the community clock rewritten against the
+  native API, with ambient-light auto-dimming.
+- `scripts/screen_speaker_demo.py` — exercises the secondary LCD and the
+  speaker (tones, then speech) for a quick hardware check.
+
+The screen and speaker are plain attributes on the cube:
+
+```python
+from pylumicube import LumiCube
+
+with LumiCube(telemetry=True,
+              schema_node_names=("button_and_light_sensor",)) as cube:
+    cube.walk_all_schemas()          # keys for every board
+    cube.screen.clear(0x0000FF)
+    cube.screen.write_text(20, 100, "hello", 3, 0xFFFFFF)
+    cube.speaker.volume = 150
+    cube.speaker.say("hello from pylumicube")
+```
+
+Two hardware notes: screen commands take ~100-200 ms each (so a full-screen
+image is a tens-of-seconds operation), and audio needs the cube board's
+telemetry switched off — it competes for the link (308 vs 56 chunks/s),
+which is why the example subscribes to the sensor board only and walks the
+cube board's schema separately.
 
 Both are run as plain Python scripts:
 

@@ -432,36 +432,52 @@ repeating until the node returns nothing (`NoSuchElementException`).
 
 #### 4.5.1 Response leading-skip semantics (cube firmware)
 
-The cube's response always replays the query's outer structure
-(`skip k0, run-1, value`) with the value filled in. The **leading
-skip in the response is contextual** — not a direct report of the
-returned block's floor:
+The cube's response replays the query's outer structure (`skip k0, run-1,
+value`) with the value filled in. **The leading skip is the field's
+absolute key**, counted from key 0 — not a distance from the queried key.
 
-| Response leading skip       | Meaning |
-|-----------------------------|---------|
-| `0`                         | queried at exactly the block's floor |
-| equals queried `k0`         | **echo** — `k0` is inside a block; floor is somewhere ≤ `k0`, unspecified |
-| differs from queried `k0`   | **gap** — no block at `k0`; the next block's floor is `k0 + skip` |
+That is how the Java daemon reads it: `RecursiveDictionary.deserialise`
+starts its `keyAccumulator` at 0, applies the skip, and uses the result as
+the field's key (`QueryMetadataTask` then continues from
+`results.lastKey()`). Raw captures confirm it — each of these probes asked
+about one key and got a *different* field back:
 
-The unfortunate corollary: when `skip == k0`, the wire bytes are
-ambiguous between an echo (in-block at unknown floor) and a gap whose
-next floor happens to equal `2 × k0`. Disambiguate by probing one key
-forward: under gap interpretation the response at `k0+1` still points
-at the same `next_floor` so its rel decreases by 1, under echo
-interpretation rel tracks the query and equals `k0+1`. Concrete
-algorithm in `utilities/snapshot_hardware.py::_classify` /
-`_resolve_floor`.
+| Queried | Leading skip | Field returned      | Real key |
+|--------:|-------------:|---------------------|---------:|
+|     113 |          128 | `speaker.data`      |      128 |
+|     244 |          256 | `display.brightness`|      256 |
+|    1267 |         2048 | `screen.rectangle_x`|     2048 |
+|    3316 |         4096 | `button_pressed`    |     4096 |
 
-For walking the schema this means **you cannot rely on the leading
-skip alone to learn a block's floor**. After landing inside an echo
-case, binary-search backwards in `[max(0, k0 - span + 1), k0]`,
-classifying each probe the same way; gaps that point at the target
-block reveal the floor directly (`mid + rel`).
+Reading the skip as relative (`k0 + skip`) yields plausible-looking but
+wrong keys — it produced 241 for `speaker.data`, 3315 for `rectangle_x`
+and 60014 for `rdp_level` in earlier revisions of this document, and a
+"field blocks overlap" mystery that did not exist.
 
-The sub-dictionary itself is emitted **in-line, with no length
-prefix** — it consumes everything after the outer `01 01`. This
-diverges from the LEB128-prefixed RecursiveDictionary the Java daemon
-emits.
+**Walking the schema.** The daemon's query is
+
+```
+ENUMERATE_FIELDS:  skip key0 | run 1 | skip key1
+```
+
+meaning "skip to field `key0`, take one field, start its sub-dictionary at
+sub-key `key1`". It starts at `(0, 0)` and continues with
+`(lastFieldKey, lastSubKey + 1)`. Once the requested sub-key is past the
+end of that field's sub-dictionary, the firmware advances to the **next
+field in its internal table order** — which is *not* key order (the cube
+board visits speaker 128..243, then display 256..1266, then screen 2048+,
+then its own button 4096, then the system fields 60000+). Walking by key
+therefore steps over whole modules; walking by table order finds all 49
+fields on the cube board and 17 on the sensor board.
+
+A reply that never arrives (`None` in `pylumicube.discovery`) must be
+retried, while an answer with no field (`{}`) is the genuine end of the
+table. The link drops replies often enough that conflating the two used to
+truncate the schema.
+
+The sub-dictionary itself is emitted **in-line, with no length prefix** —
+it consumes everything after the outer `01 01`. This diverges from the
+LEB128-prefixed RecursiveDictionary the Java daemon emits.
 
 Each metadata sub-dictionary is keyed by the **bootstrap field IDs** in
 [BootstrapMetadata.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/bus/BootstrapMetadata.java):
@@ -685,29 +701,82 @@ The *node ids* are assigned by the allocator at each boot, so they are
 and `cube`=125 / sensor=124 (2026-10-23). Resolve nodes by
 `GET_PREFERRED_NAME`, never by id.
 
-On the `cube` node, what `utilities/snapshot_hardware.py` auto-walks via
-`ENUMERATE_FIELDS` (2026-05-14 capture, in
-`ref_data/snapshot_hardware-output.txt`):
+On the `cube` node the walk finds **49 fields** (2026-10-23 capture, in
+`ref_data/cube_snapshot.txt`). The keys below are the real ones — an earlier
+version of this document listed 241/3315/7412/67413, which came from reading
+the response's leading skip as a *relative* distance instead of an absolute
+field key (see §4.5.1):
 
-| Floor | Span | Field                      | Type | Size | Module       |
-|------:|-----:|----------------------------|------|------|--------------|
-|     0 |  112 | `data`                     | INT  | 2    | microphone   |
-|   112 |    1 | `enable`                   | BOOL | 1    | microphone   |
-|   241 |  112 | `data`                     | INT  | 2    | speaker      |
-|   266 |  999 | `led_colour`               | UINT | 3    | display      |
-|  1265 |    1 | `spread_spectrum_period`   | UINT | 2    | display (sys)|
-|  1266 |    1 | `show`                     | BOOL | 1    | display      |
-|  3315 |    1 | `rectangle_x`              | UINT | 2    | screen       |
-|  7412 |    1 | `button_pressed`           | BOOL | 1    | buttons      |
-| 67413 |    1 | `rdp_level`                | UINT | 4    | (system)     |
+| Key  | Span | Field                    | Type       | Size | Module       |
+|-----:|-----:|--------------------------|------------|-----:|--------------|
+|    0 |  112 | `data`                   | INT        | 2    | microphone   |
+|  112 |    1 | `enable`                 | BOOLEAN    | 1    | microphone   |
+|  128 |  112 | `data`                   | INT        | 2    | speaker      |
+|  240 |    1 | `volume`                 | UINT       | 2    | speaker      |
+|  241 |    1 | `frequency`              | UINT       | 4    | speaker (sys)|
+|  242 |    1 | `autoReloadPeriod`       | UINT       | 4    | speaker (sys)|
+|  243 |    1 | `free_space_in_bytes`    | UINT       | 4    | speaker (sys)|
+|  256 |    1 | `brightness`             | UINT       | 1    | display      |
+|  257 |    1 | `panel_width`            | UINT       | 2    | display      |
+|  258 |    1 | `panel_height`           | UINT       | 2    | display      |
+|  259 |    1 | `refresh_period`         | UINT       | 2    | display      |
+|  260 |    1 | `estimated_current`      | UINT       | 2    | display      |
+|  261 |    1 | `max_current`            | UINT       | 2    | display      |
+|  262 |    1 | `gamma_correction_enabled`| BOOLEAN   | 1    | display      |
+|  263 |    1 | `gamma_correction_red`   | UINT       | 1    | display      |
+|  264 |    1 | `gamma_correction_green` | UINT       | 1    | display      |
+|  265 |    1 | `gamma_correction_blue`  | UINT       | 1    | display      |
+|  266 |  999 | `led_colour`             | UINT       | 3    | display      |
+| 1265 |    1 | `spread_spectrum_period` | UINT       | 2    | display (sys)|
+| 1266 |    1 | `show`                   | BOOLEAN    | 1    | display      |
+| 2048 |    1 | `rectangle_x`            | UINT       | 2    | screen       |
+| 2049 |    1 | `rectangle_y`            | UINT       | 2    | screen       |
+| 2050 |    1 | `rectangle_width`        | UINT       | 2    | screen       |
+| 2051 |    1 | `rectangle_height`       | UINT       | 2    | screen       |
+| 2052 |    1 | `rectangle_colour`       | UINT       | 2    | screen (RGB565) |
+| 2053 |    1 | `rectangle_draw`         | BOOLEAN    | 1    | screen       |
+| 2054 |  128 | `text`                   | UTF8_CHAR  | 1    | screen       |
+| 2182 |    1 | `text_x`                 | UINT       | 2    | screen       |
+| 2183 |    1 | `text_y`                 | UINT       | 2    | screen       |
+| 2184 |    1 | `text_size`              | UINT       | 1    | screen       |
+| 2185 |    1 | `text_colour`            | UINT       | 2    | screen (RGB565) |
+| 2186 |    1 | `text_background_colour` | UINT       | 2    | screen (RGB565) |
+| 2187 |    1 | `text_draw`              | BOOLEAN    | 1    | screen       |
+| 2188 |    1 | `resolution_scaling`     | UINT       | 1    | screen       |
+| 2189 |    1 | `invert_colours`         | BOOLEAN    | 1    | screen       |
+| 2190 |    1 | `rotation`               | UINT       | 1    | screen       |
+| 2191 |    1 | `cmd_space_remaining`    | UINT       | 4    | screen (sys) |
+| 2192 |    1 | `pixel_window_x`         | UINT       | 2    | screen       |
+| 2193 |    1 | `pixel_window_y`         | UINT       | 2    | screen       |
+| 2194 |    1 | `pixel_window_width`     | UINT       | 2    | screen       |
+| 2195 |    1 | `pixel_window_height`    | UINT       | 2    | screen       |
+| 2196 |    1 | `start_pixel_streaming`  | BOOLEAN    | 1    | screen       |
+| 2197 |   80 | `pixel_data_stream`      | UINT       | 2    | screen (RGB565) |
+| 2277 |    1 | `stop_pixel_streaming`   | BOOLEAN    | 1    | screen       |
+| 4096 |    1 | `button_pressed`         | BOOLEAN    | 1    | buttons      |
+| 4097 |    1 | `button_pressed_count`   | UINT       | 4    | buttons      |
+|60000 |    1 | `rdp_level`              | UINT       | 4    | (system)     |
+|60001 |    1 | `assert_count`           | UINT       | 2    | (system)     |
+|60002 |   50 | `asserts`                | UTF8_CHAR  | 1    | (system)     |
+
+**No blocks overlap** — the overlap reported by an earlier revision of this
+document was an artefact of the relative-key misreading. The firmware's
+per-batch limits are visible in the spans: `pixel_data_stream` is 80 pixels
+and `text` is 128 characters, which is exactly what the daemon's screen
+methods assume.
+
+Note the key *order* is not the table order: the walk reaches the display
+block (256..1266) after the speaker block (128..243), then jumps to the screen
+(2048), the cube's own button (4096) and the system fields (60000+). Walking
+by key would step straight over `screen` and `speaker` — see §4.5.1.
 
 ### 5.2 The sensor board's schema (measured 2026-10-23)
 
-`ENUMERATE_FIELDS` on `button_and_light_sensor` yields 16 blocks. Keys
-0..13 are the published set (all `span 1`); the two `60000+` blocks are
+`ENUMERATE_FIELDS` on `button_and_light_sensor` yields 17 fields. Keys 0..13
+are the published set (all `span 1`); the three `60000+` fields are
 firmware-internal (`system = 1`) and are also published:
 
-| Floor | Field                        | Type       | Size | Module       |
+| Key   | Field                        | Type       | Size | Module       |
 |------:|------------------------------|------------|-----:|--------------|
 |     0 | `top_pressed`                | BOOLEAN    |    1 | buttons      |
 |     1 | `top_pressed_count`          | UINT       |    4 | buttons      |
@@ -723,8 +792,9 @@ firmware-internal (`system = 1`) and are also published:
 |    11 | `num_gestures`               | UINT       |    4 | light_sensor |
 |    12 | `within_proximity`           | BOOLEAN    |    1 | light_sensor |
 |    13 | `num_times_within_proximity` | UINT       |    4 | light_sensor |
+| 60000 | `rdp_level`                  | UINT       |    4 | (system)     |
+| 60001 | `assert_count`               | UINT       |    2 | (system)     |
 | 60002 | `asserts`                    | UTF8_CHAR  |    1 | (system)     |
-| 60014 | `rdp_level`                  | UINT       |    4 | (system)     |
 
 Notes:
 
@@ -733,44 +803,18 @@ Notes:
   a normally lit room (saturating much higher in daylight). A 0..255
   assumption (as the upstream `standard_library.py` examples imply) makes
   any `value / 255` dimming curve saturate immediately.
-- `ENUMERATE_FIELDS` reports `type`, `size`, `span`, `name` and `module`
-  but **omits `gettable`/`settable`/`idempotent`** — absent flags must be
-  treated as "not reported", not as false.
-- The system blocks are published at keys the walk does **not** resolve
-  consistently: probing key 14 returns `rdp_level` with a gap-skip that
-  implies floor 60014, yet the published frames carry `rdp_level` at
-  60000 and `assert_count` at 60001. The firmware's gap arithmetic and its
-  published keys disagree here, so a decoder must be able to add a block
-  for a key it actually sees (pylumicube re-probes the key and trusts the
-  probe over the arithmetic).
-- The walk can **transiently miss a block** (2026-10-23: `middle_pressed`
-  at key 2 was skipped in one session and present in the next). Observed
-  cause: the firmware answers a probe with the *next* block depending on
-  what was queried before it. A missing block shows up as an undecodable
-  telemetry frame, which is the reliable signal to re-probe that key.
+- `ENUMERATE_FIELDS` reports `type`, `size`, `span`, `name`, `module` and
+  (when set) `min_value`/`max_value`/`units`, but **omits
+  `gettable`/`settable`/`idempotent`** — absent flags must be treated as
+  "not reported", not as false.
+- The system fields are published at the same keys the walk reports
+  (60000/60001/60002). An earlier revision of this document claimed the
+  firmware's gap arithmetic disagreed here (60014 vs 60000); that was the
+  relative-key misreading again.
+- A dropped reply used to truncate the walk mid-schema (the link is lossy —
+  see §7). The walk now retries and distinguishes "answered, no field" from
+  "no answer at all".
 
-
-Direct probes by key (via `utilities/query_key.py`) also surface fields
-the walk steps over: `display.brightness` at **256** (UINT 1B, max
-100), and per earlier captures the other display fields
-(`panel_*` @ 257..261, `gamma_correction_*` @ 262..265). These exist on
-the wire — `query_key.py 256` returns their full metadata — but
-`ENUMERATE_FIELDS`'s "next field at floor ≥ k" walk does not visit
-them, because after `speaker.data` the cube's next-pointer jumps
-straight to the led_colour block (whose reported floor 266 is below
-the cursor 353 the walker is at — see §4.5.1; this is the *echo*
-case landing inside led_colour and binary-searching back to 266).
-
-**The reported field blocks overlap.** speaker.data (241..352) and
-display.led_colour (266..1264) cover the same keys 266..352;
-display.brightness (256..256) sits inside speaker.data's range. The
-overlap is consistent across queries (`query_key.py 266` returns
-led_colour; `query_key.py 256` returns brightness; the snapshot at
-`abs_key=353` returns led_colour). SET_FIELDS to key 266 verifiably
-sets LEDs (not speaker samples), so the firmware routes writes by some
-mechanism other than the published spans — possibly module-context in
-the request, possibly priority by metadata order. This is currently an
-open question (see §7).
 
 `led_colour` declares span 999 (= `MAX_LEDS-1` in the firmware) so the
 cube has room for up to 1000-pixel chains. On a 24×8 LumiCube only the
@@ -870,6 +914,33 @@ speaker thread then mirrors to the cube. A reimplementation can bypass
 PulseAudio entirely by generating PCM itself and writing it to
 `speaker.data`.
 
+#### Measured on hardware (2026-10-23)
+
+pylumicube implements all of the above natively (`pylumicube.screen`,
+`pylumicube.speaker`); the key numbers, since they shape any implementation:
+
+| Measurement | Value |
+|-------------|-------|
+| Screen command (one `SET_FIELDS` request) | ~100-200 ms — so a full-screen image (960 pixel batches) takes tens of seconds |
+| Service request round trip (any payload) | ~50-105 ms |
+| Pipelined throughput, tiny requests | ~600 frames/s |
+| Pipelined throughput, 112-sample speaker chunks | ~380 frames/s |
+| Real-time audio requirement | 286 chunks/s (32 kHz ÷ 112) |
+| Same, with the cube board's telemetry subscribed | ~56 chunks/s (audio unusable) |
+| Audio with only the sensor board subscribed | ~308 chunks/s (works) |
+
+Two consequences:
+
+- **Writes must not wait for a ServiceResponse** when the goal is
+  throughput: the firmware answers but takes tens of ms, so the drivers
+  submit and let the link-level ACK be the delivery signal
+  (`write_named(..., await_response=False, wait=False)`).
+- **Audio needs the cube board's telemetry switched off.** Subscribing to it
+  cuts throughput ~4x. Walk its schema separately
+  (`LumiCube.walk_all_schemas()`) so the speaker still knows its keys.
+
+`scripts/screen_speaker_demo.py` exercises both peripherals end to end.
+
 ---
 
 ## 6. Bring-up sequence (daemon perspective)
@@ -931,53 +1002,51 @@ real photons on the panel).
    their previously-allocated IDs across daemon restarts, so passive
    discovery has bypassed the allocator path so far. Cold-boot test
    pending.
-3. **Field metadata `min_value` / `max_value` width for FLOAT and
-   variable-size fields.** Bootstrap declares them as `UINT, size =
-   var`. `utilities/snapshot_hardware.py` parses them at the parent
-   field's `size` bytes if seen, defaulting to 1. Verified for
-   fixed-size integral fields (e.g. `display.brightness` max_value=100,
-   1-byte); behaviour for FLOAT and variable-size fields untested.
+3. **Field metadata `min_value` / `max_value` width for FLOAT fields.**
+   Bootstrap declares them as `UINT, size = 0`, i.e. **length-prefixed**
+   (confirmed: `01 01 01 64` is max_value 100 for `display.brightness`).
+   The prefix width is 1 byte on the cube firmware; behaviour for FLOAT
+   fields is untested.
 4. **PUBLISHED_FIELDS framing for fields wider than one frame.**
-5. **Overlapping field blocks on the cube node.** speaker.data
-   (floor 241, span 112), display.led_colour (floor 266, span 999),
-   and display.brightness (floor 256, span 1) all claim overlapping
-   key ranges in their published metadata, yet SET_FIELDS works as
-   expected at each (e.g. key 266 sets an LED, not a speaker sample).
-   Hypothesis: the firmware routes by something other than the
-   published spans — perhaps module-context inside SET_FIELDS, or
-   metadata-order priority. Worth confirming by sending SET_FIELDS at
-   a contested key (e.g. 280) and observing which peripheral
-   actually changes state.
+5. ~~Overlapping field blocks on the cube node~~ — **resolved, not real.**
+   The overlap (speaker.data 241..352 vs display.led_colour 266..1264) came
+   from reading the response's leading skip as relative instead of absolute
+   (§4.5.1). The real layout has no overlaps: speaker is 128..243, display
+   256..1266, screen 2048..2277, cube button 4096..4097, system 60000+.
 6. **SET_FIELDS concurrency limit.** The cube firmware appears to
-   service exactly one SET_FIELDS request at a time. Issuing two or
-   three concurrently (distinct transferIds, all in flight) leaves the
-   second/third without a ServiceResponse — the requester times out.
-   Pipelining `_send_set_fields` therefore failed on hardware and was
-   reverted to strict per-batch round-trips. The Java daemon also
-   serialises SET_FIELDS. Open question: does this hold for *other*
-   service types, and is the limit firmware-wide (one outstanding
-   per-peripheral?) or per-type? Worth probing with a mixed
-   SET_FIELDS + GET_FIELDS burst.
-7. **`ENUMERATE_FIELDS` stops answering after a long walk.** A full walk
-   that ends with direct probes at well-known keys gets `(no response)`
-   for every one of them (2026-10-23, ~250 probes earlier in the session),
-   while the same probes answer fine in a fresh session. Workaround in
-   `pylumicube`: probe the well-known keys **first** (`CUBE_WELL_KNOWN_KEYS`)
-   and cap the walk with a time budget. Root cause unknown — possibly a
-   firmware-side service-slot or state limit; the Java daemon only ever
-   issues these on a slow heartbeat.
-8. **Each `ENUMERATE_FIELDS` round-trip costs ~100–180 ms** on the Pi 3
-   (vs ~2 ms for SET_FIELDS), which makes a full walk of the `cube` node
-   (wide blocks + binary search) take >15 s. pylumicube therefore walks
-   with a small budget and re-probes only the keys that telemetry frames
-   actually reference. Whether the latency is firmware compute or link
-   contention is untested.
+   service exactly one SET_FIELDS request at a time *and answer it*, so
+   waiting for the ServiceResponse serialises writes at ~50-200 ms each.
+   Pipelining works if you stop waiting: with several frames in flight the
+   link sustains 300-600 frames/s (measured, §5.3). The Java daemon does the
+   same — a `NullContinuation` for speaker audio, and "busy, retry later"
+   for screen commands. Open question: whether the response delay is
+   firmware compute or link contention (a 224-byte speaker frame costs the
+   same ~57 ms as a tiny request, which suggests a fixed per-request
+   processing delay rather than wire time).
+7. ~~`ENUMERATE_FIELDS` stops answering after a long walk~~ — **mostly
+   explained.** The old walk issued ~250 probes (probing and binary-searching
+   because of the relative-key misreading). The daemon-style walk needs ~50
+   queries for the whole cube board, runs in 3-4 s, and does not stall. What
+   remains is the lossy link: replies are dropped (the daemon logs
+   "Excessive serial retransmission"), so queries must be retried rather than
+   treated as "no field here".
+8. **Round-trip latency is ~50-105 ms** per service request on the Pi 3,
+   independent of payload size (a tiny `GET_PREFERRED_NAME` and a 224-byte
+   speaker frame both cost ~57-105 ms). Throughput is fine when pipelined
+   (596 frames/s for tiny requests, 380/s for speaker chunks at 64 in
+   flight), so latency, not bandwidth, is the constraint — which is why the
+   screen and speaker drivers write without waiting.
 9. **`PUBLISHED_FIELDS` field selection is opaque.** The sensor board
    publishes keys 0..13 + the 60000+ system blocks in ~30 frames/s, but
    *which* subset goes into a given frame is not documented and appears
-   data-dependent (a frame that contains key 2 is what surfaced the
-   missed-block bug). Worth logging a full frame dump to see the batching
-   rule.
+   data-dependent.
+10. **Subscribing to a board costs link throughput.** With the cube board
+    subscribed, pipelined speaker writes drop from ~308 to ~56 chunks/s —
+    the board's own telemetry competes with our egress for its attention.
+    Audio therefore runs with only the sensor board subscribed (its schema
+    is walked separately with `walk_all_schemas()`). Root cause untested:
+    possibly the firmware's UART/ingress sharing, possibly our ingress
+    parsing.
 
 A realistic capture path: stop the Java daemon (`systemctl --user stop
 foundry-daemon.service`; if the user systemd manager isn't reachable in

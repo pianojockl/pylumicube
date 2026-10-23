@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Wire-protocol findings (vs. the Java daemon)
+- **Metadata field keys are absolute, and the walk must follow the firmware's
+  table order.** The response's leading skip is the field's key counted from
+  0 (the daemon's parser starts its accumulator at 0), not a distance from
+  the queried key; and `min_value`/`max_value` are length-prefixed
+  (`UINT, size = 0`). Reading the skip as relative produced wrong keys —
+  `screen.rectangle_x` 3315 instead of 2048, `speaker.data` 241 instead of
+  128, `rdp_level` 60014 instead of 60000 — and an "overlapping blocks"
+  mystery that did not exist. With both fixed, the daemon's
+  `(key0, key1)` walk finds **49 fields on the cube board (was 16)** in
+  ~3.5 s, including the whole `screen` and `speaker` modules. See
+  PROTOCOL.md §4.5.1 and §5.1.
+- **The link drops replies**, so a query that goes unanswered must be
+  retried and distinguished from "the firmware answered with no field"
+  (the end of the table). One lost reply used to truncate the schema and
+  silently remove whole modules; preferred-name discovery retries too.
+- **Service requests cost ~50-105 ms of latency regardless of payload**
+  (a tiny request and a 224-byte speaker frame are the same), but pipelined
+  writes sustain 300-600 frames/s. Anything at streaming rates must not
+  wait for a ServiceResponse; the drivers use the link-level ACK instead.
 - **Telemetry confirmed end to end on hardware.** `SUBSCRIBE_DEFAULT_FIELDS`
   takes a 2-byte payload (`duration = cadence * 2`, `bandwidth = 255`) and
   the node answers with incremental `PUBLISHED_FIELDS` snapshots; there is
@@ -20,16 +39,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Node ids are not stable across boots** — captures have seen the
   sensor board at 125 and at 124. Resolve nodes by `GET_PREFERRED_NAME`.
 - `ENUMERATE_FIELDS` omits `gettable`/`settable`/`idempotent` (absent
-  means "not reported", not false), costs ~100–180 ms per round-trip, and
-  stops answering well-known keys after a long walk. The firmware also
-  answers a probe with the *next* block depending on what was queried
-  before, so a walk can transiently miss a block, and its gap arithmetic
-  disagrees with the keys it publishes for the `60000+` system blocks.
-  All four are worked around (probe well-known keys first, time budget,
-  per-key re-probe on undecodable frames, trust the probe over the
-  arithmetic) — see PROTOCOL.md §5.2 and §7.
+  means "not reported", not false) and (when set) reports
+  `min_value`/`max_value`/`units`. See PROTOCOL.md §5.2.
+- **Subscribing to the cube board costs link throughput** (~308 -> ~56
+  speaker chunks/s), so audio playback runs with only the sensor board
+  subscribed and walks the cube board's schema separately
+  (`LumiCube.walk_all_schemas()`).
 
 ### Added
+- **Secondary LCD screen** (`pylumicube.screen.Screen`, `LumiCube.screen`):
+  `draw_rectangle`, `set_pixel`, `clear`, `set_half_row`/`set_pixels` (the
+  firmware's pixel-window stream), `write_text` and `draw_image` (Pillow,
+  via the new `[screen]` extra), plus `rotation`, `invert_colours` and
+  `resolution_scaling`. Colours convert to the panel's RGB565 exactly as
+  upstream does, and the firmware's limits are enforced (80 pixels per
+  batch, 160 per call, 127 characters).
+- **Speaker** (`pylumicube.speaker.Speaker`, `LumiCube.speaker`): `tone`
+  (sine/square/triangle/noise), `play` (WAV), `say` (espeak-ng or espeak),
+  `volume` and `write_pcm`, streaming mono s16le at 32 kHz in the
+  firmware's 112-sample chunks. Pipelined and paced to the wall clock, with
+  chunk drops rather than queueing when the link falls behind; optional
+  `free_space_in_bytes` flow control. No PulseAudio, no numpy (the
+  resampler falls back to pure Python).
+- **`LumiCube.write_fields` / `write_named` / `write_run`**: raw, name-based
+  and run-based field writes, with `await_response` and `wait` controls for
+  peripherals that answer slowly or not at all. `write_named` addresses
+  homogeneous runs as `"pixel_data_stream+3"` / `"text+0"`.
+- **`LumiCube.walk_all_schemas()`** to discover every node's field keys
+  without subscribing to its telemetry stream.
+- **`flat_dictionary.serialise_run`** for homogeneous runs.
+- **`scripts/screen_speaker_demo.py`** — draws on the LCD, plays tones and
+  speaks, for a quick hardware sanity check.
+- **`[screen]` extra** (`pip install -e '.[screen]'`) for Pillow.
+- The compat shim now serves `screen` and `speaker` from the native drivers
+  (`ScreenShim` / `SpeakerShim`), including upstream's convention that a
+  relative image/audio path resolves against `~/Desktop`.
+
+### Fixed
+- **Metadata discovery read field keys as relative offsets**, which produced
+  wrong keys for every block the walk reached via a gap (`screen`,
+  `speaker`, the `60000+` system fields) and made the walker probe and
+  binary-search to compensate. The leading skip is absolute; the walk now
+  follows the firmware's table order like the daemon does, finding 49 fields
+  on the cube board instead of 16, in about a quarter of the time.
+- **`min_value`/`max_value` are length-prefixed**, so parsing a field that
+  reports them (e.g. `display.brightness`, max 100) no longer derails the
+  rest of the sub-dictionary.
+- **A dropped reply no longer truncates the schema.** The walk retries
+  unanswered queries and only gives up after several consecutive silences,
+  and preferred-name discovery retries too.
+- The module namespace is rebuilt when a new schema lands, so walking a
+  board after subscribing to a different one still exposes its modules.
+
 - **Ambient-light dimming** (`pylumicube.dimming`): `BrightnessCurve` maps
   a raw `light_sensor.ambient_light` reading to a 0..1 brightness with an
   auto-ranging, decaying range (so it learns the room), optional gamma and
@@ -120,6 +181,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   An attempted pipelining of `_send_set_fields` was reverted; the Java
   daemon also issues SET_FIELDS strictly sequentially. Sequential
   semantics are now pinned by a unit test.
+  *Updated 2026-10-23:* the firmware does process pipelined frames — it
+  just does not answer them promptly. Waiting for the ServiceResponse is
+  what serialises writes; submitting with `wait=False` and relying on the
+  link-level ACK sustains 300-600 frames/s (see the notes at the top of
+  this file). `Display` keeps its sequential worker, which is the right
+  trade-off for LED frames; the screen and speaker drivers pipeline.
 
 ### Added
 - `scripts/plasma.py` — native-API rewrite of the upstream community
