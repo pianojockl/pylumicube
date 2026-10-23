@@ -1,25 +1,34 @@
 """Runtime field-metadata discovery via ENUMERATE_FIELDS (PROTOCOL §4.5).
 
 The wire protocol encodes values according to per-field metadata: type,
-size in bytes, and the floor/span of the homogeneous block a key lives
-in. `metadata.py` hardcodes the display schema we already know; this
-module discovers the rest from the firmware, which is what telemetry
-decoding needs — a `PUBLISHED_FIELDS` run cannot be parsed without
-knowing each value's width.
+size in bytes, and the floor/span of the homogeneous block a key lives in.
+`metadata.py` hardcodes the display schema we already know; this module
+discovers the rest from the firmware, which is what telemetry decoding and
+the module drivers (screen, speaker) need.
 
-The cube firmware does **not** report a block's floor directly. A query
-at key `k` returns the metadata of the field covering `k` plus a leading
-skip command that is either:
+Two things about the response format are easy to get wrong, and both were
+confirmed against the Java daemon's own parser (`RecursiveDictionary.java`)
+and against raw hardware captures:
 
-  * the **echo** of `k` — `k` is somewhere inside the block, or
-  * the **relative distance** to the next block — `k` fell in a gap.
+1. **The leading skip is an absolute field key.** The daemon parses a
+   response with its key accumulator starting at 0, so a leading
+   ``skip 256`` means "the field in this response is at key 256" — *not*
+   "256 past the key you asked about". Reading it as relative produces
+   plausible-looking but wrong keys; that is how earlier notes in this repo
+   ended up with 3315 for `screen.rectangle_x` (it is 2048) and 60014 for
+   `rdp_level` (it is 60000).
+2. **A field's ``min_value``/``max_value`` are variable-size**, i.e. they
+   carry a 1-byte length prefix, because the bootstrap metadata declares
+   them as ``UINT, size = 0``. So ``01 01 01 64`` is max_value = 100, not
+   "value 1, then a stray command byte".
 
-`_classify` distinguishes the two (including the `rel == k` ambiguity, by
-probing `k + 1`), and `_resolve_floor` binary-searches backwards inside
-the block's span when the floor is unknown. See PROTOCOL.md §4.5.1.
-
-Derived from `utilities/snapshot_hardware.py`, which was validated
-against real hardware (2026-05-14 and 2026-10-23 captures).
+The walk follows the daemon's `QueryMetadataTask`: query ``(key0, key1)``
+means "skip to field key0, take one field, start its sub-dictionary at
+sub-key key1", then continue with ``(lastFieldKey, lastSubKey + 1)``. Once
+the requested sub-key is past the end of that field's sub-dictionary, the
+firmware advances to the **next field in its internal table order**, which
+is not key order — that is how the whole `screen` and `speaker` modules
+become reachable at all.
 """
 
 from __future__ import annotations
@@ -27,7 +36,6 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
 
 from .constants import TYPE_ENUMERATE_FIELDS
 from .metadata import FieldSpec
@@ -51,28 +59,14 @@ META_DEBUG = 10
 META_SYSTEM = 11
 META_MODULE = 12
 
+#: Sub-keys whose values are UTF8 strings (1-byte length prefix on the cube).
 _STRING_KEYS = (META_NAME, META_UNITS, META_MODULE)
-
-
-# Keys on the `cube` base board that host fields the auto-walk steps over
-# (the firmware's "next field at floor >= k" hint jumps straight from
-# speaker.data to the system fields). Taken from query_key.py probes and
-# metadata.py's hardcoded display schema.
-CUBE_WELL_KNOWN_KEYS = (
-    256, 257, 258, 259, 260, 261, 262, 263, 264, 265,  # brightness, panel_*, gamma_*
-    266,     # led_colour (span 999)
-    1265,    # spread_spectrum_period
-    1266,    # show
-)
+#: Sub-keys declared `UINT, size = 0` — also length-prefixed, not fixed width.
+_VARIABLE_INT_KEYS = (META_MIN_VALUE, META_MAX_VALUE)
 
 
 def _skip_op(value: int) -> bytes:
-    """Encode a FlatDictionary skip with the narrowest width that fits.
-
-    The skip command byte is `0x10 | width_in_bytes`. Width 0 means
-    "skip 0"; we still emit a width-1 zero skip so the response shape
-    stays predictable when called with value=0.
-    """
+    """Encode a FlatDictionary skip with the narrowest width that fits."""
     if value <= 0xFF:
         return bytes([0x11, value])
     if value <= 0xFFFF:
@@ -84,19 +78,22 @@ def _skip_op(value: int) -> bytes:
     raise ValueError(f"skip value {value} doesn't fit in 4 bytes")
 
 
-def build_query(k0: int, k1: int = 0) -> bytes:
-    """Build an ENUMERATE_FIELDS query: outer skip k0, run-of-1, optional sub-skip.
+def build_query(key0: int, key1: int = 0) -> bytes:
+    """Build an ENUMERATE_FIELDS query in the daemon's shape.
 
-    When ``k1 == 0`` the inner skip is omitted — the cube then returns the
-    whole metadata sub-dictionary for the field.
+    ``skip key0`` (absolute), ``run 1`` (one field), ``skip key1`` (start
+    that field's sub-dictionary at sub-key key1). Both skips carry a 2-byte
+    parameter, exactly as `QueryMetadataTask.java` emits them: a sub-key
+    past the end of the current field's sub-dictionary is what makes the
+    firmware step to the next field in its table.
     """
-    out = bytearray()
-    if k0 > 0:
-        out += _skip_op(k0)
-    out += bytes([0x01, 0x01])
-    if k1 > 0:
-        out += _skip_op(k1)
-    return bytes(out)
+    if key0 < 0 or key1 < 0:
+        raise ValueError("keys must be non-negative")
+    return bytes([
+        0x12, key0 & 0xFF, (key0 >> 8) & 0xFF,
+        0x01, 0x01,
+        0x12, key1 & 0xFF, (key1 >> 8) & 0xFF,
+    ])
 
 
 def parse_step(data: bytes, offset: int) -> tuple[int, int, int]:
@@ -109,36 +106,39 @@ def parse_step(data: bytes, offset: int) -> tuple[int, int, int]:
 
 
 def _read_string(data: bytes, offset: int) -> tuple[str, int]:
-    """Read a 1-byte-length-prefixed string (cube firmware uses 1 byte)."""
+    """Read a 1-byte-length-prefixed string (the cube firmware uses 1 byte)."""
     length = data[offset]
     end = offset + 1 + length
     return data[offset + 1 : end].decode("utf-8", errors="replace"), end
 
 
+def _read_variable_int(data: bytes, offset: int) -> tuple[int, int]:
+    """Read a length-prefixed unsigned integer (min_value/max_value)."""
+    length = data[offset]
+    end = offset + 1 + length
+    return int.from_bytes(data[offset + 1 : end], "little"), end
 
-def _consume_subkey(data: bytes, offset: int, sub_key: int,
-                    field_size: int | None) -> tuple[object, int]:
+
+def _consume_subkey(data: bytes, offset: int, sub_key: int) -> tuple[object, int]:
     """Decode one metadata sub-dict value at `sub_key`."""
     if sub_key in _STRING_KEYS:
         return _read_string(data, offset)
     if sub_key == META_SPAN:
         return int.from_bytes(data[offset : offset + 4], "little"), offset + 4
-    if sub_key in (META_MIN_VALUE, META_MAX_VALUE):
-        # Typed by the field's own type/size, which appears earlier in the
-        # same sub-dict. Fall back to 1 byte if size hasn't been seen yet.
-        width = field_size if field_size and field_size > 0 else 1
-        return int.from_bytes(data[offset : offset + width], "little"), offset + width
-    # Everything else (type/size/gettable/settable/idempotent/debug/system)
-    # is a single byte UINT/BOOLEAN.
+    if sub_key in _VARIABLE_INT_KEYS:
+        return _read_variable_int(data, offset)
+    # type/size/gettable/settable/idempotent/debug/system are 1-byte UINT/BOOLEAN.
     return data[offset], offset + 1
 
 
 def parse_metadata_subdict(data: bytes) -> dict[int, object]:
     """Parse a metadata sub-dictionary that runs to the end of `data`.
 
-    ENUMERATE_FIELDS responses do not length-prefix the sub-dict: the cube
-    emits it directly after the outer `01 01` run-1 command, with each
-    sub-key as its own run-1 and `1N <skip>` ops for unpopulated keys.
+    ENUMERATE_FIELDS responses do not length-prefix the sub-dictionary: the
+    cube emits it directly after the field's run-1 command, with each
+    sub-key as its own run-1 and `1N <skip>` ops for unpopulated keys. It
+    therefore always occupies the rest of the buffer, which is also why a
+    response carries exactly one field.
     """
     out: dict[int, object] = {}
     key_acc = 0
@@ -153,20 +153,18 @@ def parse_metadata_subdict(data: bytes) -> dict[int, object]:
         if disc != 0:
             raise ValueError(f"unknown sub-dict discriminator {disc} at offset {offset}")
         for _ in range(param):
-            seen = out.get(META_SIZE)
-            field_size = seen if isinstance(seen, int) else None
-            value, offset = _consume_subkey(data, offset, key_acc, field_size)
+            value, offset = _consume_subkey(data, offset, key_acc)
             out[key_acc] = value
             key_acc += 1
     return out
 
 
-def parse_enumerate_response(data: bytes) -> dict[int, dict]:
-    """Parse an ENUMERATE_FIELDS response into {relative_key: metadata}.
+def parse_metadata_response(data: bytes) -> dict[int, dict]:
+    """Parse an ENUMERATE_FIELDS response into ``{field_key: metadata}``.
 
-    The outer dictionary is constrained: optional leading SKIPs, then at
-    most one RUN-1 whose value (a sub-dict) consumes the rest of the
-    buffer. An empty result means "no field at the queried key".
+    Field keys are **absolute**: the outer dictionary starts at key 0, so
+    its leading skip carries the field's real key (see the module
+    docstring). An empty result means "no field there".
     """
     out: dict[int, dict] = {}
     key_acc = 0
@@ -184,7 +182,7 @@ def parse_enumerate_response(data: bytes) -> dict[int, dict]:
             meta = parse_metadata_subdict(data[offset:])
             out[key_acc] = meta
             key_acc += 1
-            # The sub-dict consumed the remainder of the buffer.
+            # The sub-dictionary consumed the remainder of the buffer.
             offset = len(data)
     return out
 
@@ -221,197 +219,132 @@ def spec_from_metadata(floor: int, meta: Mapping[int, object]) -> FieldSpec:
     )
 
 
+
 # --------------------- the walk ---------------------
 
 
-def _signature(meta: Mapping[int, object]) -> tuple:
-    """Identity of a field block: two probes returning the same signature
-    are looking at the same block (so the walk can skip repeats)."""
-    return (
-        meta.get(META_NAME),
-        meta.get(META_TYPE),
-        meta.get(META_SIZE),
-        meta.get(META_SPAN),
-        meta.get(META_MODULE),
-        meta.get(META_SYSTEM),
-    )
+def query_metadata(transport: Transport, node_id: int, key0: int, key1: int,
+                   *, timeout: float = 2.0) -> dict[int, dict] | None:
+    """Send one ``(key0, key1)`` metadata query.
 
-
-def probe_key(transport: Transport, node_id: int, key: int, *,
-              timeout: float = 3.0) -> tuple[dict, int] | None:
-    """Query the metadata of the field covering `key`.
-
-    Returns ``(metadata, relative_key)`` — the parsed sub-dict and the
-    relative key the response echoed / pointed at — or None when the
-    firmware did not answer.
+    Returns ``{field_key: metadata}`` (normally one field). An **empty dict**
+    means the firmware answered and there is no field there (the end of the
+    table); ``None`` means it did not answer at all — a distinction the walk
+    needs, because a lost reply must be retried rather than taken as the end.
     """
     try:
         future = transport.send_request(
             dest_id=node_id,
             type_id=TYPE_ENUMERATE_FIELDS,
-            payload=build_query(key),
+            payload=build_query(key0, key1),
             timeout=timeout,
         )
         response = future.result(timeout=timeout + 1.0)
-    except Exception as exc:  # noqa: BLE001 — timeouts are normal for gaps
-        log.debug("ENUMERATE_FIELDS probe at key %d failed: %s", key, exc)
+    except Exception as exc:  # noqa: BLE001 — no answer is a normal outcome
+        log.debug("metadata query (%d,%d) on node %d failed: %s", key0, key1, node_id, exc)
         return None
     if not response:
-        return None
+        return {}
     try:
-        parsed = parse_enumerate_response(response)
-    except Exception:  # noqa: BLE001 — malformed response, treat as no answer
-        log.debug("ENUMERATE_FIELDS probe at key %d returned unparsable data", key,
-                  exc_info=True)
+        return parse_metadata_response(response)
+    except Exception:  # noqa: BLE001 — treat malformed data as "no answer"
+        log.debug("metadata query (%d,%d) on node %d returned unparsable data: %s",
+                  key0, key1, node_id, response.hex(), exc_info=True)
         return None
+
+
+def probe_key(transport: Transport, node_id: int, key: int, *,
+              timeout: float = 2.0) -> tuple[dict, int] | None:
+    """Query the metadata of the field covering `key`.
+
+    Returns ``(metadata, field_key)`` — the parsed sub-dictionary and the
+    field's absolute key — or None when the firmware did not answer.
+    """
+    parsed = query_metadata(transport, node_id, key, 0, timeout=timeout)
     if not parsed:
         return None
-    rel_key = next(iter(parsed))
-    return parsed[rel_key], rel_key
+    field_key = next(iter(parsed))
+    return parsed[field_key], field_key
 
 
-def _classify(transport: Transport, node_id: int, key: int, sig: tuple,
-              timeout: float, *, known_rel: int | None = None) -> tuple[str, int]:
-    """Decide what the cube's response at `key` means for block `sig`.
+def walk_metadata(transport: Transport, node_id: int, *,
+                  max_queries: int = 400, timeout: float = 2.0,
+                  max_seconds: float | None = None,
+                  retries: int = 2, max_failures: int = 4) -> dict[int, FieldSpec]:
+    """Walk a node's whole metadata table in the firmware's own order.
 
-    Returns one of:
-      ("nope", _)        — different block, or no response
-      ("at_floor", key)  — `key` is the block's floor (rel == 0)
-      ("echo", key)      — `key` is inside the block, floor unknown
-      ("gap", floor)     — `key` is in a gap; the block starts at `floor`
+    Implements the daemon's `QueryMetadataTask`: each response advances the
+    cursor to ``(last field key, last sub-key + 1)``; the walk ends when the
+    firmware answers with no field.
 
-    Pass `known_rel` when the caller already holds the response for `key`
-    (its leading skip was `known_rel`) — that saves a redundant probe.
-
-    The ``rel == key`` case is ambiguous (echo of `key`, or a gap whose
-    relative skip happens to equal `key`); probing `key + 1` resolves it,
-    because under a gap the relative skip decreases by one and under an
-    echo it tracks `key`.
+    This link is lossy — replies are dropped and the daemon logs
+    retransmissions constantly — so a query that goes unanswered is retried
+    (`retries` times) before the walk gives up, and only `max_failures`
+    consecutive silent queries end it. Without that, one lost reply
+    truncates the schema and whole modules (screen, speaker) go missing.
     """
-    if known_rel is None:
-        result = probe_key(transport, node_id, key, timeout=timeout)
-        if result is None:
-            return "nope", 0
-        meta, rel = result
-        if _signature(meta) != sig:
-            return "nope", 0
+    specs: dict[int, FieldSpec] = {}
+    key0, key1 = 0, 0
+    failures = 0
+    deadline = None if max_seconds is None else time.monotonic() + max_seconds
+
+    for step in range(max_queries):
+        if deadline is not None and time.monotonic() > deadline:
+            log.info("metadata walk on node %d hit its %.1fs budget with %d field(s)",
+                     node_id, max_seconds, len(specs))
+            break
+        parsed = None
+        for _attempt in range(retries + 1):
+            parsed = query_metadata(transport, node_id, key0, key1, timeout=timeout)
+            if parsed is not None:
+                break
+        if parsed is None:
+            failures += 1
+            if failures >= max_failures:
+                log.warning("metadata walk on node %d gave up after %d silent "
+                            "queries (%d field(s) so far)",
+                            node_id, failures, len(specs))
+                break
+            continue
+        if not parsed:
+            log.debug("metadata walk on node %d ended after %d queries",
+                      node_id, step)
+            break
+        failures = 0
+        for field_key, meta in parsed.items():
+            specs[field_key] = spec_from_metadata(field_key, meta)
+        last_field = max(parsed)
+        last_sub = max(parsed[last_field])
+        key0, key1 = last_field, last_sub + 1
     else:
-        rel = known_rel
-    if rel == 0:
-        return "at_floor", key
-    if rel != key:
-        return "gap", key + rel
-    result2 = probe_key(transport, node_id, key + 1, timeout=timeout)
-    if result2 is None:
-        # Past the end of the schema: `key` was the final block's floor.
-        return "at_floor", key
-    meta2, rel2 = result2
-    if _signature(meta2) != sig:
-        # A different block sits at key+1, so `key` was the last key of ours.
-        return "echo", key
-    if rel2 != key + 1:
-        return "gap", (key + 1) + rel2
-    return "echo", key
+        log.warning("metadata walk on node %d stopped at max_queries=%d (%d field(s))",
+                    node_id, max_queries, len(specs))
 
-
-def _resolve_floor(transport: Transport, node_id: int, hit_key: int, hit_rel: int,
-                   sig: tuple, timeout: float) -> int:
-    """Find the real floor of block `sig`, given a hit at `hit_key` whose
-    response leading-skip was `hit_rel`."""
-    if hit_rel == 0:
-        return hit_key
-    if hit_rel != hit_key:
-        return hit_key + hit_rel
-    kind, value = _classify(transport, node_id, hit_key, sig, timeout,
-                            known_rel=hit_rel)
-    if kind == "at_floor":
-        return value
-    if kind == "nope":
-        return hit_key
-    if kind == "gap":
-        return value
-    # "echo": the floor lies within [hit_key - span + 1, hit_key].
-    span = sig[3] if isinstance(sig[3], int) and sig[3] > 0 else 1
-    lo = max(0, hit_key - span + 1)
-    hi = hit_key
-    while lo < hi:
-        mid = (lo + hi) // 2
-        kind, value = _classify(transport, node_id, mid, sig, timeout)
-        if kind == "nope":
-            lo = mid + 1
-        elif kind == "at_floor":
-            return value
-        elif kind == "gap":
-            return value
-        else:  # still inside the block at mid: floor <= mid
-            hi = mid
-    return lo
+    log.info("discovered %d field(s) on node %d", len(specs), node_id)
+    log.debug("node %d schema: %s", node_id,
+              ", ".join(f"{key}:{spec.name}" for key, spec in sorted(specs.items())))
+    return specs
 
 
 def enumerate_fields(transport: Transport, node_id: int, *,
                      extra_probe_keys: Iterable[int] = (),
-                     max_iters: int = 400, max_empty: int = 4,
-                     timeout: float = 3.0,
+                     max_iters: int = 400, timeout: float = 2.0,
                      max_seconds: float | None = None) -> dict[int, FieldSpec]:
-    """Walk a node's ENUMERATE_FIELDS schema.
+    """Discover a node's field schema.
 
-    Returns ``{floor: FieldSpec}``. The walk follows the firmware's
-    "next field at floor >= k" hints, stepping to ``floor + span`` after
-    each hit, and gives up after `max_empty` consecutive empty responses
-    or once `max_seconds` have elapsed (a partial schema is still useful —
-    it just cannot decode the fields it is missing).
-
-    `extra_probe_keys` are probed **first**, on a fresh service session:
-    the cube has been observed to stop answering ENUMERATE_FIELDS probes
-    at these keys once a long walk has run (see PROTOCOL.md §5.1).
+    Runs the table-order walk (`walk_metadata`), then probes any
+    `extra_probe_keys` explicitly and merges what they report — a safety net
+    for fields whose table position the firmware skips.
     """
-    specs: dict[int, FieldSpec] = {}
-    seen: set[tuple] = set()
-    deadline = None if max_seconds is None else time.monotonic() + max_seconds
-
+    specs = walk_metadata(transport, node_id, max_queries=max_iters,
+                          timeout=timeout, max_seconds=max_seconds)
     for key in extra_probe_keys:
         result = probe_key(transport, node_id, key, timeout=timeout)
         if result is None:
             log.debug("extra probe at key %d: no response", key)
             continue
-        meta, rel = result
-        sig = _signature(meta)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        floor = _resolve_floor(transport, node_id, key, rel, sig, timeout)
-        specs[floor] = spec_from_metadata(floor, meta)
-
-    abs_key = 0
-    empty_streak = 0
-    for _ in range(max_iters):
-        if deadline is not None and time.monotonic() > deadline:
-            log.info("schema walk on node %d hit its %.1fs budget with %d block(s)",
-                     node_id, max_seconds, len(specs))
-            break
-        result = probe_key(transport, node_id, abs_key, timeout=timeout)
-        if result is None:
-            empty_streak += 1
-            if empty_streak >= max_empty:
-                break
-            abs_key += 1
-            continue
-        empty_streak = 0
-        meta, rel = result
-        sig = _signature(meta)
-        if sig in seen:
-            abs_key += 1
-            continue
-        seen.add(sig)
-        floor = _resolve_floor(transport, node_id, abs_key, rel, sig, timeout)
-        spec = spec_from_metadata(floor, meta)
-        specs[floor] = spec
-        abs_key = floor + max(1, spec.span)
-
-    log.info("discovered %d field block(s) on node %d", len(specs), node_id)
-    log.debug("node %d schema: %s", node_id,
-              ", ".join(f"{s.floor}:{s.name}" for s in sorted(specs.values(),
-                                                             key=lambda s: s.floor)))
+        meta, field_key = result
+        if field_key not in specs:
+            specs[field_key] = spec_from_metadata(field_key, meta)
     return specs
-
 

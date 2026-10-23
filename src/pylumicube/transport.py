@@ -79,7 +79,18 @@ class Transport:
 
     def send_request(self, dest_id: int, type_id: int, payload: bytes,
                      priority: int = DEFAULT_PRIORITY,
-                     timeout: float = 5.0) -> Future:
+                     timeout: float = 5.0,
+                     expect_response: bool = True) -> Future:
+        """Send a service request.
+
+        With `expect_response=True` (the default) the returned future
+        resolves when the matching ServiceResponse arrives, and times out
+        otherwise. Some peripherals — the speaker's audio stream is the one
+        we know — service the write but never answer, so streaming callers
+        pass `expect_response=False`: the future then resolves when the
+        *link* acknowledges the frame, which is the strongest delivery
+        guarantee available without a service response.
+        """
         if len(payload) > MAX_UAVCAN_PAYLOAD:
             raise ValueError("payload too large")
         message_id = u.encode_request(self._source_id, dest_id, type_id, priority)
@@ -87,11 +98,15 @@ class Transport:
             key = (dest_id, type_id)
             transfer_id = self._service_transfer_ids.get(key, 0)
             self._service_transfer_ids[key] = (transfer_id + 1) & 0x1F
-            response_fut: Future = Future()
-            inflight_key = (dest_id, type_id, transfer_id)
-            self._inflight[inflight_key] = response_fut
+            if expect_response:
+                response_fut: Future = Future()
+                inflight_key = (dest_id, type_id, transfer_id)
+                self._inflight[inflight_key] = response_fut
         body = u.pack_message(transfer_id, message_id, payload)
         link_fut = self._link.submit(body)
+
+        if not expect_response:
+            return link_fut
 
         def on_link_complete(f: Future) -> None:
             try:

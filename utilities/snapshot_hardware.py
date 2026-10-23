@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, "src")
 
 from pylumicube import LumiCube  # noqa: E402
-from pylumicube.discovery import CUBE_WELL_KNOWN_KEYS, probe_key  # noqa: E402
+from pylumicube.discovery import probe_key  # noqa: E402
 from pylumicube.metadata import FieldSpec  # noqa: E402
 
 
@@ -107,9 +107,8 @@ def main(argv: list[str] | None = None) -> int:
 
         for node_id in sorted(allocated):
             name = names.get(node_id, "<unknown>")
-            extra = CUBE_WELL_KNOWN_KEYS if name.lower() == "cube" else ()
-            print(f"## Node {node_id} ({name!r}) — ENUMERATE_FIELDS")
-            count = dump_node_fields(cube, node_id, extra_probe_keys=extra)
+            print(f"## Node {node_id} ({name!r}) — metadata walk")
+            count = dump_node_fields(cube, node_id)
             print(f"  ({count} field entries)")
             print()
 

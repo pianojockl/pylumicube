@@ -13,9 +13,11 @@ import logging
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from concurrent.futures import Future
 
 from . import discovery as _discovery
+from . import flat_dictionary
 from . import uavcan as u
 from .allocator import Allocator
 from .constants import (
@@ -25,6 +27,7 @@ from .constants import (
     TYPE_ALLOCATION,
     TYPE_GET_NODE_INFO,
     TYPE_GET_PREFERRED_NAME,
+    TYPE_SET_FIELDS,
 )
 from .display import Display
 from .link import SerialLink
@@ -79,6 +82,8 @@ class LumiCube:
         self._schemas: dict[int, dict[int, FieldSpec]] = {}
         self._telemetry: TelemetryStore | None = None
         self._namespace: dict[str, FieldModule] | None = None
+        self._screen = None
+        self._speaker = None
 
 
     # ---------------- lifecycle ----------------
@@ -230,7 +235,6 @@ class LumiCube:
         try:
             specs = _discovery.enumerate_fields(
                 self.transport, node_id,
-                extra_probe_keys=_discovery.CUBE_WELL_KNOWN_KEYS if is_cube else (),
                 timeout=self._schema_timeout,
                 max_seconds=self._schema_budget if budget is None else budget,
             )
@@ -242,9 +246,26 @@ class LumiCube:
             merged.update(specs)
             specs = merged
         self._schemas[node_id] = specs
+        # The namespace is derived from the schemas, so it must be rebuilt
+        # after a new one lands (e.g. walking the cube board after enabling
+        # telemetry for the sensor board only).
+        self._namespace = None
         log.info("node %d (%s): %d field block(s) discovered in %.1fs",
                  node_id, name or "?", len(specs), time.monotonic() - started)
         return specs
+
+    def walk_all_schemas(self, *, budget: float | None = None) -> dict[int, int]:
+        """Walk every discovered node's schema without subscribing to it.
+
+        Useful when a driver needs another node's field keys but its
+        telemetry stream would compete for the link — e.g. audio playback
+        wants the cube board's `speaker` keys while subscribing only to the
+        sensor board. Returns ``{node_id: field_count}``.
+        """
+        counts: dict[int, int] = {}
+        for node_id in sorted(self._allocated):
+            counts[node_id] = len(self.discover_schema(node_id, budget=budget))
+        return counts
 
     @property
     def schemas(self) -> dict[int, dict[int, FieldSpec]]:
@@ -254,9 +275,9 @@ class LumiCube:
     def _repair_schema(self, node_id: int, key: int) -> bool:
         """Probe one key and add it to a node's schema (telemetry callback).
 
-        Called when a `PUBLISHED_FIELDS` frame references a key the walk
-        did not discover — the firmware has been observed to answer a walk
-        probe with the *next* block, so a block can be transiently missed.
+        Called when a `PUBLISHED_FIELDS` frame references a key the walk did
+        not discover. With the leading skip understood as an absolute key
+        (see `pylumicube.discovery`) this is a single query, no probing.
         """
         specs = self._schemas.get(node_id)
         if specs is None or self._transport is None:
@@ -265,18 +286,13 @@ class LumiCube:
                                       timeout=self._schema_timeout)
         if result is None:
             return False
-        meta, rel = result
-        floor = _discovery._resolve_floor(self._transport, node_id, key, rel,
-                                         _discovery._signature(meta),
-                                         self._schema_timeout)
-        spec = _discovery.spec_from_metadata(floor, meta)
+        meta, field_key = result
+        spec = _discovery.spec_from_metadata(field_key, meta)
         if not spec.covers(key):
-            # The firmware's gap arithmetic is not always consistent with
-            # the keys it actually publishes (observed for the system
-            # blocks at 60000+/2183+), so trust the probe: it answered for
-            # exactly this key.
+            # Trust the probe: it answered for exactly this key.
             spec = _discovery.spec_from_metadata(key, meta)
         specs[spec.floor] = spec
+        self._namespace = None
         store = self._telemetry
         if store is not None:
             store.set_schema(node_id, specs)
@@ -329,6 +345,126 @@ class LumiCube:
         """The `buttons` module (top/middle/bottom pressed + counters)."""
         return self.modules.get("buttons") if self._telemetry is not None else None
 
+    # ---------------- raw field writes ----------------
+
+    def write_fields(self, node_id: int, values: Mapping[int, int | bytes], *,
+                     timeout: float = 2.0, await_response: bool = True,
+                     wait: bool = True) -> "Future | None":
+        """Write raw field values to a node (one SET_FIELDS request).
+
+        Keys are absolute; values are encoded per the node's discovered
+        schema.
+
+        `await_response=False` waits only for the link-level ACK, for
+        peripherals that service writes without answering (the speaker).
+        `wait=False` returns immediately with the link future instead of
+        blocking on it — the building block for streaming: a single write
+        costs ~50-100 ms of *latency* on this hardware, but pipelined writes
+        sustain several hundred frames per second.
+        """
+        if self._transport is None:
+            raise RuntimeError("cube not started")
+        specs = self._schemas.get(node_id)
+        if specs is None:
+            raise RuntimeError(f"no schema for node {node_id}; "
+                               f"enable telemetry or call discover_schema() first")
+        payload = flat_dictionary.serialise(values, specs)
+        future = self._transport.send_request(
+            dest_id=node_id, type_id=TYPE_SET_FIELDS, payload=payload,
+            timeout=timeout, expect_response=await_response)
+        if not wait:
+            return future
+        future.result(timeout=timeout)
+        return None
+
+    def write_named(self, module_name: str, values: Mapping[str, int | bytes], *,
+                    timeout: float = 2.0, await_response: bool = True,
+                    wait: bool = True) -> "Future | None":
+        """Write fields by module + field name.
+
+        Names come from the module namespace. A homogeneous run (the
+        screen's `pixel_data_stream` or `text`) is addressed with a ``+n``
+        offset from its first field, e.g. ``"pixel_data_stream+3"`` — those
+        individual keys are not separate namespace entries.
+        """
+        module = self.module(module_name)
+        refs = module.refs
+        if not refs:
+            raise RuntimeError(f"module {module_name!r} has no fields")
+        node_id = next(iter(refs.values())).node_id
+        keys: dict[int, int | bytes] = {}
+        for name, value in values.items():
+            base, _, offset_text = name.partition("+")
+            ref = module.ref(base)
+            offset = int(offset_text) if offset_text else 0
+            if offset and offset >= ref.spec.span:
+                raise ValueError(f"{module_name}.{base} has span {ref.spec.span}; "
+                                 f"offset {offset} is out of range")
+            keys[ref.key + offset] = value
+        return self.write_fields(node_id, keys, timeout=timeout,
+                                 await_response=await_response, wait=wait)
+
+    def write_run(self, module_name: str, field_name: str,
+                  values: Iterable[int], *, timeout: float = 2.0,
+                  await_response: bool = False,
+                  wait: bool = True) -> "Future | None":
+        """Fast path for streaming: write a contiguous run starting at a field.
+
+        `values[i]` goes to `field + i`, which is how the speaker's 112-sample
+        blocks and the screen's 80-pixel blocks are addressed. Avoids the
+        per-value name resolution and dict building of `write_named`, which
+        matters at hundreds of frames per second.
+        """
+        if self._transport is None:
+            raise RuntimeError("cube not started")
+        ref = self.module(module_name).ref(field_name)
+        payload = flat_dictionary.serialise_run(ref.key, values, ref.spec)
+        future = self._transport.send_request(
+            dest_id=ref.node_id, type_id=TYPE_SET_FIELDS, payload=payload,
+            timeout=timeout, expect_response=await_response)
+        if not wait:
+            return future
+        future.result(timeout=timeout)
+        return None
+
+    @property
+    def screen(self):
+        """The secondary LCD driver (320x240). Requires telemetry."""
+        if self._screen is None:
+            from .screen import Screen
+            self._screen = Screen(self.write_named)
+        return self._screen
+
+    @property
+    def speaker(self):
+        """The speaker driver (32 kHz PCM streaming). Requires telemetry."""
+        if self._speaker is None:
+            from .speaker import Speaker
+            self._speaker = Speaker(
+                self.write_named,
+                read=lambda name: self.read_named("speaker", name),
+                run=lambda samples, **kwargs: self.write_run("speaker", "data",
+                                                             samples, **kwargs),
+            )
+        return self._speaker
+
+    def read_named(self, module_name: str, field_name: str) -> int | None:
+        """Read a module field from the telemetry cache (None if unavailable).
+
+        There is no field-read service, so this only sees values the node
+        has published — which is enough for the speaker's
+        `free_space_in_bytes` flow control when telemetry is enabled for the
+        cube board.
+        """
+        if self._telemetry is None:
+            return None
+        try:
+            ref = self.module(module_name).ref(field_name)
+        except (KeyError, AttributeError, RuntimeError):
+            return None
+        value = self._telemetry.get(ref.node_id, ref.key)
+        return value if isinstance(value, int) else None
+
     # ---------------- discovery ----------------
 
     def _on_allocated(self, node_id: int, identity: uuid.UUID) -> None:
@@ -358,22 +494,39 @@ class LumiCube:
         time.sleep(0.75)  # grace period for additional discoveries
         log.info("discovered %d node(s): %s", len(self._allocated), self._allocated)
 
-    def _discover_names(self) -> None:
+    def _discover_names(self, attempts: int = 3) -> None:
+        """Resolve every discovered node's preferred name.
+
+        The link drops replies (the daemon logs retransmissions constantly),
+        so a single lost GET_PREFERRED_NAME used to leave a node nameless —
+        and since the module namespace is keyed by name, that silently
+        removed whole modules. Retry until every node answers or we run out
+        of attempts.
+        """
         assert self._transport is not None
-        for node_id in list(self._allocated):
-            try:
-                future = self._transport.send_request(
-                    dest_id=node_id,
-                    type_id=TYPE_GET_PREFERRED_NAME,
-                    payload=b"",
-                    timeout=2.0,
-                )
-                response = future.result(timeout=2.5)
-                name = response.decode("utf-8", errors="replace").strip("\x00").strip()
-                self._names[node_id] = name
-                log.info("node %d preferred_name=%r", node_id, name)
-            except Exception as exc:
-                log.warning("could not get preferred name for node %d: %s", node_id, exc)
+        for attempt in range(attempts):
+            pending = [node_id for node_id in self._allocated
+                       if node_id not in self._names]
+            if not pending:
+                return
+            for node_id in pending:
+                try:
+                    future = self._transport.send_request(
+                        dest_id=node_id,
+                        type_id=TYPE_GET_PREFERRED_NAME,
+                        payload=b"",
+                        timeout=2.0,
+                    )
+                    response = future.result(timeout=2.5)
+                    name = response.decode("utf-8", errors="replace").strip("\x00").strip()
+                    self._names[node_id] = name
+                    log.info("node %d preferred_name=%r", node_id, name)
+                except Exception as exc:
+                    log.warning("could not get preferred name for node %d "
+                                "(attempt %d/%d): %s", node_id, attempt + 1,
+                                attempts, exc)
+            if attempt + 1 < attempts:
+                time.sleep(0.2)
 
     def _pick_display_node(self) -> int | None:
         # The cube base board's preferred name is `cube` (or

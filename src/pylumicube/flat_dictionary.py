@@ -105,6 +105,28 @@ def serialise(values: Mapping[int, int | bytes], specs: Mapping[int, FieldSpec])
     return bytes(buf)
 
 
+def serialise_run(floor: int, values: "Iterable[int]", spec: FieldSpec) -> bytes:
+    """Encode a contiguous run of equal-width values starting at `floor`.
+
+    Equivalent to `serialise({floor + i: v}, {floor: spec})` but without
+    building a dict or looking anything up per value — the shape every
+    streaming writer needs (112 speaker samples, 80 screen pixels). The
+    encoding is `[skip floor][run N][N values]`.
+    """
+    buf = bytearray()
+    if floor > 0:
+        _emit_command(buf, discriminator=1, parameter=floor)   # skip to floor
+    values = list(values)
+    _emit_command(buf, discriminator=0, parameter=len(values))
+    size = spec.size
+    if size <= 0:
+        raise ValueError("variable-width runs are not supported")
+    signed = spec.signed
+    for value in values:
+        buf.extend(int(value).to_bytes(size, "little", signed=signed))
+    return bytes(buf)
+
+
 class SizeTracker:
     """Incrementally track the encoded size of a FlatDictionary.
 
