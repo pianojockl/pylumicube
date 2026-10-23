@@ -53,7 +53,7 @@ DEFAULT_VOLUME = 40
 #: absorbed most of it. A larger lead overflows the firmware instead (a
 #: 35 ms lead dropped 51 chunks of a 5 second sentence), so this is a narrow
 #: window rather than "more is better".
-LEAD_SECONDS = 0.014
+LEAD_SECONDS = 0.021
 
 #: Chunks sent back-to-back per wakeup. `time.sleep` on a busy Pi overshoots
 #: by a few milliseconds, which shows up as a tail of late chunks (measured
@@ -61,6 +61,15 @@ LEAD_SECONDS = 0.014
 #: small to absorb that. Sleeping once per *group* means three times fewer
 #: timing events and three times more audio behind each one.
 PACE_GROUP = 3
+
+#: How far behind the schedule audio may fall before chunks are skipped.
+#: Upstream's PulseAudio buffer played the same role: a hiccup delayed a
+#: write but the samples were still there afterwards, so the audio came out
+#: complete and slightly late. Dropping on the first late chunk (the old
+#: behaviour) turned every hiccup into an audible gap. A second of lag is
+#: inaudible in an announcement; beyond it something is badly wrong and
+#: skipping ahead is the lesser evil.
+MAX_LAG_SECONDS = 1.0
 
 SINE = "sine"
 SQUARE = "square"
@@ -152,6 +161,7 @@ class Speaker:
                  pace: bool = True,
                  lead: float = LEAD_SECONDS,
                  pace_group: int = PACE_GROUP,
+                 max_lag: float = MAX_LAG_SECONDS,
                  await_response: bool = False,
                  max_in_flight: int = 32) -> None:
         self._write = write
@@ -175,6 +185,8 @@ class Speaker:
         self.lead = float(lead)
         #: Chunks per wakeup when pacing (see `write_pcm`).
         self.pace_group = max(1, int(pace_group))
+        #: How late audio may run before it is skipped (see `MAX_LAG_SECONDS`).
+        self.max_lag = max(0.0, float(max_lag))
         self._volume = max(0, min(MAX_VOLUME, volume))
         self._stopped = False
         self.dropped_chunks = 0
@@ -218,13 +230,23 @@ class Speaker:
         Chunks are **pipelined**: a single write costs ~50-100 ms of latency
         on this hardware, but the link sustains ~380 frames/s when several
         are in flight (measured), which is comfortably above the 286
-        chunks/s that 32 kHz mono needs. Chunks are dropped rather than
-        queued when the link falls behind, so audio never drifts late.
+        chunks/s that 32 kHz mono needs.
 
-        The first `lead` seconds go out as fast as the link takes them, and
-        only after that does the schedule bite: the firmware buffers about
-        3 KB (≈95 ms), and pacing exactly to real time leaves that buffer
-        empty, so any jitter underruns it and the speech chops.
+        The pacing is what makes it sound right, and it is worth being
+        precise about, because the firmware's own buffer is small (~3 KB,
+        about 47 ms): pacing *exactly* to real time leaves that buffer empty,
+        so every scheduling hiccup is an audible gap. So:
+
+        * `lead` seconds go out ahead of the schedule, to start with the
+          buffer full rather than empty.
+        * `pace_group` chunks are sent per wakeup, so there are that many
+          fewer `sleep()` overshoots to be late with.
+        * lateness is *tolerated* (`max_lag`): the audio plays slightly late
+          rather than being thrown away, which is what upstream's PulseAudio
+          buffer effectively did. Only a genuine runaway skips ahead.
+        * the in-flight window is never *waited* on — the Java daemon used a
+          `NullContinuation` and never blocked either; waiting here is what
+          turns a busy link into a stall.
         """
         self._stopped = False
         if realtime is None:
@@ -233,38 +255,45 @@ class Speaker:
         chunk_duration = self.chunk_samples / self.sample_rate
         started = time.monotonic()
         sent = 0
+        offset = 0
+        total = len(pcm)
         in_flight: deque[Future] = deque()
 
-        for offset in range(0, len(pcm) - 1, chunk_bytes):
+        while offset < total - 1:
             if self._stopped:
                 break
             chunk = pcm[offset : offset + chunk_bytes]
             if len(chunk) < chunk_bytes:
                 chunk = chunk + b"\x00" * (chunk_bytes - len(chunk))   # pad
-            if realtime and sent % self.pace_group == 0:
-                # Sleep once per group: the schedule is still absolute, so a
-                # group that arrives late is caught up by the next one, but
-                # there are `pace_group` times fewer sleeps to overshoot.
-                due = started + max(0.0, sent * chunk_duration - self.lead)
+            if realtime:
                 now = time.monotonic()
-                if now < due:
-                    time.sleep(due - now)
-                elif now > due + 3 * chunk_duration * self.pace_group:
-                    # Genuinely behind (the lead is spent and then some):
-                    # skip this group rather than play the rest late.
-                    self.dropped_chunks += self.pace_group
-                    sent += self.pace_group
+                schedule = started + sent * chunk_duration
+                if now - schedule > self.max_lag:
+                    # Hopelessly behind: skip *audio* (not just this chunk)
+                    # so the rest is not played a second late.
+                    remaining = (total - offset) // chunk_bytes
+                    skip = max(1, min(int((now - schedule) / chunk_duration),
+                                      remaining))
+                    self.dropped_chunks += skip
+                    sent += skip
+                    offset += skip * chunk_bytes
                     continue
+                due = schedule - self.lead
+                if sent % self.pace_group == 0 and now < due:
+                    # Sleep once per group: the schedule is absolute, so a
+                    # group that arrives late is caught up by the next one,
+                    # but there are `pace_group` times fewer sleeps to
+                    # overshoot. The lead never tightens this: it is a head
+                    # start, not an earlier deadline.
+                    time.sleep(due - now)
                 self._wait_for_space()
             while in_flight and in_flight[0].done():
                 in_flight.popleft()
             if len(in_flight) >= self.max_in_flight:
-                # The link is saturated: let the oldest write finish rather
-                # than growing a queue that would play back late.
-                try:
-                    in_flight.popleft().result(timeout=self.timeout)
-                except Exception:  # noqa: BLE001
-                    self.dropped_chunks += 1
+                # Do not block. The future is only for error reporting and
+                # audio does not need it; waiting turns a busy link into a
+                # stall, which is exactly what the firmware cannot absorb.
+                in_flight.popleft()
 
             samples = array.array("h")
             samples.frombytes(chunk)
@@ -287,7 +316,9 @@ class Speaker:
                 if future is not None:
                     in_flight.append(future)
             sent += 1
+            offset += chunk_bytes
 
+        # Let the last writes land, without failing the caller if one is late.
         for future in in_flight:
             try:
                 future.result(timeout=max(self.timeout, 2.0))

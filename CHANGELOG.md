@@ -150,6 +150,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LEVEL` covers the non-interactive case.
 
 ### Fixed
+- **Choppy speech, properly this time.** A probe that attributes every
+  millisecond (`ref_data/tools/audio_stall_probe.py`) showed the write itself
+  was only ~10% of the loop's time: 20-78% was spent *outside* it, waiting on
+  the in-flight window. `write_pcm` blocked on the oldest future whenever 32
+  writes were outstanding — and the Java daemon never blocked on anything (it
+  passed a `NullContinuation`). Three changes:
+  - the in-flight window is **never waited on** (the future is only for error
+    reporting; audio does not need it),
+  - lateness is **tolerated** up to `MAX_LAG_SECONDS` instead of dropping the
+    first late chunk — upstream's PulseAudio buffer played exactly that role,
+    so a hiccup delayed the audio rather than deleting part of it,
+  - the `lead` no longer tightens the drop threshold (it is a head start, not
+    an earlier deadline; conflating them made a *bigger* lead drop *more*).
+  Measured over a 7-second sentence: dropped chunks **37-446 → 0-4**, worst
+  gap **52-66 ms → 13-25 ms** (the firmware's own buffer is ≈47 ms, so it no
+  longer underruns), stalls over 20 ms **6-55 → 0-1**, and loop time outside
+  the write **20-78% → 5-8%**. A nine-second announcement through the daemon
+  now reports **0% loss** (2 chunks of 2614).
 - **Choppy speech.** The stream was paced to exactly real time, which leaves
   the firmware's small audio buffer empty: measured on the cube, the p50 gap
   between chunks was spot on (3.5 ms) but the p95 was 8.6 ms and spikes
