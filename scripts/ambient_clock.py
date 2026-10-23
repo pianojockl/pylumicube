@@ -93,6 +93,13 @@ DISPLAY_BRIGHTNESS = 255   # the matrix's own brightness (0..255): the firmware
                            # boots at 65, which multiplies with the dimming
                            # below — 0.5 brightness then means 13%, not 50%
 
+#: How the hour is spoken at the top of the hour, indexed by `hour % 12`. The
+#: clock is 12-hour by ear: `now.hour` runs 0..23, and espeak reads a bare
+#: number literally, so handing it `16` gets you "sixteen o'clock". Words
+#: (never digits) are the point — `08` would be read as "zero eight".
+HOUR_WORDS = ("twelve", "one", "two", "three", "four", "five", "six",
+              "seven", "eight", "nine", "ten", "eleven")
+
 # CPU-temperature chart on the secondary LCD (bottom button).
 TEMP_SAMPLE_SECONDS = 10   # one sample this often
 TEMP_HISTORY = 60          # samples kept (and columns plotted)
@@ -112,7 +119,8 @@ LIGHT_LOG = os.path.join(
 #: Settings a config file may override.
 CONFIG_NAMES = ("BRIGHTNESS_MIN", "BRIGHTNESS_MAX", "GAMMA", "SMOOTHING", "ADAPT",
                 "LOW", "HIGH", "HUE_FOLLOWS_HOUR", "HUE", "SATURATION", "JITTER",
-                "ALLOW_REBOOT", "HOURLY_SCROLL", "HOURLY_SPEAK", "SCROLL_SPEED",
+                "ALLOW_REBOOT", "HOURLY_SCROLL", "HOURLY_SPEAK", "HOUR_WORDS",
+                "SCROLL_SPEED",
                 "SCROLL_FONT", "SPEAKER_VOLUME", "DISPLAY_BRIGHTNESS",
                 "TEMP_SAMPLE_SECONDS", "TEMP_HISTORY", "CHART_REFRESH",
                 "STATUS_INTERVAL", "LIGHT_LOG")
@@ -561,7 +569,7 @@ class AmbientClock:
         if HOURLY_SCROLL:
             self.scroll_time(now)
         if HOURLY_SPEAK and 7 < now.hour < 20:
-            self.say(f"it's {now.hour} o'clock")
+            self.say(f"it's {HOUR_WORDS[now.hour % 12]} o'clock")
 
 
 def _open_light_log(path: str | None = None):

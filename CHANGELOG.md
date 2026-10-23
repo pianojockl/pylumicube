@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not even restart.
 
 ### Fixed
+- **The hourly chime said "sixteen o'clock".** It handed espeak-ng the raw
+  24-hour number (`f"it's {now.hour} o'clock"`), and espeak reads a bare
+  number literally — verified with its phoneme output: `it's 16 o'clock` →
+  `Its s'Iksti:n @kl'0k`. So 13:00-19:00 were announced as
+  "thirteen"…"nineteen" while the morning was accidentally right (8-12 read
+  as "eight"…"twelve"). The hour now comes from a `HOUR_WORDS` table indexed
+  by `hour % 12`, so the chime is 12-hour by ear — eight, nine, ten, eleven,
+  twelve, one, two, three, four, five, six, seven — and a test asserts no
+  spoken chime contains a digit at all (`08` would be read as "zero eight",
+  which is how the pre-rewrite version announced 8:00).
 - **The MQTT bridge heard its own state as a command, and looped with Home
   Assistant.** It subscribed to `lumicube/speaker/#`, which includes
   `lumicube/speaker/volume` — the topic it *publishes* the volume on. Each

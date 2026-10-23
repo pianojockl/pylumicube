@@ -44,6 +44,10 @@ JITTER = 1.0             # per-pixel hue shimmer; 0 = steady colour
 ALLOW_REBOOT = True      # middle button reboots the Pi
 HOURLY_SCROLL = True     # scroll the time at the top of each hour
 HOURLY_SPEAK = True      # ...and speak it (needs the speaker module)
+HOUR_WORDS = ("twelve", "one", "two", "three", "four", "five", "six",
+              "seven", "eight", "nine", "ten", "eleven")
+                         # how the hour is spoken, indexed by `hour % 12`, so
+                         # 16:00 is "four o'clock" and not "sixteen o'clock"
 SCROLL_SPEED = 0.7       # higher = faster scroll
 SCROLL_FONT = "digits"   # "digits" = the clock's own 3x5 glyphs (matches
                          # the static display); "firmware" = the taller

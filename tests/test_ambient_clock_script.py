@@ -578,7 +578,7 @@ def test_hourly_chime_scrolls_and_speaks_once_per_hour(monkeypatch) -> None:
     instance.hourly_chime(at_the_hour)
     instance.hourly_chime(at_the_hour)          # same hour: no repeat
     assert len(cube.display.scrolled_pixels) == 1
-    assert speaker.said == ["it's 14 o'clock"]
+    assert speaker.said == ["it's two o'clock"]
     instance.hourly_chime(datetime.datetime(2026, 10, 23, 15, 0, 1))
     assert len(cube.display.scrolled_pixels) == 2
 
@@ -595,5 +595,46 @@ def test_hourly_chime_ignores_other_minutes() -> None:
     instance, cube, _curve = _clock()
     instance.hourly_chime(datetime.datetime(2026, 10, 23, 14, 30, 0))
     assert cube.display.scrolls == []
+
+
+def test_the_chime_speaks_twelve_hour_words(monkeypatch) -> None:
+    """The hours it actually speaks: eight .. twelve, then one .. seven.
+
+    `now.hour` is 0..23 and espeak reads a bare number literally, so 16:00
+    used to be announced as "sixteen o'clock".
+    """
+    monkeypatch.setattr(clock, "HOURLY_SPEAK", True)
+    monkeypatch.setattr(clock, "HOURLY_SCROLL", False)
+    speaker = FakeModule()
+    instance, _cube, _curve = _clock({"speaker": speaker})
+    for hour in range(8, 20):
+        instance.hourly_chime(datetime.datetime(2026, 10, 23, hour, 0, 1))
+    assert speaker.said == [
+        "it's eight o'clock", "it's nine o'clock", "it's ten o'clock",
+        "it's eleven o'clock", "it's twelve o'clock", "it's one o'clock",
+        "it's two o'clock", "it's three o'clock", "it's four o'clock",
+        "it's five o'clock", "it's six o'clock", "it's seven o'clock",
+    ]
+
+
+def test_the_hour_table_wraps_at_midnight_and_noon() -> None:
+    """The window never speaks 0 or 12, but the table should still be right."""
+    assert len(clock.HOUR_WORDS) == 12
+    assert clock.HOUR_WORDS[0] == "twelve"
+    assert clock.HOUR_WORDS[12 % 12] == "twelve"
+    assert clock.HOUR_WORDS[13 % 12] == "one"
+
+
+def test_no_chime_ever_speaks_a_digit(monkeypatch) -> None:
+    """Digits are the bug: espeak reads `16` as "sixteen" and `08` as "zero eight"."""
+    monkeypatch.setattr(clock, "HOURLY_SPEAK", True)
+    monkeypatch.setattr(clock, "HOURLY_SCROLL", False)
+    speaker = FakeModule()
+    instance, _cube, _curve = _clock({"speaker": speaker})
+    for hour in range(24):
+        instance.hourly_chime(datetime.datetime(2026, 10, 23, hour, 0, 1))
+    assert speaker.said, "the chime never spoke, so this proves nothing"
+    for phrase in speaker.said:
+        assert not any(char.isdigit() for char in phrase), phrase
 
 
