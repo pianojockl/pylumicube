@@ -26,6 +26,7 @@ import base64
 import json
 import logging
 import os
+import queue
 import socket
 import threading
 import time
@@ -180,10 +181,18 @@ class ControlServer:
     """
 
     def __init__(self, cube: Any, path: str | None = None, *,
-                 log_ops: bool = False) -> None:
+                 log_ops: bool = False,
+                 protected_nodes: Iterable[str] = (),
+                 allow_protected: bool = False) -> None:
         self.cube = cube
         self.path = resolve_socket_path(path)
         self.log_ops = log_ops
+        #: Node names whose telemetry is refused unless `allow_protected`:
+        #: the cube board publishes everything at full rate (its LED block
+        #: included), which drowns the link — measured at 30 service
+        #: timeouts in 30 seconds, with display writes failing.
+        self.protected_nodes = {name.lower() for name in protected_nodes}
+        self.allow_protected = bool(allow_protected)
         self._listener: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -200,6 +209,11 @@ class ControlServer:
         self._last_audio_op = 0.0
         self._started = time.time()
         self._ops_served = 0
+        #: Telemetry events waiting for the sender thread (bounded: dropping
+        #: frames is better than stalling the link that feeds them).
+        self._events: queue.Queue = queue.Queue(maxsize=256)
+        self._sender: threading.Thread | None = None
+        self._dropped_events = 0
 
     def start(self) -> None:
         if self._listener is not None:
@@ -214,10 +228,17 @@ class ControlServer:
         self._thread = threading.Thread(target=self._accept_loop, daemon=True,
                                         name="pylumicube-control")
         self._thread.start()
+        self._sender = threading.Thread(target=self._sender_loop, daemon=True,
+                                        name="pylumicube-events")
+        self._sender.start()
         log.info("control socket listening on %s", self.path)
 
     def stop(self) -> None:
         self._stop.set()
+        try:
+            self._events.put_nowait(None)       # wake the sender
+        except queue.Full:
+            pass
         if self._listener is not None:
             try:
                 self._listener.close()
@@ -232,6 +253,9 @@ class ControlServer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        if self._sender is not None:
+            self._sender.join(timeout=2.0)
+            self._sender = None
         try:
             if os.path.exists(self.path):
                 os.unlink(self.path)
@@ -333,30 +357,58 @@ class ControlServer:
     # ---------------- events ----------------
 
     def broadcast(self, message: Mapping[str, Any]) -> None:
-        """Push an event to every connected client."""
-        with self._lock:
-            connections = list(self._connections)
-        for connection in connections:
-            connection.send(message)
+        """Queue an event for every connected client."""
+        self._enqueue(message)
 
     def broadcast_values(self, node_id: int, values: Mapping[int, int]) -> None:
-        """Push freshly published field values (only to subscribers)."""
+        """Queue freshly published field values for the subscribers.
+
+        Queued, never sent here: this runs on the link's I/O thread, and
+        serialising a frame for every client (a cube-board frame carries a
+        couple of hundred values) is easily slow enough to stall the wire —
+        which then makes service requests time out. A dedicated sender
+        thread does the work, and the queue is bounded so a client that
+        cannot keep up loses frames instead of slowing the cube down.
+        """
         if not values:
             return
-        with self._lock:
-            targets = [c for c in self._connections
-                       if not c.subscriptions or node_id in c.subscriptions]
-        if not targets:
-            return
-        message = {"event": "values", "node": node_id,
-                   "values": {str(key): int(value) for key, value in values.items()}}
-        for connection in targets:
-            connection.send(message)
+        self._enqueue({"event": "values", "node": node_id,
+                       "values": {str(key): int(value)
+                                  for key, value in values.items()}})
+
+    def _enqueue(self, message: Mapping[str, Any]) -> None:
+        try:
+            self._events.put_nowait(dict(message))
+        except queue.Full:
+            self._dropped_events += 1
+            if self._dropped_events % 100 == 1:
+                log.warning("dropping telemetry events: %d clients are behind",
+                            self._dropped_events)
+
+    def _sender_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                message = self._events.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if message is None:
+                break
+            node_id = message.get("node")
+            with self._lock:
+                targets = [c for c in self._connections
+                           if node_id is None or not c.subscriptions
+                           or node_id in c.subscriptions]
+            for connection in targets:
+                connection.send(message)
 
     @property
     def client_count(self) -> int:
         with self._lock:
             return len(self._connections)
+
+    @property
+    def dropped_events(self) -> int:
+        return self._dropped_events
 
     # ---------------- operations ----------------
 
@@ -384,13 +436,29 @@ class ControlServer:
                     "schemas": encode_schemas(cube.schemas)}
 
         if op == "subscribe":
-            nodes = [int(node) for node in request.get("nodes") or []]
+            nodes = self._node_list(request.get("nodes"))
+            refused = self._protected_in(nodes)
+            if refused and not self.allow_protected:
+                raise ControlError(
+                    "refusing to subscribe to "
+                    f"{', '.join(refused)}: that board publishes every field at "
+                    "full rate and drowns the link (display writes then time "
+                    "out). Start the daemon with --allow-cube-telemetry to "
+                    "permit it, and expect a degraded cube while it lasts.",
+                    code="link_protected")
             with self.write_lock:
                 subscribed = cube.telemetry.subscribe(nodes or None)
             connection.subscriptions.update(subscribed)
             return {"ok": True, "subscribed": sorted(subscribed),
                     "telemetry": cube.telemetry.stats()
                     if hasattr(cube.telemetry, "stats") else {}}
+
+        if op == "unsubscribe":
+            nodes = self._node_list(request.get("nodes"))
+            with self.write_lock:
+                stopped = cube.telemetry.unsubscribe(nodes or None)
+            connection.subscriptions.difference_update(stopped)
+            return {"ok": True, "unsubscribed": sorted(stopped)}
 
         if op == "read":
             module = self._module(request)
@@ -520,6 +588,27 @@ class ControlServer:
             return self.cube.module(name)
         except KeyError as exc:
             raise ControlError(str(exc), code="no_module") from None
+
+    @staticmethod
+    def _node_list(value: Any) -> list[int]:
+        """Accept `[1, 2]`, `1` or `"1"` — `lumicube-do nodes=125` is handy."""
+        if value is None or value == "":
+            return []
+        if isinstance(value, (int, str)):
+            return [int(value)]
+        return [int(node) for node in value]
+
+    def _protected_in(self, node_ids: Iterable[int]) -> list[str]:
+        """Which of these node ids are on the protected list (by name)."""
+        if not self.protected_nodes:
+            return []
+        names = getattr(self.cube, "node_names", {}) or {}
+        out = []
+        for node_id in node_ids:
+            name = str(names.get(node_id, "")).lower()
+            if name in self.protected_nodes:
+                out.append(name or str(node_id))
+        return out
 
 
 class ControlClient:

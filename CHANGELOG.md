@@ -122,6 +122,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`deploy/pylumicube-daemon.service`** and the daemon section of the
   deploy guide, including the Home Assistant setup and the washing-machine
   automation.
+- **Microphone capture** (`pylumicube.microphone`, `LumiCube.microphone`):
+  16 kHz mono s16le assembled from the published `microphone.data` block
+  (112 samples per frame — the same format the Java daemon piped to
+  PulseAudio), with `capture()`, `record()` (WAV) and `chunks()`, and
+  `scripts/record_microphone.py` to record and play it back. It is
+  **refused by default** on the daemon: subscribing to the cube board floods
+  the link (measured: 30 service timeouts in 30 seconds, display writes
+  failing, no handshake possible) because the firmware publishes every field
+  on that board at full rate. `lumicube-daemon --allow-cube-telemetry` opts
+  in; record with the clock stopped.
+- **`TelemetryStore.add_update_handler` / `RemoteTelemetry.on_values`** —
+  runtime frame consumers (what the microphone uses), separate from the
+  constructor's single `on_update`.
+- **An `unsubscribe` operation** (and `TelemetryStore.unsubscribe`), so a
+  client that wanted the link back can stop renewing its subscription.
 - **`LIGHT_LOG`** — the clock appends `timestamp,ambient,brightness,low,high`
   to a CSV every `STATUS_INTERVAL` (default
   `~/.local/state/pylumicube/light.csv`), so a room's light over a whole day
@@ -134,6 +149,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LEVEL` covers the non-interactive case.
 
 ### Fixed
+- **Telemetry broadcasts ran on the link's I/O thread.** Serialising a
+  frame for every client — a cube-board frame carries a couple of hundred
+  values — was slow enough to stall the wire, which made service requests
+  time out and the daemon unable to complete a handshake. Broadcasts now go
+  through a bounded queue and a sender thread, so a slow client loses frames
+  instead of the cube losing its link.
+- **The clock died on a dropped frame.** A timed-out display write
+  propagated out of `render()` and killed the process (systemd restarted it,
+  noisily). Drawing now logs and retries, and the main loop survives any
+  transient link failure — a hiccup should cost a frame, not the clock.
 - **A telemetry store decoded frames before it was armed.** The broadcast
   handler was registered in the constructor, so frames arriving during
   `enable_telemetry`'s schema walk were decoded against a half-built

@@ -222,6 +222,18 @@ and `~/AbstractFoundry/` is untouched.
   the speaker for the whole utterance, so an announcement from Home
   Assistant cannot talk over the clock's hourly chime. Display writes are
   *not* held up by that — they use a separate lock.
+- **The microphone is off by default.** Capturing needs the cube board
+  subscribed, and the firmware publishes every field on that board at full
+  rate (its 192-LED block included): measured at 30 service timeouts in 30
+  seconds, with display writes failing. The daemon refuses it unless started
+  with `--allow-cube-telemetry`, and the capture itself wants the clock
+  stopped:
+
+  ```bash
+  systemctl --user stop pylumicube-clock
+  .venv/bin/python scripts/record_microphone.py --seconds 5 --play
+  systemctl --user start pylumicube-clock
+  ```
 - A healthy daemon start looks like this (about 6 s, most of it discovery):
 
   ```

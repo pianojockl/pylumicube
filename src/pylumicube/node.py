@@ -88,6 +88,7 @@ class LumiCube:
         self._namespace: dict[str, FieldModule] | None = None
         self._screen = None
         self._speaker = None
+        self._microphone = None
 
 
     # ---------------- lifecycle ----------------
@@ -481,6 +482,34 @@ class LumiCube:
             self.speaker.say(text, voice=voice)
         else:
             self.speaker.say(text, voice=voice, speed=speed)
+
+    @property
+    def microphone(self):
+        """The microphone driver (16 kHz s16le capture).
+
+        The microphone lives on the cube board, so `enable()` subscribes to
+        it — which costs speaker throughput while it is on (see
+        `pylumicube.microphone`).
+        """
+        if self._microphone is None:
+            from .microphone import Microphone
+            module = self.module("microphone")
+
+            def subscribe() -> None:
+                node_id = next(iter(module.refs.values())).node_id
+                if self._telemetry is not None:
+                    self._telemetry.subscribe([node_id])
+
+            def unsubscribe() -> None:
+                node_id = next(iter(module.refs.values())).node_id
+                if self._telemetry is not None:
+                    self._telemetry.unsubscribe([node_id])
+
+            self._microphone = Microphone(module, telemetry=self._telemetry,
+                                          write=self.write_named,
+                                          subscribe=subscribe,
+                                          unsubscribe=unsubscribe)
+        return self._microphone
 
     def read_named(self, module_name: str, field_name: str) -> int | None:
         """Read a module field from the telemetry cache (None if unavailable).

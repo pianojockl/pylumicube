@@ -19,7 +19,7 @@ import contextlib
 import logging
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future
 from typing import Any
 
@@ -49,6 +49,7 @@ class RemoteTelemetry:
         self._subscribed: set[int] = set()
         self._frames = 0
         self._started = time.time()
+        self._handlers: list[Callable[[int, Mapping[int, int]], None]] = []
 
     # ---------------- store API ----------------
 
@@ -131,6 +132,19 @@ class RemoteTelemetry:
 
     # ---------------- event sink ----------------
 
+    def on_values(self, callback: Callable[[int, Mapping[int, int]], None]) -> None:
+        """Add a callback for pushed frames (the microphone captures this way)."""
+        with self._lock:
+            self._handlers.append(callback)
+
+    def remove_values_handler(self,
+                              callback: Callable[[int, Mapping[int, int]], None]) -> None:
+        with self._lock:
+            try:
+                self._handlers.remove(callback)
+            except ValueError:
+                pass
+
     def _on_values(self, node_id: int, values: Mapping[int, int]) -> None:
         with self._updated:
             node_values = self._values.setdefault(node_id, {})
@@ -138,6 +152,12 @@ class RemoteTelemetry:
             self._last_update[node_id] = time.monotonic()
             self._frames += 1
             self._updated.notify_all()
+            handlers = list(self._handlers)
+        for handler in handlers:
+            try:
+                handler(node_id, values)
+            except Exception:  # noqa: BLE001 — a handler must not kill the reader
+                log.exception("telemetry value handler raised")
 
 
 class RemoteTransport:
@@ -209,6 +229,7 @@ class CubeClient:
         self._display = None
         self._screen = None
         self._speaker = None
+        self._microphone = None
         self._transport = RemoteTransport(self)
         log.info("connected to the daemon on %s (%d nodes, %d modules)",
                  self.path, len(self._names), len(self.info.get("modules") or []))
@@ -445,6 +466,32 @@ class CubeClient:
                                                              samples, **kwargs),
             )
         return self._speaker
+
+    @property
+    def microphone(self):
+        """The microphone driver (16 kHz s16le capture).
+
+        The microphone lives on the cube board, so `enable()` asks the
+        daemon to subscribe to it — which costs speaker throughput while it
+        is on (see `pylumicube.microphone`).
+        """
+        if self._microphone is None:
+            from .microphone import Microphone
+            module = self.module("microphone")
+
+            def subscribe() -> None:
+                node_id = next(iter(module.refs.values())).node_id
+                self.enable_telemetry(node_ids=[node_id])
+
+            def unsubscribe() -> None:
+                node_id = next(iter(module.refs.values())).node_id
+                self.control.request("unsubscribe", nodes=[node_id], timeout=10.0)
+
+            self._microphone = Microphone(module, telemetry=self._telemetry,
+                                          write=self.write_named,
+                                          subscribe=subscribe,
+                                          unsubscribe=unsubscribe)
+        return self._microphone
 
 
 def _check(reply: Mapping[str, Any]) -> None:

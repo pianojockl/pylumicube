@@ -76,6 +76,7 @@ class TelemetryStore:
         self._repair_executor: ThreadPoolExecutor | None = None
         self._frames = 0
         self._registered = False
+        self._update_handlers: list[Callable[[int, dict[int, int]], None]] = []
 
     # ---------------- registration ----------------
 
@@ -83,6 +84,22 @@ class TelemetryStore:
         """Register a node's field schema (needed to decode its frames)."""
         with self._lock:
             self._schemas[node_id] = dict(specs)
+
+    def add_update_handler(self, handler: Callable[[int, dict[int, int]], None]) -> None:
+        """Add a callback for decoded frames (the microphone captures this way).
+
+        Unlike the constructor's `on_update` (one owner, the daemon), any
+        number of handlers can be added and removed at runtime.
+        """
+        with self._lock:
+            self._update_handlers.append(handler)
+
+    def remove_update_handler(self, handler: Callable[[int, dict[int, int]], None]) -> None:
+        with self._lock:
+            try:
+                self._update_handlers.remove(handler)
+            except ValueError:
+                pass
 
     @property
     def schemas(self) -> dict[int, Mapping[int, FieldSpec]]:
@@ -124,6 +141,23 @@ class TelemetryStore:
     def subscribed_nodes(self) -> set[int]:
         with self._lock:
             return set(self._subscribed)
+
+    def unsubscribe(self, node_ids: Iterable[int] | None = None, *,
+                    timeout: float = 2.0) -> list[int]:
+        """Stop renewing a subscription, so it lapses on its own.
+
+        The firmware's subscription carries a duration (twice the cadence),
+        so this does not take effect instantly — it stops the *renewal*,
+        which is what a caller wanting the link back needs. (Asking the node
+        to stop early was tried and is not worth the request: it adds
+        traffic to a link that is usually the reason you are unsubscribing.)
+        """
+        with self._lock:
+            targets = (sorted(self._subscribed) if node_ids is None
+                       else [int(node) for node in node_ids])
+            for node_id in targets:
+                self._subscribed.discard(node_id)
+        return targets
 
     def start(self) -> None:
         """Arm the store: decode frames from here on, and renew the subscription.
@@ -187,6 +221,14 @@ class TelemetryStore:
                 self._on_update(node_id, values)
             except Exception:  # noqa: BLE001 — a bad callback must not kill the link
                 log.exception("telemetry on_update callback raised")
+        if self._update_handlers:
+            with self._lock:
+                handlers = list(self._update_handlers)
+            for handler in handlers:
+                try:
+                    handler(node_id, values)
+                except Exception:  # noqa: BLE001 — same reasoning
+                    log.exception("telemetry update handler raised")
 
     def _decode(self, node_id: int, payload: bytes,
                 specs: Mapping[int, FieldSpec]) -> dict[int, int | float] | None:

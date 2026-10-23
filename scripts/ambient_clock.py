@@ -331,8 +331,13 @@ class AmbientClock:
         if not force and state == self._rendered:
             return False
         colour_for = self._colour_for(now.hour, brightness)
-        self.cube.display.set_panel("left", render_text(hours, colour_for))
-        self.cube.display.set_panel("right", render_text(minutes, colour_for))
+        try:
+            self.cube.display.set_panel("left", render_text(hours, colour_for))
+            self.cube.display.set_panel("right", render_text(minutes, colour_for))
+        except Exception:  # noqa: BLE001 — a dropped frame is cosmetic
+            # Deliberately not recorded as rendered: the next poll retries.
+            log.warning("could not draw the time; will retry", exc_info=True)
+            return False
         self._rendered = state
         return True
 
@@ -621,13 +626,18 @@ def run(cube: LumiCube, *, seconds: float | None = None,
     try:
         while True:
             now = datetime.datetime.now()
-            clock.poll_buttons(now)
-            clock.hourly_chime(now)
-            clock.sample_temperature(now)
-            clock.refresh_chart(now)
-            fresh = clock.poll_light()
-            brightness = clock.brightness() if fresh is None else fresh
-            clock.render(now, brightness)
+            try:
+                clock.poll_buttons(now)
+                clock.hourly_chime(now)
+                clock.sample_temperature(now)
+                clock.refresh_chart(now)
+                fresh = clock.poll_light()
+                brightness = clock.brightness() if fresh is None else fresh
+                clock.render(now, brightness)
+            except Exception:  # noqa: BLE001 — keep the clock alive through a hiccup
+                log.warning("clock loop failed; retrying", exc_info=True)
+                time.sleep(poll_interval)
+                continue
             if time.monotonic() >= status_at:
                 log.info("ambient %s -> brightness %.2f (range %.0f..%.0f)",
                          clock.last_raw, brightness, *clock.curve.range)

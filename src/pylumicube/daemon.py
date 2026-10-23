@@ -41,12 +41,14 @@ class Daemon:
                  log_ops: bool = False, subscribe_except: tuple[str, ...] = ("cube",),
                  telemetry_cadence: float = DEFAULT_CADENCE,
                  mqtt: Any = None, temperature_interval: float = TEMPERATURE_INTERVAL,
-                 clear_on_stop: bool = False) -> None:
+                 clear_on_stop: bool = False,
+                 allow_cube_telemetry: bool = False) -> None:
         self.port = port
         self.socket_path = resolve_socket_path(socket_path)
         self.mqtt_config = mqtt
         self.temperature_interval = temperature_interval
         self.clear_on_stop = clear_on_stop
+        self.allow_cube_telemetry = bool(allow_cube_telemetry)
         self._button_counts: dict[str, int] = {}
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -57,7 +59,9 @@ class Daemon:
                              telemetry_cadence=telemetry_cadence,
                              subscribe_except=subscribe_except,
                              on_update=self._on_telemetry)
-        self.server = ControlServer(self.cube, self.socket_path, log_ops=log_ops)
+        self.server = ControlServer(self.cube, self.socket_path, log_ops=log_ops,
+                                    protected_nodes=("cube",),
+                                    allow_protected=self.allow_cube_telemetry)
         self.bridge = None
 
     # ---------------- lifecycle ----------------
@@ -192,6 +196,10 @@ def build_parser() -> "argparse.ArgumentParser":
                         help="log every control operation")
     parser.add_argument("--clear-on-stop", action="store_true",
                         help="blank the LED matrix when shutting down")
+    parser.add_argument("--allow-cube-telemetry", action="store_true",
+                        help="let clients subscribe to the cube board (needed for "
+                             "the microphone; it floods the link, so it is off by "
+                             "default)")
     parser.add_argument("--mqtt-host", default=os.environ.get("PYLUMICUBE_MQTT_HOST"),
                         help="MQTT broker for the Home Assistant bridge")
     parser.add_argument("--mqtt-port", type=int,
@@ -233,7 +241,8 @@ def main(argv: list[str] | None = None) -> int:
         log.info("no --mqtt-host given; running without the MQTT bridge")
 
     daemon = Daemon(args.port, socket_path=args.socket, log_ops=args.log_ops,
-                    mqtt=mqtt, clear_on_stop=args.clear_on_stop)
+                    mqtt=mqtt, clear_on_stop=args.clear_on_stop,
+                    allow_cube_telemetry=args.allow_cube_telemetry)
 
     def _stop(_signum: int, _frame: Any) -> None:
         log.info("stopping")
