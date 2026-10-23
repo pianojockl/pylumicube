@@ -173,6 +173,7 @@ class LumiCube:
     def enable_telemetry(self, node_ids: Iterable[int] | None = None,
                          node_names: Iterable[str] | None = None, *,
                          subscribe: bool = True,
+                         subscribe_except: Iterable[str] = (),
                          budget: float | None = None) -> TelemetryStore:
         """Discover field schemas, subscribe to telemetry, build the namespace.
 
@@ -181,6 +182,12 @@ class LumiCube:
         both default to the constructor's `schema_nodes` /
         `schema_node_names`, and to every discovered node when those are
         unset too. `budget` overrides `schema_budget` for this call.
+
+        `subscribe_except` names nodes to *walk* (so their field keys are
+        known) but not subscribe to. A board's own telemetry stream competes
+        with our writes for the link — subscribing to the cube board cuts
+        pipelined speaker throughput from ~308 to ~56 chunks/s — so
+        peripherals that stream (the speaker) want it walked but silent.
         """
         if self._telemetry is not None:
             return self._telemetry
@@ -189,14 +196,22 @@ class LumiCube:
         targets = self._resolve_nodes(node_ids, node_names)
         if not targets:
             log.warning("enable_telemetry: no nodes discovered to subscribe to")
+        except_names = {name.lower() for name in subscribe_except}
+        subscribed = []
         for node_id in targets:
             specs = self.discover_schema(node_id, budget=budget)
             if specs:
                 store.set_schema(node_id, specs)
+            name = self._names.get(node_id, "").lower()
+            if name in except_names:
+                log.info("telemetry: walking node %d (%s) but not subscribing to it",
+                         node_id, name)
+                continue
+            subscribed.append(node_id)
         self._telemetry = store
         self._namespace = None
         if subscribe:
-            store.subscribe()
+            store.subscribe(node_ids=subscribed)
         store.start()
         return store
 

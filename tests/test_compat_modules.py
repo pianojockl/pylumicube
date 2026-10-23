@@ -247,11 +247,13 @@ class FakeCube:
         self.display = MagicMock()
         self.telemetry = None
         self.enable_calls = 0
+        self.enable_kwargs: list[dict] = []
         store, _transport = _store_with_sensor()
         self._modules = build_namespace({124: SENSOR_SCHEMA}, {124: "sensor"}, store)
 
     def enable_telemetry(self, *args, **kwargs):
         self.enable_calls += 1
+        self.enable_kwargs.append(kwargs)
         self.telemetry = MagicMock()
         return self.telemetry
 
@@ -297,6 +299,15 @@ def test_build_globals_module_handles_are_lazy() -> None:
     # `display`, `speaker`, `pi` are eager objects, not lazy handles.
     assert not isinstance(ns["display"], _LazyModule)
     assert isinstance(ns["pi"], PiModule)
+
+
+def test_telemetry_module_subscription_excludes_the_cube_board() -> None:
+    """Speaker throughput needs the cube board walked but not subscribed."""
+    cube = FakeCube()
+    compat = LumiCubeCompat(cube)
+    with pytest.warns(RuntimeWarning):
+        compat.speaker                      # absent on FakeCube -> stub
+    assert cube.enable_kwargs[-1].get("subscribe_except") == ("cube",)
 
 
 def test_lazy_module_forwards_reads_and_writes() -> None:

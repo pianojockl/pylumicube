@@ -699,7 +699,13 @@ class LumiCubeCompat:
             return True
         log.info("compat: enabling telemetry for '%s' access", name)
         try:
-            cube.enable_telemetry(budget=self._SCHEMA_BUDGET)
+            # Walk every board (so `screen` / `speaker` have their keys) but
+            # subscribe only to the sensor board: the cube board's own
+            # telemetry stream competes with our writes for the link, and
+            # subscribing to it cuts speaker throughput ~4x, which an
+            # upstream-style script that calls speaker.say() would notice.
+            cube.enable_telemetry(budget=self._SCHEMA_BUDGET,
+                                  subscribe_except=("cube",))
         except Exception:  # noqa: BLE001 — callers fall back to a stub
             log.exception("compat: telemetry unavailable; '%s' stays stubbed", name)
             return False
