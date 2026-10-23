@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future
 
 from . import discovery as _discovery
@@ -51,7 +51,9 @@ class LumiCube:
                  schema_timeout: float = 1.5,
                  schema_budget: float = 15.0,
                  schema_nodes: Iterable[int] | None = None,
-                 schema_node_names: Iterable[str] | None = None) -> None:
+                 schema_node_names: Iterable[str] | None = None,
+                 subscribe_except: Iterable[str] = (),
+                 on_update: Callable[[int, dict[int, int]], None] | None = None) -> None:
         self._port = port
         self._baudrate = baudrate
         self._source_id = source_id
@@ -64,6 +66,8 @@ class LumiCube:
         self._schema_nodes = list(schema_nodes) if schema_nodes is not None else None
         self._schema_node_names = (list(schema_node_names)
                                    if schema_node_names is not None else None)
+        self._subscribe_except = list(subscribe_except)
+        self._on_update = on_update
 
         self._link: SerialLink | None = None
         self._transport: Transport | None = None
@@ -111,7 +115,7 @@ class LumiCube:
         self._discover_names()
         self._display_node_id = self._pick_display_node()
         if self._telemetry_enabled:
-            self.enable_telemetry()
+            self.enable_telemetry(subscribe_except=self._subscribe_except)
 
     def stop(self) -> None:
         # Stop the telemetry heartbeat before closing the wire, so the
@@ -192,7 +196,8 @@ class LumiCube:
         if self._telemetry is not None:
             return self._telemetry
         store = TelemetryStore(self.transport, cadence=self._telemetry_cadence,
-                               repair_schema=self._repair_schema)
+                               repair_schema=self._repair_schema,
+                               on_update=self._on_update)
         targets = self._resolve_nodes(node_ids, node_names)
         if not targets:
             log.warning("enable_telemetry: no nodes discovered to subscribe to")
@@ -462,6 +467,20 @@ class LumiCube:
                                                              samples, **kwargs),
             )
         return self._speaker
+
+    def say(self, text: str, *, voice: str | None = None, speed: int | None = None,
+            volume: int | None = None) -> None:
+        """Speak `text` out of the cube's speaker.
+
+        Needs `espeak-ng` (or `espeak`) on PATH. `volume` is 0..200 and is
+        written first, so a caller can pin the level per announcement.
+        """
+        if volume is not None:
+            self.speaker.volume = volume
+        if speed is None:
+            self.speaker.say(text, voice=voice)
+        else:
+            self.speaker.say(text, voice=voice, speed=speed)
 
     def read_named(self, module_name: str, field_name: str) -> int | None:
         """Read a module field from the telemetry cache (None if unavailable).

@@ -74,6 +74,7 @@ def _store_with_sensor() -> tuple[TelemetryStore, FakeTransport]:
     transport = FakeTransport()
     store = TelemetryStore(transport)
     store.set_schema(124, SENSOR_SCHEMA)
+    store.start()          # frames are decoded once armed, as the cube does
     return store, transport
 
 

@@ -348,7 +348,19 @@ class AmbientClock:
         self._rendered = None      # the scroll overwrote the digits
 
     def say(self, text: str) -> None:
-        """Speak `text` if a speaker is available (else log and move on)."""
+        """Speak `text` if a speaker is available (else log and move on).
+
+        `cube.say` is preferred where it exists: through the daemon it holds
+        the speaker for the whole utterance, so an announcement from Home
+        Assistant cannot talk over the clock.
+        """
+        atomic = getattr(self.cube, "say", None)
+        if atomic is not None:
+            try:
+                atomic(text)
+                return
+            except Exception:  # noqa: BLE001 — never let audio break the clock
+                log.warning("cube.say failed", exc_info=True)
         if self._speaker is None:
             log.info("speaker unavailable; would have said: %s", text)
             return

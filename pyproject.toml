@@ -41,10 +41,17 @@ extras = [
 screen = [
     "Pillow>=9",
 ]
+# The Home Assistant bridge in the daemon (`lumicube-daemon --mqtt-host ...`).
+mqtt = [
+    "paho-mqtt>=1.6",
+]
 
 [project.scripts]
 lumicube-leds = "pylumicube.cli:main"
 lumicube-run = "pylumicube.compat.cli:main"
+lumicube-daemon = "pylumicube.daemon:main"
+lumicube-say = "pylumicube.client_cli:say_main"
+lumicube-do = "pylumicube.client_cli:do_main"
 
 [project.urls]
 Homepage = "https://github.com/chrislibuilds/pylumicube"

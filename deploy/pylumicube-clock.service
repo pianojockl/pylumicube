@@ -1,6 +1,8 @@
 [Unit]
 Description=pylumicube ambient-light clock
 After=network.target
+Wants=pylumicube-daemon.service
+After=pylumicube-daemon.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -9,6 +11,10 @@ Type=simple
 WorkingDirectory=%h/git/pylumicube
 # Unbuffered so the journal shows the clock's lines as they happen.
 Environment=PYTHONUNBUFFERED=1
+# Give the daemon a moment to bind its socket, so the clock becomes a client
+# of it rather than opening the serial port itself. The loop always succeeds:
+# with no daemon the clock opens the port exactly as it did before.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do [ -S %t/pylumicube.sock ] && break; sleep 1; done'
 ExecStart=%h/git/pylumicube/.venv/bin/python %h/git/pylumicube/scripts/ambient_clock.py --config %h/.config/pylumicube/clock.py
 Restart=always
 RestartSec=5s

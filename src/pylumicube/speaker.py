@@ -170,6 +170,15 @@ class Speaker:
         self._write("speaker", {"volume": self._volume},
                     await_response=self.await_response)
 
+    def note_volume(self, value: int) -> None:
+        """Record a volume someone else wrote, without writing it again.
+
+        The firmware cannot be read back, so whoever sets the volume has to
+        tell the object — the daemon uses this when a *client* changes it,
+        so what it publishes to Home Assistant stays truthful.
+        """
+        self._volume = max(0, min(MAX_VOLUME, int(value)))
+
     # ---------------- streaming ----------------
 
     def stop(self) -> None:

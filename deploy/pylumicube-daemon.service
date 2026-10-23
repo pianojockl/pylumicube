@@ -1,0 +1,24 @@
+[Unit]
+Description=pylumicube daemon (owns the LumiCube, serves the control socket)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/git/pylumicube
+# Unbuffered so the journal shows lines as they happen.
+Environment=PYTHONUNBUFFERED=1
+# Broker credentials live here (chmod 600): PYLUMICUBE_MQTT_HOST,
+# _USERNAME, _PASSWORD. Without it the daemon runs with no MQTT bridge.
+EnvironmentFile=-%h/.config/pylumicube/mqtt.env
+ExecStart=%h/git/pylumicube/.venv/bin/lumicube-daemon --clear-on-stop
+Restart=always
+RestartSec=5s
+# SIGTERM is handled: clients are disconnected, the socket removed, the
+# display blanked and the serial port released.
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=default.target

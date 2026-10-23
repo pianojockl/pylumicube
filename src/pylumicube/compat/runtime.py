@@ -107,6 +107,20 @@ def open_or_use_hosted(port: str = SERIAL_DEVICE,
     if hosted is not None:
         yield hosted
         return
+    # A running daemon owns the port, so prefer it: scripts then share the
+    # cube with the clock and Home Assistant instead of fighting over it.
+    from ..client import CubeClient, daemon_available
+    if daemon_available():
+        client = CubeClient()
+        try:
+            if lumi_kwargs.get("telemetry"):
+                client.enable_telemetry(
+                    node_names=lumi_kwargs.get("schema_node_names"),
+                    subscribe_except=lumi_kwargs.get("subscribe_except") or ())
+            yield client
+        finally:
+            client.close()
+        return
     with LumiCube(port, **lumi_kwargs) as cube:
         yield cube
 

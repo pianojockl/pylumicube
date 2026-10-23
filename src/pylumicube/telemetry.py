@@ -75,8 +75,7 @@ class TelemetryStore:
         self._repaired: set[tuple[int, int]] = set()
         self._repair_executor: ThreadPoolExecutor | None = None
         self._frames = 0
-
-        transport.add_broadcast_handler(self._on_broadcast)
+        self._registered = False
 
     # ---------------- registration ----------------
 
@@ -127,7 +126,16 @@ class TelemetryStore:
             return set(self._subscribed)
 
     def start(self) -> None:
-        """Start the renewal heartbeat thread."""
+        """Arm the store: decode frames from here on, and renew the subscription.
+
+        Frames are not decoded before this: during `LumiCube.enable_telemetry`
+        the schemas are still being walked, and decoding a frame against a
+        half-built namespace would call the update callback before the
+        modules exist (the daemon's button watcher found that the hard way).
+        """
+        if not self._registered:
+            self._transport.add_broadcast_handler(self._on_broadcast)
+            self._registered = True
         if self._thread is not None:
             return
         self._stop.clear()
@@ -157,7 +165,7 @@ class TelemetryStore:
     # ---------------- ingress ----------------
 
     def _on_broadcast(self, transfer: u.Broadcast) -> None:
-        if transfer.type_id != TYPE_PUBLISHED_FIELDS:
+        if transfer.type_id != TYPE_PUBLISHED_FIELDS or self._stop.is_set():
             return
         node_id = transfer.source_id
         with self._lock:

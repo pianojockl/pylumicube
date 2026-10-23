@@ -68,6 +68,9 @@ def _store(cadence: float = 15.0) -> tuple[TelemetryStore, FakeTransport]:
     transport = FakeTransport()
     store = TelemetryStore(transport, cadence=cadence)
     store.set_schema(124, SENSOR_SCHEMA)
+    # A store decodes frames only once armed, the way
+    # `LumiCube.enable_telemetry` arms it after the schema walk.
+    store.start()
     return store, transport
 
 
@@ -189,8 +192,24 @@ def test_on_update_callback_receives_decoded_values() -> None:
     store = TelemetryStore(transport,
                            on_update=lambda node, values: seen.append((node, values)))
     store.set_schema(124, SENSOR_SCHEMA)
+    store.start()
     transport.emit(124, TYPE_PUBLISHED_FIELDS, _frame({6: 42}))
     assert seen == [(124, {6: 42})]
+
+
+def test_frames_before_start_are_not_decoded() -> None:
+    """The walk is still running then; callbacks must wait for the namespace."""
+    seen: list[tuple[int, dict[int, int]]] = []
+    transport = FakeTransport()
+    store = TelemetryStore(transport,
+                           on_update=lambda node, values: seen.append((node, values)))
+    store.set_schema(124, SENSOR_SCHEMA)
+    transport.emit(124, TYPE_PUBLISHED_FIELDS, _frame({6: 42}))
+    assert seen == []
+    assert store.get(124, 6) is None
+    store.start()
+    transport.emit(124, TYPE_PUBLISHED_FIELDS, _frame({6: 43}))
+    assert seen == [(124, {6: 43})]
 
 
 def test_on_update_exception_does_not_break_ingest() -> None:
@@ -200,6 +219,7 @@ def test_on_update_exception_does_not_break_ingest() -> None:
     transport = FakeTransport()
     store = TelemetryStore(transport, on_update=boom)
     store.set_schema(124, SENSOR_SCHEMA)
+    store.start()
     transport.emit(124, TYPE_PUBLISHED_FIELDS, _frame({6: 42}))
     assert store.get(124, 6) == 42
 
@@ -278,6 +298,7 @@ def test_unknown_key_schedules_a_schema_repair() -> None:
 
     store = TelemetryStore(transport, repair_schema=repair)
     store.set_schema(124, SENSOR_SCHEMA)
+    store.start()
 
     transport.emit(124, TYPE_PUBLISHED_FIELDS, _bad_frame())
     deadline = time.monotonic() + 2.0
@@ -296,6 +317,7 @@ def test_repair_is_bounded_per_node() -> None:
     store = TelemetryStore(transport, repair_schema=lambda node, key: calls.append(key) or True,
                            max_repairs_per_node=1)
     store.set_schema(124, SENSOR_SCHEMA)
+    store.start()
     transport.emit(124, TYPE_PUBLISHED_FIELDS, _bad_frame())
     deadline = time.monotonic() + 2.0
     while not calls and time.monotonic() < deadline:
@@ -318,6 +340,7 @@ def test_repair_does_not_block_the_ingest_path() -> None:
 
     store = TelemetryStore(transport, repair_schema=slow_repair)
     store.set_schema(124, SENSOR_SCHEMA)
+    store.start()
     started = time.monotonic()
     transport.emit(124, TYPE_PUBLISHED_FIELDS, _bad_frame())
     elapsed = time.monotonic() - started
@@ -333,6 +356,7 @@ def test_repair_failure_is_counted_not_raised() -> None:
 
     store = TelemetryStore(transport, repair_schema=broken)
     store.set_schema(124, SENSOR_SCHEMA)
+    store.start()
     transport.emit(124, TYPE_PUBLISHED_FIELDS, _bad_frame())
     time.sleep(0.1)
     assert store.stats()["decode_errors"] == {124: 1}
