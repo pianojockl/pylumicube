@@ -26,6 +26,8 @@ from ..constants import SERIAL_DEVICE
 from ..display import NUM_LEDS, Display, led_index, xy_to_index, xyz_to_index
 from ..modules import FieldModule
 from ..node import LumiCube
+from ..screen import HEIGHT, WIDTH, Screen
+from ..speaker import SINE, SQUARE, NOISE, Speaker
 from . import font as _font  # noqa: F401 — kept for compatibility
 
 log = logging.getLogger(__name__)
@@ -533,6 +535,107 @@ class _LazyModule:
         return f"<LazyModule {name!r} ({state})>"
 
 
+class ScreenShim:
+    """Upstream `screen` API on top of `pylumicube.screen.Screen`."""
+
+    def __init__(self, screen: Screen) -> None:
+        object.__setattr__(self, "_screen", screen)
+
+    def set_pixel(self, x: int, y: int, colour: int) -> None:
+        self._screen.set_pixel(x, y, colour)
+
+    def set_pixels(self, x: int = 0, y: int = 0, width: int = WIDTH,
+                   height: int = HEIGHT, pixels: list[int] | None = None) -> None:
+        self._screen.set_pixels(x, y, width, height, list(pixels or []))
+
+    def draw_rectangle(self, x: int, y: int, width: int, height: int,
+                       colour: int) -> None:
+        self._screen.draw_rectangle(x, y, width, height, colour)
+
+    def write_text(self, x: int, y: int, text: str, size: int = 1,
+                   colour: int = 0xFFFFFF, background_colour: int = 0x000000) -> None:
+        self._screen.write_text(x, y, text, size, colour, background_colour)
+
+    def draw_image(self, relative_or_absolute_path: str, x: int = 0, y: int = 0,
+                   width: int | None = None, height: int | None = None) -> None:
+        """Draw an image; a relative path resolves against ``~/Desktop``.
+
+        That is what the daemon's `screen_draw_image` did, and community
+        scripts rely on it (e.g. the clock writing `temperature-chart.jpg`).
+        """
+        self._screen.draw_image(_resolve_script_path(relative_or_absolute_path),
+                                x, y, width, height)
+
+    # ----- field-like properties -----
+
+    @property
+    def resolution_scaling(self) -> int:
+        return self._screen.scaling
+
+    @resolution_scaling.setter
+    def resolution_scaling(self, value: int) -> None:
+        self._screen.set_resolution_scaling(int(value))
+
+    @property
+    def rotation(self) -> int:
+        return self._screen.rotation
+
+    @rotation.setter
+    def rotation(self, value: int) -> None:
+        self._screen.set_rotation(int(value))
+
+    @property
+    def invert_colours(self) -> bool:
+        return self._screen.invert_colours
+
+    @invert_colours.setter
+    def invert_colours(self, value: bool) -> None:
+        self._screen.set_invert_colours(bool(value))
+
+
+class SpeakerShim:
+    """Upstream `speaker` API on top of `pylumicube.speaker.Speaker`."""
+
+    #: Upstream exposes waveform sentinels as strings; map them to waveforms.
+    _WAVEFORMS = {sine_wave: SINE, square_wave: SQUARE, white_noise: NOISE}
+
+    def __init__(self, speaker: Speaker) -> None:
+        object.__setattr__(self, "_speaker", speaker)
+
+    def say(self, text: str) -> None:
+        self._speaker.say(text)
+
+    def play(self, relative_or_absolute_path: str) -> None:
+        self._speaker.play(_resolve_script_path(relative_or_absolute_path))
+
+    def tone(self, frequency: float = 261.626, duration: float = 0.5,
+             amplitude: float = 0.25, function: str = sine_wave) -> None:
+        self._speaker.tone(frequency, duration, amplitude,
+                           self._WAVEFORMS.get(function, SINE))
+
+    def stop(self) -> None:
+        self._speaker.stop()
+
+    @property
+    def volume(self) -> int:
+        return self._speaker.volume
+
+    @volume.setter
+    def volume(self, value: int) -> None:
+        self._speaker.volume = int(value)
+
+
+def _resolve_script_path(path: str) -> str:
+    """Absolute path unchanged; a relative one resolves against ``~/Desktop``.
+
+    Matches the daemon's Python service, which prefixed ``~/Desktop``.
+    """
+    expanded = os.path.expanduser(path)
+    if os.path.isabs(expanded):
+        return expanded
+    return os.path.join(os.path.expanduser("~/Desktop"), expanded)
+
+
 # ----- Top-level facade ----------------------------------------------------
 
 
@@ -553,6 +656,8 @@ class LumiCubeCompat:
 
     #: Modules served from node telemetry (lazy: enabled on first access).
     _TELEMETRY_MODULES = ("light_sensor", "buttons", "env_sensor", "imu")
+    #: Modules served by native drivers (also lazy).
+    _DRIVER_MODULES = ("screen", "speaker")
 
     #: Wall-clock budget per node for the initial schema walk. Deliberately
     #: small: the cube base board's walk is slow (many probes, wide blocks)
@@ -563,39 +668,64 @@ class LumiCubeCompat:
     def __init__(self, cube: LumiCube) -> None:
         self._cube = cube
         self.display = DisplayShim(cube.display)
-        # Telemetry-backed modules are installed on first access; until
-        # then the attribute is absent from __dict__ and __getattr__ builds
-        # it (which is also where telemetry gets switched on).
-        self.screen = StubModule("screen")
-        self.speaker = StubModule("speaker", available_fields=("volume",))
+        # Telemetry-backed and driver-backed modules are installed on first
+        # access; until then the attribute is absent from __dict__ and
+        # __getattr__ builds it (which is where telemetry gets switched on).
         self.microphone = StubModule("microphone", available_fields=("enable",))
         self.pi = PiModule()
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
-        if name not in self._TELEMETRY_MODULES:
+        if name not in self._TELEMETRY_MODULES and name not in self._DRIVER_MODULES:
             raise AttributeError(name)
-        module = self._telemetry_module(name)
+        module = (self._telemetry_module(name) if name in self._TELEMETRY_MODULES
+                  else self._driver_module(name))
         object.__setattr__(self, name, module)
         return module
 
     def lazy(self, name: str) -> _LazyModule:
         """A module handle that only enables telemetry when actually used."""
-        if name not in self._TELEMETRY_MODULES:
-            return _LazyModule(lambda: getattr(self, name), name)
-        return _LazyModule(lambda: self._telemetry_module(name), name)
+        if name in self._TELEMETRY_MODULES:
+            return _LazyModule(lambda: self._telemetry_module(name), name)
+        if name in self._DRIVER_MODULES:
+            return _LazyModule(lambda: self._driver_module(name), name)
+        return _LazyModule(lambda: getattr(self, name), name)
+
+    def _ensure_telemetry(self, name: str) -> bool:
+        """Enable telemetry if needed. Returns True if it is available."""
+        cube: LumiCube = object.__getattribute__(self, "_cube")
+        if cube.telemetry is not None:
+            return True
+        log.info("compat: enabling telemetry for '%s' access", name)
+        try:
+            cube.enable_telemetry(budget=self._SCHEMA_BUDGET)
+        except Exception:  # noqa: BLE001 — callers fall back to a stub
+            log.exception("compat: telemetry unavailable; '%s' stays stubbed", name)
+            return False
+        return cube.telemetry is not None
+
+    def _driver_module(self, name: str):
+        """Build `screen` / `speaker`, falling back to a stub if unavailable."""
+        cube: LumiCube = object.__getattribute__(self, "_cube")
+        if self._ensure_telemetry(name):
+            try:
+                if name == "screen":
+                    return ScreenShim(cube.screen)
+                if name == "speaker":
+                    return SpeakerShim(cube.speaker)
+            except Exception:  # noqa: BLE001 — missing module on this cube
+                log.exception("compat: could not build the %r driver", name)
+        warnings.warn(
+            f"pylumicube compat: module '{name}' is not available on this "
+            f"cube; returning a no-op stub. Script may not behave correctly.",
+            RuntimeWarning, stacklevel=3)
+        return StubModule(name, available_fields=("volume",) if name == "speaker" else ())
 
     def _telemetry_module(self, name: str):
         cube: LumiCube = object.__getattribute__(self, "_cube")
-        if cube.telemetry is None:
-            log.info("compat: enabling telemetry for '%s' access", name)
-            try:
-                cube.enable_telemetry(budget=self._SCHEMA_BUDGET)
-            except Exception:  # noqa: BLE001 — fall back to a stub below
-                log.exception("compat: telemetry unavailable; '%s' stays stubbed", name)
         field_module: FieldModule | None = None
-        if cube.telemetry is not None:
+        if self._ensure_telemetry(name):
             try:
                 field_module = cube.modules.get(name)
             except Exception:  # noqa: BLE001
@@ -607,6 +737,7 @@ class LumiCubeCompat:
                 RuntimeWarning, stacklevel=3)
             return StubModule(name)
         return TelemetryModuleShim(field_module)
+
 
 
 
@@ -632,8 +763,8 @@ def build_globals(cube: LumiCube | LumiCubeCompat) -> dict[str, Any]:
         "light_sensor": compat.lazy("light_sensor"),
         "env_sensor": compat.lazy("env_sensor"),
         "imu": compat.lazy("imu"),
-        "screen": compat.screen,
-        "speaker": compat.speaker,
+        "screen": compat.lazy("screen"),
+        "speaker": compat.lazy("speaker"),
         "microphone": compat.microphone,
         "pi": compat.pi,
         # Colour constants (both spellings — upstream `api.txt` uses

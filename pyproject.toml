@@ -37,6 +37,10 @@ dev = [
 extras = [
     "requests>=2.28",   # weather fetch in scripts/digital_clock.py
 ]
+# Image support for the secondary LCD (`LumiCube.screen.draw_image`).
+screen = [
+    "Pillow>=9",
+]
 
 [project.scripts]
 lumicube-leds = "pylumicube.cli:main"

@@ -302,11 +302,21 @@ def test_build_globals_module_handles_are_lazy() -> None:
 def test_lazy_module_forwards_reads_and_writes() -> None:
     cube = FakeCube()
     compat = LumiCubeCompat(cube)
-    lazy = compat.lazy("speaker")
+    lazy = compat.lazy("display")
     assert "lazy" in repr(lazy)
-    lazy.volume = 10                      # forwarded to the StubModule (accepted)
+    lazy.set_all(0)                       # forwarded to the DisplayShim
     assert "resolved" in repr(lazy)
-    assert cube.enable_calls == 0         # non-telemetry module stays cheap
+    assert cube.enable_calls == 0         # display needs no telemetry
+
+
+def test_driver_module_falls_back_to_a_stub_when_absent() -> None:
+    """A cube without a `speaker` module degrades to the warn+no-op stub."""
+    cube = FakeCube()                     # has no .speaker attribute
+    compat = LumiCubeCompat(cube)
+    with pytest.warns(RuntimeWarning):
+        module = compat.speaker
+    assert isinstance(module, StubModule)
+    assert cube.enable_calls == 1         # the driver path needs telemetry
 
 
 
