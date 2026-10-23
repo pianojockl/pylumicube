@@ -37,6 +37,7 @@ class FakeDisplay:
     def __init__(self) -> None:
         self.panels: list[tuple[str, list[list[int]]]] = []
         self.scrolls: list[tuple[str, int, float]] = []
+        self.scrolled_pixels: list[tuple[list[list[int]], float]] = []
         self.fills: list[int] = []
         self.flushes = 0
 
@@ -45,6 +46,9 @@ class FakeDisplay:
 
     def scroll_text(self, text, colour=0xFFFFFF, speed=1.0, **kwargs):
         self.scrolls.append((text, colour, speed))
+
+    def scroll_pixels(self, rows, *, speed=1.0, **kwargs):
+        self.scrolled_pixels.append(([list(row) for row in rows], speed))
 
     def set_all(self, colour, show=True):
         self.fills.append(colour)
@@ -259,8 +263,35 @@ def test_top_button_scrolls_the_time() -> None:
     instance.poll_buttons(now)                    # baseline
     buttons.values["top_pressed_count"] = 4
     instance.poll_buttons(now)
+    # The clock scrolls its own 3x5 digits, not the taller built-in font.
+    assert cube.display.scrolled_pixels
+    rows, speed = cube.display.scrolled_pixels[0]
+    assert speed == clock.SCROLL_SPEED
+    assert len(rows) == 8
+    assert len(rows[0]) == 5 * 4                  # "14:05": 4 columns each
+    lit_rows = [index for index, row in enumerate(rows) if any(row)]
+    assert lit_rows == [1, 2, 3, 4, 5]            # same rows as the static digits
+
+
+def test_scroll_font_firmware_uses_the_builtin_font(monkeypatch) -> None:
+    monkeypatch.setattr(clock, "SCROLL_FONT", "firmware")
+    instance, cube, _curve = _clock()
+    instance.scroll_time(datetime.datetime(2026, 10, 23, 14, 5))
     assert cube.display.scrolls
-    assert cube.display.scrolls[0][0] == "14:05"
+    assert cube.display.scrolled_pixels == []
+
+
+def test_render_scroll_rows_matches_the_static_digits() -> None:
+    colour = 0x00FF00
+    rows = clock.render_scroll_rows("12", colour)
+    assert len(rows) == 8
+    assert len(rows[0]) == 8                       # 2 glyphs of 3 + separator
+    # The "1" glyph lights only its third column, on rows 1..5.
+    assert rows[1][:3] == [0, 0, colour]
+    # The separator column between the two digits is blank.
+    assert all(rows[row][3] == 0 for row in range(8))
+    # Row 0 and row 7 stay empty, exactly like `render_text`.
+    assert not any(rows[0]) and not any(rows[7])
 
 
 def test_middle_button_reboots_when_allowed(monkeypatch) -> None:
@@ -357,7 +388,7 @@ def test_top_button_leaves_chart_mode(monkeypatch) -> None:
     buttons.values["top_pressed_count"] = 1
     instance.poll_buttons(now)
     assert instance._chart_mode is False
-    assert cube.display.scrolls                       # the top button still scrolls
+    assert cube.display.scrolled_pixels               # the top button still scrolls
 
 
 def test_say_without_a_speaker_only_logs(caplog) -> None:
@@ -432,10 +463,10 @@ def test_hourly_chime_scrolls_and_speaks_once_per_hour(monkeypatch) -> None:
     at_the_hour = datetime.datetime(2026, 10, 23, 14, 0, 1)
     instance.hourly_chime(at_the_hour)
     instance.hourly_chime(at_the_hour)          # same hour: no repeat
-    assert len(cube.display.scrolls) == 1
+    assert len(cube.display.scrolled_pixels) == 1
     assert speaker.said == ["it's 14 o'clock"]
     instance.hourly_chime(datetime.datetime(2026, 10, 23, 15, 0, 1))
-    assert len(cube.display.scrolls) == 2
+    assert len(cube.display.scrolled_pixels) == 2
 
 
 def test_hourly_chime_is_silent_at_night(monkeypatch) -> None:

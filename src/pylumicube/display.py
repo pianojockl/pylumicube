@@ -17,6 +17,10 @@ Two write modes:
     frame is in flight on the wire (firmware constraint — see
     PROTOCOL.md §7 item 6); the next async call blocks until the
     previous one is done. `flush()` and `close()` drain the queue.
+
+Animations do not use either mode: `scroll_pixels` pipelines frames that
+expect no ServiceResponse, with a bounded number in flight, because the
+per-frame latency would otherwise dominate (see its docstring).
 """
 
 from __future__ import annotations
@@ -43,6 +47,12 @@ LED_KEY_OFFSET = 266
 NUM_LEDS = 192
 SHOW_KEY = 1266
 BRIGHTNESS_KEY = 256
+
+#: How many animation frames `scroll_pixels` keeps on the wire. Frames are
+#: sent without waiting for a ServiceResponse (each one costs ~50-100 ms of
+#: latency, which would pin a scroll at a few frames per second), so this is
+#: the backpressure that stops a producer outrunning the link.
+MAX_FRAMES_IN_FLIGHT = 4
 
 
 # ----------------------------------------------------------------------
@@ -246,46 +256,125 @@ class Display:
                     with_gap: bool = True, *, timeout: float = 2.0) -> None:
         """Scroll ``text`` once across the 16x8 LED area (blocking).
 
-        Lays the rendered glyphs into a row buffer 16 columns wider than
-        the visible area (so text enters from the right and exits to the
-        left), then walks an 8-row window across it at ``0.05 / speed``
-        seconds per column. Uses the built-in 5x7 font (`pylumicube.font`)
-        rather than upstream's PIL-rendered ``slkscr.ttf``.
-
-        This is a timed animation, so it blocks for its duration and
-        returns once the last frame has been ACK'd.
+        Renders with the built-in 5x7 font (`pylumicube.font`) — upstream
+        drew the same text with PIL and `slkscr.ttf` at size 8, which is
+        about the same height — and scrolls it at ``0.05 / speed`` seconds
+        per column. For a caller that wants its own glyphs (the clock
+        scrolls the same 3x5 digits it displays statically), render them
+        into an 8-row bitmap and use `scroll_pixels`.
         """
         glyph_rows = font.render_text(text)
         if not glyph_rows or not glyph_rows[0]:
             return
-        text_width = len(glyph_rows[0])
-        pad = 16
-        width = text_width + pad * 2
-        rows = [[0] * width for _ in range(8)]
-        for r, glyph_row in enumerate(glyph_rows):
-            target_row = r + 1  # one-pixel top margin, fits the 8-tall area
-            if target_row >= 8:
-                continue
-            for x, pixel in enumerate(glyph_row):
-                rows[target_row][pad + x] = pixel
+        blank_row = [0] * len(glyph_rows[0])
+        rows = [blank_row] + [[colour if pixel else 0 for pixel in row]
+                              for row in glyph_rows]
+        self.scroll_pixels(rows, speed=speed, with_gap=with_gap,
+                           background_colour=background_colour, timeout=timeout)
 
+    def scroll_pixels(self, rows: Sequence[Sequence[int]], *,
+                      speed: float = 1.0, with_gap: bool = True,
+                      background_colour: int = 0x000000,
+                      timeout: float = 2.0) -> None:
+        """Scroll a pre-rendered bitmap across the 16x8 LED area (blocking).
+
+        ``rows`` is up to 8 rows of colours, top row first, one entry per
+        column; a zero means "background". The bitmap is padded 16 columns
+        either side, so it enters from the right and leaves to the left, at
+        ``0.05 / speed`` seconds per column (upstream's timing).
+
+        Frames are **pipelined**, which is what makes this watchable: a
+        display write costs ~50-100 ms of *latency* regardless of payload,
+        so waiting for each frame's ServiceResponse — the obvious
+        implementation, and what this used to do — pins the animation at a
+        handful of frames per second and it crawls. Upstream never had the
+        problem because `display.set_leds` ran *inside* the daemon process.
+
+        So each frame is sent without expecting a response (the way the
+        speaker streams), paced to the period, with at most
+        ``MAX_FRAMES_IN_FLIGHT`` on the wire, and only the pixels that
+        changed are written — a steady-state frame is a few LEDs, not 128.
+        A final full frame (sent synchronously) guarantees the end state
+        even if a frame was dropped along the way.
+        """
+        width = max((len(row) for row in rows), default=0)
+        if width == 0:
+            return
+        pad = 16
+        padded = [list(row) + [0] * (width - len(row)) for row in rows]
+        padded = [[0] * pad + row + [0] * pad for row in padded]
+        total = width + pad * 2
         period = 0.05 / max(speed, 0.0001)
-        for shift in range(width - 16):
+
+        inflight: list[Future] = []
+        previous: dict[tuple[int, int], int] = {}
+        current: dict[tuple[int, int], int] = {}
+        for shift in range(total - 15):
             frame_start = time.monotonic()
-            window = [row[shift : shift + 17] for row in rows]
-            leds: dict[tuple[int, int], int] = {}
-            for r, row in enumerate(window):
-                for x, pixel in enumerate(row):
-                    plotted_x = x - 1 if (with_gap and x > 8) else x
-                    if plotted_x >= 16:
+            values: dict[int, int] = {}
+            current = {}
+            for row_index in range(8):
+                if row_index >= len(padded):
+                    break
+                row = padded[row_index]
+                for column in range(17):
+                    index = shift + column
+                    if index >= total:
+                        break
+                    x = column - 1 if (with_gap and column > 8) else column
+                    if x >= 16:
                         continue
-                    leds[(plotted_x, 7 - r)] = colour if pixel else background_colour
-            self.set_leds_xy(leds, timeout=timeout)
+                    coordinate = (x, 7 - row_index)
+                    colour = row[index] or background_colour
+                    current[coordinate] = colour
+                    if previous.get(coordinate) != colour:
+                        led = xy_to_index(x, 7 - row_index)
+                        if led is not None:
+                            values[LED_KEY_OFFSET + led] = colour
+            if values:
+                values[SHOW_KEY] = 1
+                while len(inflight) >= MAX_FRAMES_IN_FLIGHT:
+                    self._drain_one(inflight.pop(0), timeout)
+                inflight.append(self._send_frame(values, timeout))
+            previous = current
             elapsed = time.monotonic() - frame_start
             if elapsed < period:
                 time.sleep(period - elapsed)
-        # Ensure the last frame is on the wire before returning.
+        # The end state must be exact, so re-send the whole last window and
+        # wait for it, rather than trusting that every delta frame landed.
+        for future in inflight:
+            self._drain_one(future, timeout)
+        if current:
+            final = {LED_KEY_OFFSET + led: colour
+                     for (x, y), colour in current.items()
+                     if (led := xy_to_index(x, y)) is not None}
+            final[SHOW_KEY] = 1
+            self._send_set_fields(final, timeout)
         self.flush(timeout=timeout)
+
+    def _drain_one(self, future: Future, timeout: float) -> None:
+        try:
+            future.result(timeout=timeout)
+        except Exception:  # noqa: BLE001 — an animation frame is expendable
+            log.warning("scroll frame was not acknowledged", exc_info=True)
+
+    def _send_frame(self, values: Mapping[int, int], timeout: float) -> Future:
+        """Send one frame without waiting for a ServiceResponse."""
+        batches = list(_batch_for_frame(values, self._specs))
+        future: Future | None = None
+        for batch in batches:
+            payload = flat_dictionary.serialise(batch, self._specs)
+            future = self._transport.send_request(
+                dest_id=self._node_id,
+                type_id=TYPE_SET_FIELDS,
+                payload=payload,
+                timeout=timeout,
+                expect_response=False,
+            )
+        if future is None:  # pragma: no cover - empty frame
+            future = Future()
+            future.set_result(b"")
+        return future
 
     # ------------------------------------------------------------------
     # Async lifecycle

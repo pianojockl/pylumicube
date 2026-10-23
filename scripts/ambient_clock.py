@@ -81,6 +81,8 @@ ALLOW_REBOOT = True        # middle button reboots the Pi
 HOURLY_SCROLL = True       # scroll the time at the top of each hour
 HOURLY_SPEAK = True        # ...and speak it, if a speaker is available
 SCROLL_SPEED = 0.7
+SCROLL_FONT = "digits"     # "digits" = the clock's own 3x5 glyphs;
+                           # "firmware" = the built-in 5x7 font (taller)
 SPEAKER_VOLUME = 100       # 0..200; the firmware powers up loud, so set it
 
 # CPU-temperature chart on the secondary LCD (bottom button).
@@ -96,8 +98,8 @@ STATUS_INTERVAL = 300.0
 CONFIG_NAMES = ("BRIGHTNESS_MIN", "BRIGHTNESS_MAX", "GAMMA", "SMOOTHING", "ADAPT",
                 "LOW", "HIGH", "HUE_FOLLOWS_HOUR", "HUE", "SATURATION", "JITTER",
                 "ALLOW_REBOOT", "HOURLY_SCROLL", "HOURLY_SPEAK", "SCROLL_SPEED",
-                "SPEAKER_VOLUME", "TEMP_SAMPLE_SECONDS", "TEMP_HISTORY",
-                "CHART_REFRESH", "STATUS_INTERVAL")
+                "SCROLL_FONT", "SPEAKER_VOLUME", "TEMP_SAMPLE_SECONDS",
+                "TEMP_HISTORY", "CHART_REFRESH", "STATUS_INTERVAL")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = os.path.join(_HERE, "ambient_clock_config.py")
@@ -204,6 +206,30 @@ def render_text(text: str, colour_for: Callable[[], int]) -> list[list[int]]:
     return rows
 
 
+def render_scroll_rows(text: str, colour: int) -> list[list[int]]:
+    """Render `text` as an 8-row bitmap for `Display.scroll_pixels`.
+
+    Uses the clock's own 3x5 digits, in the same rows (1..5) and with the
+    same 1-column separators as the static display, so scrolling shows the
+    digits at the size you are already looking at. Upstream scrolled with a
+    taller font (`slkscr.ttf` at size 8) and so did this until it was
+    pointed out.
+    """
+    columns: list[list[int]] = []
+    for char in text:
+        glyph = DIGITS.get(char, DIGITS["0"])
+        for column_index in range(3):
+            column = [0] * PANEL_SIZE
+            for row_index in range(5):
+                if glyph[row_index][column_index] == "#":
+                    column[row_index + 1] = colour
+            columns.append(column)
+        columns.append([0] * PANEL_SIZE)          # separator
+    rows = [[column[row_index] for column in columns]
+            for row_index in range(PANEL_SIZE)]
+    return rows
+
+
 # --------------------------------------------------------------------------
 # The clock
 # --------------------------------------------------------------------------
@@ -305,8 +331,13 @@ class AmbientClock:
 
     def scroll_time(self, now: datetime.datetime) -> None:
         colour = scale_colour(hsv_colour(0.25, 1.0, 1.0), self.brightness())
-        self.cube.display.scroll_text(now.strftime("%H:%M"), colour,
-                                      speed=SCROLL_SPEED)
+        if SCROLL_FONT == "firmware":
+            self.cube.display.scroll_text(now.strftime("%H:%M"), colour,
+                                          speed=SCROLL_SPEED)
+        else:
+            self.cube.display.scroll_pixels(
+                render_scroll_rows(now.strftime("%H:%M"), colour),
+                speed=SCROLL_SPEED)
         self._rendered = None      # the scroll overwrote the digits
 
     def say(self, text: str) -> None:

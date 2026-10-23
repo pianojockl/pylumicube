@@ -31,6 +31,9 @@ ALLOW_REBOOT = True      # middle button reboots the Pi
 HOURLY_SCROLL = True     # scroll the time at the top of each hour
 HOURLY_SPEAK = True      # ...and speak it (needs the speaker module)
 SCROLL_SPEED = 0.7       # higher = faster scroll
+SCROLL_FONT = "digits"   # "digits" = the clock's own 3x5 glyphs (matches
+                         # the static display); "firmware" = the taller
+                         # built-in 5x7 font that upstream scrolled with
 SPEAKER_VOLUME = 100     # 0..200. The firmware powers up at full blast;
                          # 150 was still "very high" here, 100 is half.
 

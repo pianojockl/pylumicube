@@ -9,6 +9,8 @@ SET_FIELDS payloads, so what actually goes on the wire is checked.
 
 from __future__ import annotations
 
+import threading
+import time
 from concurrent.futures import Future
 
 import pytest
@@ -34,10 +36,13 @@ class RecordingTransport:
     def __init__(self) -> None:
         self.payloads: list[bytes] = []
         self.fail = False
+        self.expect_response: list[bool] = []
 
     def send_request(self, dest_id: int, type_id: int, payload: bytes,
-                     timeout: float = 5.0, priority: int = 20) -> Future:
+                     timeout: float = 5.0, priority: int = 20,
+                     expect_response: bool = True) -> Future:
         assert type_id == TYPE_SET_FIELDS
+        self.expect_response.append(expect_response)
         future: Future = Future()
         if self.fail:
             future.set_exception(TimeoutError("nope"))
@@ -55,6 +60,30 @@ class RecordingTransport:
                 if LED_KEY_OFFSET <= key < LED_KEY_OFFSET + NUM_LEDS:
                     out[key - LED_KEY_OFFSET] = value
         return out
+
+
+class DeferredTransport(RecordingTransport):
+    """Records payloads but leaves every future unresolved until told to."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pending: list[Future] = []
+
+    def send_request(self, dest_id: int, type_id: int, payload: bytes,
+                     timeout: float = 5.0, priority: int = 20,
+                     expect_response: bool = True) -> Future:
+        assert type_id == TYPE_SET_FIELDS
+        self.expect_response.append(expect_response)
+        self.payloads.append(payload)
+        future: Future = Future()
+        self.pending.append(future)
+        return future
+
+    def release(self, count: int | None = None) -> None:
+        while self.pending and (count is None or count > 0):
+            self.pending.pop(0).set_result(b"")
+            if count is not None:
+                count -= 1
 
 
 def _display() -> tuple[Display, RecordingTransport]:
@@ -187,13 +216,69 @@ def test_brightness_write_uses_the_display_key() -> None:
         display.set_brightness(256)
 
 
+def _led_frame(payload: bytes) -> dict[int, int]:
+    """Decode one payload into {led_index: colour}."""
+    values = flat_dictionary.deserialise(payload, display_specs())
+    return {key - LED_KEY_OFFSET: value for key, value in values.items()
+            if LED_KEY_OFFSET <= key < LED_KEY_OFFSET + NUM_LEDS}
+
+
 def test_scroll_text_emits_frames_and_clears() -> None:
     display, transport = _display()
     display.scroll_text("AB", colour=0x00FF00, speed=1000)   # near-zero sleep
     assert len(transport.payloads) > 5
-    leds = transport.leds()
-    assert set(leds.values()) == {0x00FF00, 0x000000}
+    frames = [_led_frame(payload) for payload in transport.payloads]
+    # The text scrolls into view...
+    assert any(0x00FF00 in frame.values() for frame in frames)
+    # ...and off again, leaving the display blank rather than a stray column.
+    assert set(frames[-1].values()) == {0x000000}
     # The last frame must have been flushed, not left queued.
     pending = display._pending_async  # noqa: SLF001
     assert pending is None or pending.done()
+
+
+def test_scroll_frames_do_not_wait_for_a_service_response() -> None:
+    """Every animation frame is sent fire-and-forget (the speaker's mode).
+
+    Waiting for each frame's ServiceResponse costs ~50-100 ms of latency,
+    which is what made the scroll crawl.
+    """
+    display, transport = _display()
+    display.scroll_pixels([[0xFFFFFF] * 12], speed=1000)
+    assert transport.expect_response
+    assert not any(transport.expect_response[:-1])     # all but the last frame
+    assert transport.expect_response[-1] is True       # the final full frame waits
+
+
+def test_scroll_pipelines_frames_without_blocking() -> None:
+    """More than one frame is on the wire at a time, so latency is not the rate."""
+    transport = DeferredTransport()
+    display = Display(transport, node_id=125)
+    finished: list[bool] = []
+
+    def scroll() -> None:
+        display.scroll_pixels([[0xFFFFFF] * 20], speed=1000)
+        finished.append(True)
+
+    thread = threading.Thread(target=scroll, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5.0
+    while len(transport.pending) < 2 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert len(transport.pending) >= 2, "frames are sent one at a time"
+    assert not finished, "the scroll waited for a frame"
+    while thread.is_alive():
+        transport.release()
+        thread.join(timeout=0.05)
+    assert finished
+
+
+def test_scroll_writes_only_the_pixels_that_change() -> None:
+    """A steady-state frame is a column or two, not the whole 16x8 window."""
+    display, transport = _display()
+    display.scroll_pixels([[0xFFFFFF] * 20], speed=1000)
+    per_frame = [len(_led_frame(payload)) for payload in transport.payloads]
+    assert len(per_frame) > 10
+    assert max(per_frame) <= 32                        # one column is 8 LEDs
+    assert sum(per_frame) < 128 * len(per_frame) / 4    # not a full frame each time
 

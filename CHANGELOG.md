@@ -74,6 +74,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The compat shim now serves `screen` and `speaker` from the native drivers
   (`ScreenShim` / `SpeakerShim`), including upstream's convention that a
   relative image/audio path resolves against `~/Desktop`.
+- **`Display.scroll_pixels(rows, ...)`** — scroll a pre-rendered bitmap
+  across the 16x8 area, so a caller can scroll its own glyphs;
+  `Display.scroll_text` now renders with the built-in 5x7 font and
+  delegates to it.
+- The clock scrolls **its own 3x5 digits** (`SCROLL_FONT = "digits"`, the
+  default) instead of the taller built-in font, so the scrolled time is
+  the same size as the static display; `SCROLL_FONT = "firmware"`
+  restores the old look.
 - **`deploy/`** — a systemd user unit (`pylumicube-clock.service`) and a
   step-by-step guide for running the clock on the cube instead of the Java
   daemon: venv layout, settings in `~/.config/pylumicube/clock.py`, the
@@ -97,6 +105,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dimming curve can be watched in the journal.
 
 ### Fixed
+- **Scrolling ran at a fraction of the requested speed.** Every frame
+  waited for its ServiceResponse, and a display write costs ~50-100 ms of
+  *latency* regardless of payload, so `scroll_text` crawled at 6.5 fps
+  where 14 was asked for — and the frames arrived in 100 ms bursts, which
+  reads as stutter. Frames are now sent fire-and-forget (the way the
+  speaker streams), paced to `0.05 / speed`, with at most four on the
+  wire, and only the pixels that changed: **12.9 fps measured on
+  hardware**, within 8% of the target. A final full frame, sent
+  synchronously, guarantees the end state. Upstream never had the problem
+  because its `display.set_leds` ran *inside* the daemon process.
 - **Metadata discovery read field keys as relative offsets**, which produced
   wrong keys for every block the walk reached via a gap (`screen`,
   `speaker`, the `60000+` system fields) and made the walker probe and
