@@ -103,6 +103,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outside the git checkout; `STATUS_INTERVAL` logs
   `ambient <reading> -> brightness <value> (range low..high)` so the
   dimming curve can be watched in the journal.
+- **A daemon that owns the cube, and clients that talk to it**
+  (`pylumicube.control`, `pylumicube.daemon`, `pylumicube.client`,
+  `lumicube-daemon`): line-delimited JSON on a Unix socket, telemetry
+  pushed to subscribers instead of polled per read, `await_response` /
+  `wait` carried through so streaming callers are not forced to wait, and a
+  separate audio lock so a three-second announcement cannot stall the
+  clock's display. `connect_or_open()` / `open_or_use_hosted()` prefer the
+  daemon and fall back to the serial port, so nothing needs it.
+- **`lumicube-say` and `lumicube-do`** — speak through the daemon, or send
+  any control operation and print the reply.
+- **An MQTT bridge for Home Assistant** (`pylumicube.mqtt`, `[mqtt]`
+  extra): commands as plain payloads (`lumicube/speaker/say` takes the
+  sentence), retained state for the light sensor, CPU temperature, volume
+  and display brightness, an `online`/`offline` LWT, and MQTT discovery so
+  HA creates the entities itself — including event entities for the cube's
+  four buttons, so a button press can trigger an automation.
+- **`deploy/pylumicube-daemon.service`** and the daemon section of the
+  deploy guide, including the Home Assistant setup and the washing-machine
+  automation.
 - **`LIGHT_LOG`** — the clock appends `timestamp,ambient,brightness,low,high`
   to a CSV every `STATUS_INTERVAL` (default
   `~/.local/state/pylumicube/light.csv`), so a room's light over a whole day
@@ -115,6 +134,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LEVEL` covers the non-interactive case.
 
 ### Fixed
+- **A telemetry store decoded frames before it was armed.** The broadcast
+  handler was registered in the constructor, so frames arriving during
+  `enable_telemetry`'s schema walk were decoded against a half-built
+  namespace and fired the update callback before the modules existed (the
+  daemon's button watcher logged a traceback per frame). The store now
+  arms itself in `start()`, which is also when the renewal heartbeat
+  begins.
 - **`GAMMA` cannot brighten a dark room while `ADAPT = True`.** Auto-ranging
   puts the darkest reading the curve has seen at the bottom of its range, so
   in a dark room the position is ~0 and `0 ** gamma` is still 0: only

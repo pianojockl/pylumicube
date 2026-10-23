@@ -464,8 +464,34 @@ python scripts/ambient_clock.py --seconds 30 --debug
 python scripts/ambient_clock.py --config ~/.config/pylumicube/clock.py
 ```
 
-`deploy/` holds the systemd user unit and a step-by-step guide for running
-the clock on the cube instead of the Java daemon (`deploy/README.md`).
+`deploy/` holds the systemd units and a step-by-step guide for running the
+clock on the cube instead of the Java daemon, including the Home Assistant
+bridge (`deploy/README.md`).
+
+## Daemon, clients and Home Assistant
+
+One process has to own the serial port. `lumicube-daemon` is that process:
+it opens the cube, discovers every schema once, keeps telemetry alive and
+serves a control socket at `$XDG_RUNTIME_DIR/pylumicube.sock`. Everything
+else connects to it and gets a `LumiCube`-shaped object, so the drivers,
+the compat shim and the scripts are unchanged:
+
+```bash
+lumicube-daemon --mqtt-host 192.168.5.101 --mqtt-username ... # own the cube
+lumicube-say "Dinner is ready"          # speak through the daemon
+lumicube-do stats                       # ask it how it is
+lumicube-do read module=light_sensor field=ambient_light
+```
+
+Scripts that use `open_or_use_hosted()` (or `connect_or_open()`) get the
+daemon when one is running and open the port themselves when it is not — a
+fresh install needs no daemon.
+
+With a broker configured, the daemon bridges to MQTT, which is how Home
+Assistant drives the cube and reads it back: `lumicube/speaker/say` takes
+the sentence as its payload, and MQTT discovery creates entities for the
+light sensor, CPU temperature, speaker volume, display brightness, a text
+box that speaks and the cube's buttons. See `deploy/README.md` §4.
 
 Getting the brightness right for a room is its own little job, so the clock
 logs what it saw and there is a tool to measure it:

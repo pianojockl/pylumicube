@@ -2,16 +2,22 @@
 
 How the LumiCube runs the Python clock instead of the Abstract Foundry Java
 daemon. This is the setup that is live on the cube as of 2026-10-23 — the
-Java daemon is stopped and disabled, the clock is a systemd **user** unit
-(the same way the old daemon was installed), and the display, LCD, buttons
-and speaker are all driven by `pylumicube`.
+Java daemon is stopped and disabled, a `pylumicube` daemon owns the cube,
+the clock is a client of it, and Home Assistant talks to the cube over MQTT.
+
+```
+Home Assistant ──MQTT──> pylumicube-daemon ──serial──> LumiCube
+                              ^  (control socket)
+                              |
+                    pylumicube-clock, scripts, lumicube-say
+```
 
 ## 1. Install the package in a venv
 
 ```bash
 cd ~/git/pylumicube
 python3 -m venv --system-site-packages .venv
-.venv/bin/pip install -e .
+.venv/bin/pip install -e '.[mqtt]'      # drop [mqtt] for no Home Assistant
 ```
 
 `--system-site-packages` is deliberate on 32-bit Raspberry Pi OS: piwheels'
@@ -43,44 +49,108 @@ Every name is optional. The ones worth knowing about:
 | `TEMP_SAMPLE_SECONDS`, `TEMP_HISTORY` | CPU-temperature chart on the LCD |
 | `STATUS_INTERVAL` | seconds between `ambient X -> brightness Y` log lines |
 
-## 3. Install the unit
+For Home Assistant, put the broker credentials next to it (see §4):
 
 ```bash
-cp ~/git/pylumicube/deploy/pylumicube-clock.service ~/.config/systemd/user/
+cat > ~/.config/pylumicube/mqtt.env <<'ENV'
+PYLUMICUBE_MQTT_HOST=192.168.5.101
+PYLUMICUBE_MQTT_USERNAME=lumicube
+PYLUMICUBE_MQTT_PASSWORD=...
+ENV
+chmod 600 ~/.config/pylumicube/mqtt.env
+```
+
+## 3. Install the daemon and the clock
+
+```bash
+cp ~/git/pylumicube/deploy/pylumicube-daemon.service \
+   ~/git/pylumicube/deploy/pylumicube-clock.service \
+   ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user disable --now foundry-daemon     # the old Java daemon
+systemctl --user enable --now pylumicube-daemon
 systemctl --user enable --now pylumicube-clock
 ```
 
-The unit runs
+The daemon owns the serial port, walks every schema once (~6 s), subscribes
+to the boards that do not compete with streaming writes, and serves a
+control socket at `$XDG_RUNTIME_DIR/pylumicube.sock` (mode 600, local only).
+The clock connects to that socket; if no daemon is running it opens the port
+itself, exactly as it did before — so the daemon is an upgrade, not a
+dependency.
 
-```
-%h/git/pylumicube/.venv/bin/python %h/git/pylumicube/scripts/ambient_clock.py \
-    --config %h/.config/pylumicube/clock.py
-```
-
-with `Restart=always`. It handles `SIGTERM`, so a stop or restart blanks the
-display and releases `/dev/ttyAMA0` cleanly instead of leaving a frozen
-frame. Follow it with:
+That split is why the clock can restart without dropping the cube link, and
+why Home Assistant keeps working while it does. Clients:
 
 ```bash
-systemctl --user status pylumicube-clock
-journalctl --user -u pylumicube-clock -f
+.venv/bin/lumicube-say "Dinner is ready"        # speak through the cube
+.venv/bin/lumicube-do stats                     # ask the daemon how it is
+.venv/bin/lumicube-do read module=light_sensor field=ambient_light
+.venv/bin/lumicube-run scripts/original/rainbow.py   # community scripts too
 ```
 
-A healthy start looks like this (about 8 s, most of it schema discovery):
+Everything above uses the daemon when it is there and falls back to the
+serial port when it is not.
 
+## 4. Home Assistant over MQTT
+The Mosquitto broker add-on (or any broker) plus the `mqtt.env` file from §2
+is all the configuration there is. The daemon publishes discovery payloads,
+so Home Assistant creates the entities by itself:
+
+| Entity | What it is |
+| --- | --- |
+| `sensor.lumicube_ambient_light`, `..._red/_green/_blue` | the light sensor |
+| `sensor.lumicube_cube_cpu_temperature` | the Pi's CPU temperature |
+| `sensor.lumicube_something_within_proximity` | proximity flag |
+| `number.lumicube_speaker_volume` | 0..200, two-way |
+| `number.lumicube_display_brightness` | 0..255, two-way |
+| `text.lumicube_speak` | type a sentence, the cube says it |
+| `event.lumicube_top_button`, `..._middle`, `..._bottom`, `..._base` | button presses, for automations |
+
+Commands are plain payloads where that makes sense:
+
+| Topic | Payload |
+| --- | --- |
+| `lumicube/speaker/say` | the sentence (`{"text": ..., "volume": 60}` also works) |
+| `lumicube/speaker/tone` | `440` or `{"frequency": 880, "duration": 0.3, "waveform": "square"}` |
+| `lumicube/speaker/play` | a WAV path on the cube |
+| `lumicube/speaker/stop` | anything — also stops a stream another client started |
+| `lumicube/speaker/volume` | 0..200 |
+| `lumicube/screen/text` | `{"text": "hello", "size": 2, "colour": "#ffffff"}` |
+| `lumicube/screen/image` | an image path on the cube |
+| `lumicube/screen/clear`, `lumicube/display/fill` | a colour (`#rrggbb` or a number) |
+| `lumicube/display/brightness` | 0..255 |
+
+So the washing machine is:
+
+```yaml
+automation:
+  - alias: Washing machine finished
+    triggers:
+      - trigger: state
+        entity_id: sensor.washing_machine_state
+        to: "finished"
+    actions:
+      - action: mqtt.publish
+        data:
+          topic: lumicube/speaker/say
+          payload: "The washing machine has finished"
 ```
-node 124 (button_and_light_sensor): 17 field block(s) discovered in 2.0s
-node 125 (cube): 49 field block(s) discovered in 4.7s
-speaker volume set to 100
-startup brightness 0.212 (range 50..1999)
+
+...and the cube's buttons can drive automations:
+
+```yaml
+    triggers:
+      - trigger: state
+        entity_id: event.lumicube_top_button
+        attribute: event_type
+        to: "press"
 ```
 
-User units start at boot without a login session because lingering is
-enabled (`loginctl enable-linger $USER`).
+Without a broker (or with `--no-mqtt`) the daemon simply runs without the
+bridge; nothing else changes.
 
-## 4. Getting the brightness right
+## 5. Getting the brightness right
 
 The dimming curve has two knobs, and only one of them works at a time:
 
@@ -120,7 +190,7 @@ hour     n  ambient min     avg     max   brightness avg
   23    30           24      28      31             0.50
 ```
 
-## 5. Rolling back to the Java daemon
+## 6. Rolling back to the Java daemon
 
 ```bash
 systemctl --user disable --now pylumicube-clock
@@ -132,12 +202,41 @@ and `~/AbstractFoundry/` is untouched.
 
 ## Notes
 
-- **Only one of the two can run at a time**: both own `/dev/ttyAMA0`.
-- **Why the clock walks the cube board but does not subscribe to it**: the
+- **Only one process can own `/dev/ttyAMA0`**: the daemon when it is
+  running, the clock (or a script) when it is not. Two `LumiCube`s at once
+  means one of them gets `Resource busy`.
+- **The control protocol** is line-delimited JSON on
+  `$XDG_RUNTIME_DIR/pylumicube.sock` (mode 600, never a TCP port — MQTT is
+  the network face). A request is `{"id": 1, "op": "read", "module": ...,
+  "field": ...}`; the reply echoes the id, and telemetry arrives as
+  unsolicited `{"event": "values", ...}`. `lumicube-do OP k=v` sends any op
+  by hand. Ops: `hello`, `schemas`, `walk`, `subscribe`, `read`, `read_all`,
+  `write`, `run`, `frame`, `say`, `tone`, `play`, `stop_audio`, `snapshot`,
+  `stats`, `ping`.
+- **Why the daemon walks the cube board but does not subscribe to it**: the
   drivers resolve their field keys through the board's schema, but the cube
   board's telemetry stream competes with speaker writes for the link
   (~308 → ~56 chunks/s), which is the difference between speech and
   stutter. `cube.walk_all_schemas()` is what walks without subscribing.
+- **Audio is serialised on the daemon**, not on the clients: a `say` holds
+  the speaker for the whole utterance, so an announcement from Home
+  Assistant cannot talk over the clock's hourly chime. Display writes are
+  *not* held up by that — they use a separate lock.
+- A healthy daemon start looks like this (about 6 s, most of it discovery):
+
+  ```
+  node 124 (button_and_light_sensor): 17 field block(s) discovered in 2.0s
+  node 125 (cube): 49 field block(s) discovered in 3.9s
+  telemetry: walking node 125 (cube) but not subscribing to it
+  control socket listening on /run/user/1000/pylumicube.sock
+  MQTT bridge connecting to 192.168.5.101:1883 as pylumicube
+  daemon ready: cube on /dev/ttyAMA0, 9 modules
+  ```
+
+  and the clock then logs `connected to the daemon on ...` instead of
+  opening the port itself.
+- User units start at boot without a login session because lingering is
+  enabled (`loginctl enable-linger $USER`).
 - The old community scripts in `~/AbstractFoundry/Daemon/Scripts/` can still
   be run, against the same cube, with
   `.venv/bin/lumicube-run ~/AbstractFoundry/Daemon/Scripts/main.py`.
