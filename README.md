@@ -467,6 +467,21 @@ python scripts/ambient_clock.py --config ~/.config/pylumicube/clock.py
 `deploy/` holds the systemd user unit and a step-by-step guide for running
 the clock on the cube instead of the Java daemon (`deploy/README.md`).
 
+Getting the brightness right for a room is its own little job, so the clock
+logs what it saw and there is a tool to measure it:
+
+```bash
+python scripts/calibrate_dimming.py            # step through levels, judge by eye
+python scripts/calibrate_dimming.py --readable 0.5   # same, non-interactive
+python scripts/calibrate_dimming.py --report   # summarise the logged readings
+```
+
+It finishes with ready-to-paste settings for both ways of driving the curve
+(raise the floor and keep auto-ranging, or pin `LOW`/`HIGH` and use `GAMMA`),
+and `LIGHT_LOG` (default `~/.local/state/pylumicube/light.csv`) records
+`timestamp,ambient,brightness,low,high` every `STATUS_INTERVAL` so a day or
+two of real readings is there to calibrate from.
+
 
 `utilities/` contains helper tools used during bring-up and reverse-
 engineering (require a connected cube):

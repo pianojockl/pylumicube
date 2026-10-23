@@ -80,7 +80,47 @@ startup brightness 0.212 (range 50..1999)
 User units start at boot without a login session because lingering is
 enabled (`loginctl enable-linger $USER`).
 
-## 4. Rolling back to the Java daemon
+## 4. Getting the brightness right
+
+The dimming curve has two knobs, and only one of them works at a time:
+
+- **`ADAPT = True`** (auto-ranging): the darkest reading the curve has seen
+  sits at the *bottom* of its range, so in a dark room the position is ~0 and
+  **`GAMMA` has nothing to lift** — `BRIGHTNESS_MIN` (the floor) alone decides
+  how bright the clock is. Simple and stable; every dark room looks the same.
+- **`ADAPT = False`** with `LOW`/`HIGH` pinned to the room's real range, plus
+  `GAMMA < 1` to lift the dark end: an evening and the middle of the night
+  can differ. Needs measurements.
+
+Either way, measure instead of guessing:
+
+```bash
+systemctl --user stop pylumicube-clock
+.venv/bin/python scripts/calibrate_dimming.py          # judge each level by eye
+systemctl --user start pylumicube-clock
+```
+
+It shows the clock's own digits at a series of brightnesses, prints the live
+ambient reading at each one, and ends with ready-to-paste config lines (it
+also solves for the `GAMMA` that puts your chosen brightness at the reading
+you saw). Over a plain `ssh` command there is no terminal to prompt on, so
+pass `--readable 0.5` instead.
+
+For the second option you want readings from a whole day, which the clock is
+already collecting in `LIGHT_LOG` (default
+`~/.local/state/pylumicube/light.csv`, one row per `STATUS_INTERVAL`):
+
+```bash
+.venv/bin/python scripts/calibrate_dimming.py --report
+```
+
+```
+hour     n  ambient min     avg     max   brightness avg
+  18    30           92      96     118             0.66
+  23    30           24      28      31             0.50
+```
+
+## 5. Rolling back to the Java daemon
 
 ```bash
 systemctl --user disable --now pylumicube-clock

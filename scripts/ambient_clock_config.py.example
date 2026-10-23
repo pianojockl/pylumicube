@@ -7,18 +7,32 @@
 # count: hundreds..thousands in a lit room, much lower in the dark) to a
 # display brightness. Leave LOW/HIGH as None to let it learn your room.
 #
-# Measured on this cube: dark room ~100, lit room ~1200-2000. BRIGHTNESS_MIN
-# is the floor the clock sits at in the dark -- 0.02 is a barely-visible
-# glow, so use something higher if you want to read the time at night.
+# Measured on this cube: evening ~70-120, lit room ~1200-2000.
+#
+# Two things worth knowing:
+#
+#   * With ADAPT = True the darkest reading the curve has seen sits at the
+#     *bottom* of its range, so in a dark room the position is ~0 and GAMMA
+#     has nothing to lift. BRIGHTNESS_MIN is then the only knob that decides
+#     how bright the clock is -- so set it to the level you want at night.
+#   * To make an evening and the middle of the night differ, pin the range
+#     (ADAPT = False, LOW/HIGH over a whole day) and use GAMMA < 1 to lift
+#     the dark end. `scripts/calibrate_dimming.py` measures both for you,
+#     and `--report` summarises the readings the clock has logged.
 
-BRIGHTNESS_MIN = 0.15    # 0.0 = fully off in the dark, 0.15 = a night glow
+BRIGHTNESS_MIN = 0.45    # the floor: what the clock shows in the dark
 BRIGHTNESS_MAX = 1.0
-GAMMA = 1.0              # <1 brightens mid-tones, >1 darkens them
+GAMMA = 1.0              # <1 brightens mid-tones; only matters with LOW/HIGH
 SMOOTHING = 0.25         # 0 = snap to each new value, 0.9 = very slow fade
 ADAPT = True             # learn the room's light range
-LOW = None               # e.g. 100  — pin the darkest reading instead
-HIGH = None              # e.g. 2000 — pin the brightest reading instead
+LOW = None               # e.g. 20   — pin the darkest reading instead
+HIGH = None              # e.g. 1300 — pin the brightest reading instead
 STATUS_INTERVAL = 300.0  # seconds between "ambient X -> brightness Y" log lines
+
+# Where to append a CSV of (timestamp, ambient, brightness, low, high) every
+# STATUS_INTERVAL — the data for calibrating the curve over days. None
+# disables it. Read it with `calibrate_dimming.py --report`.
+# LIGHT_LOG = "~/.local/state/pylumicube/light.csv"
 
 # --- colour ----------------------------------------------------------------
 HUE_FOLLOWS_HOUR = True  # hue cycles through the day; else use HUE

@@ -103,8 +103,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outside the git checkout; `STATUS_INTERVAL` logs
   `ambient <reading> -> brightness <value> (range low..high)` so the
   dimming curve can be watched in the journal.
+- **`LIGHT_LOG`** — the clock appends `timestamp,ambient,brightness,low,high`
+  to a CSV every `STATUS_INTERVAL` (default
+  `~/.local/state/pylumicube/light.csv`), so a room's light over a whole day
+  is on disk to calibrate the dimming curve from.
+- **`scripts/calibrate_dimming.py`** — walks the display through brightness
+  levels using the clock's own rendering, prints the live ambient reading at
+  each one, and ends with ready-to-paste settings for both ways of driving
+  the curve, including the `GAMMA` that puts your chosen brightness at the
+  reading you saw. `--report` summarises the light log by hour; `--readable
+  LEVEL` covers the non-interactive case.
 
 ### Fixed
+- **`GAMMA` cannot brighten a dark room while `ADAPT = True`.** Auto-ranging
+  puts the darkest reading the curve has seen at the bottom of its range, so
+  in a dark room the position is ~0 and `0 ** gamma` is still 0: only
+  `BRIGHTNESS_MIN` (the floor) decides the brightness. Both the example
+  config and `deploy/README.md` now say so, the example's floor moved from
+  0.02 (effectively off) to 0.45, and `calibrate_dimming.py` measures the
+  floor you actually want.
 - **Scrolling ran at a fraction of the requested speed.** Every frame
   waited for its ServiceResponse, and a display write costs ~50-100 ms of
   *latency* regardless of payload, so `scroll_text` crawled at 6.5 fps

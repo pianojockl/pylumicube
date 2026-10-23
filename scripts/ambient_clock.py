@@ -94,12 +94,19 @@ CHART_REFRESH = 60.0       # seconds between redraws while the chart is up
 #: the easiest way to see what the auto-ranging curve is doing.
 STATUS_INTERVAL = 300.0
 
+#: Where to append a CSV of (timestamp, ambient, brightness, range) every
+#: `STATUS_INTERVAL` — the raw data for calibrating the dimming curve to a
+#: room. `None` (or "") disables it.
+LIGHT_LOG = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "pylumicube", "light.csv")
+
 #: Settings a config file may override.
 CONFIG_NAMES = ("BRIGHTNESS_MIN", "BRIGHTNESS_MAX", "GAMMA", "SMOOTHING", "ADAPT",
                 "LOW", "HIGH", "HUE_FOLLOWS_HOUR", "HUE", "SATURATION", "JITTER",
                 "ALLOW_REBOOT", "HOURLY_SCROLL", "HOURLY_SPEAK", "SCROLL_SPEED",
                 "SCROLL_FONT", "SPEAKER_VOLUME", "TEMP_SAMPLE_SECONDS",
-                "TEMP_HISTORY", "CHART_REFRESH", "STATUS_INTERVAL")
+                "TEMP_HISTORY", "CHART_REFRESH", "STATUS_INTERVAL", "LIGHT_LOG")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = os.path.join(_HERE, "ambient_clock_config.py")
@@ -503,6 +510,38 @@ class AmbientClock:
             self.say(f"it's {now.hour} o'clock")
 
 
+def _open_light_log(path: str | None = None):
+    """Open the ambient-light CSV for appending, or None when it is off."""
+    target = LIGHT_LOG if path is None else path
+    if not target:
+        return None
+    try:
+        directory = os.path.dirname(os.path.abspath(target))
+        os.makedirs(directory, exist_ok=True)
+        fresh = not os.path.exists(target)
+        handle = open(target, "a", buffering=1, encoding="utf-8")
+        if fresh:
+            handle.write("timestamp,ambient,brightness,low,high\n")
+        return handle
+    except OSError:
+        log.warning("could not open the light log %r; continuing without it",
+                    target, exc_info=True)
+        return None
+
+
+def _write_light_row(handle, ambient, brightness, curve_range) -> None:
+    """Append one calibration row. Never lets a disk problem stop the clock."""
+    if handle is None:
+        return
+    low, high = curve_range
+    try:
+        handle.write(f"{datetime.datetime.now().isoformat(timespec='seconds')},"
+                     f"{'' if ambient is None else int(ambient)},"
+                     f"{brightness:.3f},{low:.1f},{high:.1f}\n")
+    except Exception:  # noqa: BLE001 — a log file is not worth a crash
+        log.debug("could not append to the light log", exc_info=True)
+
+
 def _cpu_temperature_c() -> float | None:
     """Read the Pi's CPU temperature in °C (None if the file is unavailable)."""
     try:
@@ -565,6 +604,8 @@ def run(cube: LumiCube, *, seconds: float | None = None,
 
     deadline = None if seconds is None else time.monotonic() + seconds
     status_at = time.monotonic() + STATUS_INTERVAL
+    light_log = _open_light_log()
+    _write_light_row(light_log, clock.last_raw, brightness, clock.curve.range)
     try:
         while True:
             now = datetime.datetime.now()
@@ -578,6 +619,8 @@ def run(cube: LumiCube, *, seconds: float | None = None,
             if time.monotonic() >= status_at:
                 log.info("ambient %s -> brightness %.2f (range %.0f..%.0f)",
                          clock.last_raw, brightness, *clock.curve.range)
+                _write_light_row(light_log, clock.last_raw, brightness,
+                                 clock.curve.range)
                 status_at = time.monotonic() + STATUS_INTERVAL
             if deadline is not None and time.monotonic() >= deadline:
                 log.info("finished %ss run (brightness %.3f, range %s)",
@@ -589,6 +632,8 @@ def run(cube: LumiCube, *, seconds: float | None = None,
     finally:
         display.set_all(0x000000)
         display.flush(timeout=2.0)
+        if light_log is not None:
+            light_log.close()
     return 0
 
 
@@ -603,6 +648,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default=None,
                         help="config file to load (default: ambient_clock_config.py "
                              "next to this script, if present)")
+    parser.add_argument("--light-log", default=None,
+                        help="CSV to append ambient readings to (default: the "
+                             "LIGHT_LOG setting; an empty string disables it)")
     parser.add_argument("--no-telemetry", action="store_true",
                         help="skip sensor setup and use a fixed brightness")
     parser.add_argument("--debug", action="store_true")
@@ -613,6 +661,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.config:
         load_config(args.config)
+    if args.light_log is not None:
+        globals()["LIGHT_LOG"] = args.light_log
 
     if args.no_telemetry:
         with open_or_use_hosted(args.port) as cube:

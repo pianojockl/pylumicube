@@ -452,6 +452,43 @@ def test_sibling_config_is_optional() -> None:
     assert clock.load_config() in (None, clock.DEFAULT_CONFIG)
 
 
+# ----- light log (calibration data) ---------------------------------------
+
+
+def test_light_log_appends_a_row_per_status_interval(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(clock, "LIGHT_LOG", str(tmp_path / "light.csv"))
+    handle = clock._open_light_log()  # noqa: SLF001
+    assert handle is not None
+    clock._write_light_row(handle, 118, 0.45, (72.0, 1869.0))  # noqa: SLF001
+    clock._write_light_row(handle, None, 0.45, (72.0, 1869.0))  # noqa: SLF001
+    handle.close()
+
+    lines = (tmp_path / "light.csv").read_text().splitlines()
+    assert lines[0] == "timestamp,ambient,brightness,low,high"
+    assert lines[1].endswith(",118,0.450,72.0,1869.0")
+    assert lines[2].endswith(",,0.450,72.0,1869.0")   # no reading yet
+    # Re-opening appends rather than rewriting the header.
+    handle = clock._open_light_log()  # noqa: SLF001
+    clock._write_light_row(handle, 120, 0.45, (72.0, 1869.0))  # noqa: SLF001
+    handle.close()
+    assert len((tmp_path / "light.csv").read_text().splitlines()) == 4
+
+
+def test_light_log_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(clock, "LIGHT_LOG", "")
+    assert clock._open_light_log() is None  # noqa: SLF001
+    clock._write_light_row(None, 100, 0.5, (10.0, 20.0))  # noqa: SLF001
+
+
+def test_light_log_failure_does_not_stop_the_clock(tmp_path, monkeypatch, caplog) -> None:
+    target = tmp_path / "nope" / "light.csv"
+    target.parent.write_text("not a directory")          # mkdir will fail
+    monkeypatch.setattr(clock, "LIGHT_LOG", str(target))
+    with caplog.at_level("WARNING"):
+        assert clock._open_light_log() is None  # noqa: SLF001
+    assert "light log" in caplog.text
+
+
 # ----- hourly chime ------------------------------------------------------
 
 
