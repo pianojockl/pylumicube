@@ -39,6 +39,36 @@ from .transport import Transport
 log = logging.getLogger(__name__)
 
 
+class _NullTelemetry:
+    """A store-shaped object for cubes running without telemetry.
+
+    The module namespace needs *something* to read from; with no telemetry
+    every read is empty, but the namespace still resolves field keys, which
+    is what writing by name needs.
+    """
+
+    def get(self, node_id: int, key: int, default: int | None = None) -> int | None:
+        return default
+
+    def snapshot(self, node_id: int) -> dict[int, int]:
+        return {}
+
+    def has_data(self, node_id: int) -> bool:
+        return False
+
+    def last_update(self, node_id: int) -> float | None:
+        return None
+
+    def wait_for(self, node_id: int, key: int, timeout: float | None = None,
+                 default: int | None = None) -> int | None:
+        if default is not None:
+            return default
+        raise TimeoutError("no telemetry: this cube was opened without it")
+
+    def stats(self) -> dict[str, object]:
+        return {"frames": 0, "nodes": [], "disabled": True}
+
+
 class LumiCube:
     """Owns the serial link, transport, and allocator. Exposes module helpers."""
 
@@ -339,14 +369,13 @@ class LumiCube:
     def modules(self) -> dict[str, FieldModule]:
         """Module namespace built from the discovered schemas.
 
-        Requires telemetry: the module objects read the telemetry cache.
+        Reads come from telemetry, so without it every field reads as None —
+        but the namespace is still built, because writing by name (the
+        drivers, `write_named`) needs the field keys, not the values.
         """
         if self._namespace is None:
-            if self._telemetry is None:
-                raise RuntimeError(
-                    "telemetry not enabled — construct with LumiCube(telemetry=True) "
-                    "or call enable_telemetry()")
-            self._namespace = build_namespace(self._schemas, self._names, self._telemetry)
+            store = self._telemetry if self._telemetry is not None else _NullTelemetry()
+            self._namespace = build_namespace(self._schemas, self._names, store)
         return self._namespace
 
     def module(self, name: str) -> FieldModule:

@@ -43,8 +43,24 @@ CHUNK_SAMPLES = 112
 #: Speaker volume field range (`speaker.volume`, 0..200 per api.txt).
 MAX_VOLUME = 200
 #: Default volume. The firmware powers up at full blast, which is far too
-#: loud in a room, so a driver that is not told otherwise starts at half.
-DEFAULT_VOLUME = 100
+#: loud in a room; measured on this cube, speech is comfortable around 20.
+DEFAULT_VOLUME = 40
+
+#: Audio sent ahead of real time, in seconds. The firmware buffers only a few
+#: chunks, so pacing exactly to real time means every scheduling hiccup
+#: underruns it — measured on the cube, ~10% of chunks arrived late (p95
+#: 5-14 ms, spikes to 50 ms) with no lead, and a lead of about four chunks
+#: absorbed most of it. A larger lead overflows the firmware instead (a
+#: 35 ms lead dropped 51 chunks of a 5 second sentence), so this is a narrow
+#: window rather than "more is better".
+LEAD_SECONDS = 0.014
+
+#: Chunks sent back-to-back per wakeup. `time.sleep` on a busy Pi overshoots
+#: by a few milliseconds, which shows up as a tail of late chunks (measured
+#: p95 gap 8.6 ms against a 3.5 ms ideal) — and the firmware's buffer is too
+#: small to absorb that. Sleeping once per *group* means three times fewer
+#: timing events and three times more audio behind each one.
+PACE_GROUP = 3
 
 SINE = "sine"
 SQUARE = "square"
@@ -134,6 +150,8 @@ class Speaker:
                  volume: int = DEFAULT_VOLUME,
                  timeout: float = 0.5,
                  pace: bool = True,
+                 lead: float = LEAD_SECONDS,
+                 pace_group: int = PACE_GROUP,
                  await_response: bool = False,
                  max_in_flight: int = 32) -> None:
         self._write = write
@@ -152,6 +170,11 @@ class Speaker:
         #: Upper bound on writes in flight; the link sustains ~380 chunks/s
         #: with a few dozen outstanding, and audio needs 286/s.
         self.max_in_flight = max_in_flight
+        #: Seconds of audio sent ahead of real time, so the firmware's small
+        #: buffer stays fed instead of sitting empty (see `write_pcm`).
+        self.lead = float(lead)
+        #: Chunks per wakeup when pacing (see `write_pcm`).
+        self.pace_group = max(1, int(pace_group))
         self._volume = max(0, min(MAX_VOLUME, volume))
         self._stopped = False
         self.dropped_chunks = 0
@@ -197,6 +220,11 @@ class Speaker:
         are in flight (measured), which is comfortably above the 286
         chunks/s that 32 kHz mono needs. Chunks are dropped rather than
         queued when the link falls behind, so audio never drifts late.
+
+        The first `lead` seconds go out as fast as the link takes them, and
+        only after that does the schedule bite: the firmware buffers about
+        3 KB (≈95 ms), and pacing exactly to real time leaves that buffer
+        empty, so any jitter underruns it and the speech chops.
         """
         self._stopped = False
         if realtime is None:
@@ -213,15 +241,19 @@ class Speaker:
             chunk = pcm[offset : offset + chunk_bytes]
             if len(chunk) < chunk_bytes:
                 chunk = chunk + b"\x00" * (chunk_bytes - len(chunk))   # pad
-            if realtime:
-                due = started + sent * chunk_duration
+            if realtime and sent % self.pace_group == 0:
+                # Sleep once per group: the schedule is still absolute, so a
+                # group that arrives late is caught up by the next one, but
+                # there are `pace_group` times fewer sleeps to overshoot.
+                due = started + max(0.0, sent * chunk_duration - self.lead)
                 now = time.monotonic()
                 if now < due:
                     time.sleep(due - now)
-                elif now > due + chunk_duration:
-                    # Too far behind to catch up: skip this chunk entirely.
-                    self.dropped_chunks += 1
-                    sent += 1
+                elif now > due + 3 * chunk_duration * self.pace_group:
+                    # Genuinely behind (the lead is spent and then some):
+                    # skip this group rather than play the rest late.
+                    self.dropped_chunks += self.pace_group
+                    sent += self.pace_group
                     continue
                 self._wait_for_space()
             while in_flight and in_flight[0].done():

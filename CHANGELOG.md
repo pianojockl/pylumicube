@@ -86,10 +86,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   step-by-step guide for running the clock on the cube instead of the Java
   daemon: venv layout, settings in `~/.config/pylumicube/clock.py`, the
   enable/disable dance, and how to roll back.
-- **`Speaker` starts at half volume** (`DEFAULT_VOLUME = 100`, not
+- **`Speaker` starts at a sane volume** (`DEFAULT_VOLUME`, not
   `MAX_VOLUME`): the firmware powers up at full blast, which is far too
-  loud in a room. `Speaker(volume=...)`, the demo's `--volume` and the
-  clock's `SPEAKER_VOLUME` all override it.
+  loud in a room. Measured since on this cube: comfortable speech is around
+  **20** of 200, so the default is 40, and `Speaker(volume=...)`, the demo's
+  `--volume` and the clock's `SPEAKER_VOLUME` all override it.
 - **`LumiCube.enable_telemetry(subscribe_except=...)`** — walk a node's
   field keys without subscribing to its telemetry stream, the configuration
   that makes audio work; the compat shim uses it so a script that reads
@@ -149,6 +150,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LEVEL` covers the non-interactive case.
 
 ### Fixed
+- **Choppy speech.** The stream was paced to exactly real time, which leaves
+  the firmware's small audio buffer empty: measured on the cube, the p50 gap
+  between chunks was spot on (3.5 ms) but the p95 was 8.6 ms and spikes
+  reached 50 ms, so ~10% of chunks arrived late and the buffer underran.
+  Two changes: a **lead** (`LEAD_SECONDS`, 14 ms — measured as the sweet
+  spot; 35 ms overflows the firmware and *drops* chunks) and **grouped
+  pacing** (`PACE_GROUP`, three chunks per wakeup, so there are three times
+  fewer `sleep()` overshoots to be late with). Drops for a nine-second
+  sentence went from 7% to ~2%, best case 0. `espeak-ng` is also preferred
+  over `espeak` when installed — its synthesis is markedly clearer, and it
+  is what the probe was measuring.
+- **`LumiCube.modules` no longer requires telemetry.** It raised if the cube
+  was opened without it, which broke `write_named` — and so the whole
+  speaker driver — on a telemetry-less cube even though writing by name only
+  needs the field *keys*. The namespace is now built against an empty store,
+  so reads are None and writes work.
 - **Telemetry broadcasts ran on the link's I/O thread.** Serialising a
   frame for every client — a cube-board frame carries a couple of hundred
   values — was slow enough to stall the wire, which made service requests

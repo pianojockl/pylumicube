@@ -540,11 +540,20 @@ class ControlServer:
             if not text:
                 raise ControlError("text is required", code="bad_request")
             self._audio_stopped.clear()
+            speaker = cube.speaker
+            written, dropped = (getattr(speaker, "written_chunks", 0),
+                                getattr(speaker, "dropped_chunks", 0))
             with self.audio_lock:
                 cube.say(text, voice=request.get("voice"),
                          speed=request.get("speed"),
                          volume=request.get("volume"))
-            return {"ok": True}
+            log.info("said %r (%d chunks, %d dropped, %d%% loss)", text,
+                     getattr(speaker, "written_chunks", 0) - written,
+                     getattr(speaker, "dropped_chunks", 0) - dropped,
+                     round(100 * (getattr(speaker, "dropped_chunks", 0) - dropped)
+                           / max(1, getattr(speaker, "written_chunks", 0) - written)))
+            return {"ok": True,
+                    "dropped": getattr(speaker, "dropped_chunks", 0) - dropped}
 
         if op == "tone":
             self._audio_stopped.clear()
