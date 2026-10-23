@@ -211,7 +211,17 @@ and `~/AbstractFoundry/` is untouched.
 
 - **Only one process can own `/dev/ttyAMA0`**: the daemon when it is
   running, the clock (or a script) when it is not. Two `LumiCube`s at once
-  means one of them gets `Resource busy`.
+  means one of them gets `Resource busy`. The daemon also takes an `flock` on
+  `$XDG_RUNTIME_DIR/pylumicube.sock.lock` *before* it opens the port, so a
+  stray second daemon is refused with `another pylumicube daemon already owns
+  ...` instead of quietly stealing frames from the running one.
+- **A daemon restart does not need a clock restart.** The clock notices the
+  dead link (a check on every pass, because a dead link raises nothing —
+  telemetry just freezes and display writes fail inside the async worker),
+  reconnects, re-applies its brightness and volume, and redraws. Expect
+  `lost the daemon connection; reconnecting` followed by `reconnected to the
+  daemon; resuming` a few seconds later, and no interruption in the learned
+  dimming range.
 - **The control protocol** is line-delimited JSON on
   `$XDG_RUNTIME_DIR/pylumicube.sock` (mode 600, never a TCP port — MQTT is
   the network face). A request is `{"id": 1, "op": "read", "module": ...,
