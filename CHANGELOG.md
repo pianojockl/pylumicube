@@ -186,6 +186,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   daemon now records the brightness a client writes through the control
   socket — the clock re-asserts its own at startup — the same way it records
   the speaker volume, so the published state is the one on the matrix.
+- **The Home Assistant scripts only worked when they were given fields.** A
+  field's `default:` is *not* applied when a script is called as a service with
+  no data — which is exactly what the dashboard cards do — so `colour`, `size`,
+  `y`, `frequency` and `duration` arrived undefined and the payload died with
+  `TypeError: Object of type LoggingUndefined is not JSON serializable`. Three
+  of the four scripts were affected (`scroll`, `screen_text`, `tone`); every
+  payload now guards its fields with `| default(...)`, the conditional ones
+  check `is defined` too, and `deploy/home-assistant/scripts.yaml` explains why
+  so the next script does not repeat it.
 
 ### Fixed
 - **The hourly chime said "sixteen o'clock".** It handed espeak-ng the raw

@@ -1,6 +1,14 @@
 # Reference copy of the lumicube_* scripts, as written through the HA API
 # (`script/config/save`). Run from the UI they show a form; run from an
 # automation they take the same fields.
+#
+# Every payload guards its fields with `| default(...)`, and that is not
+# decoration: Home Assistant does *not* apply a field's `default:` to a bare
+# service call — which is exactly what the dashboard cards make
+# (`perform_action: script.lumicube_scroll`, no data). An unguarded field then
+# arrives as undefined and the payload dies with "Object of type
+# LoggingUndefined is not JSON serializable". A field's `default:` still earns
+# its place: it pre-fills the form you get when you run the script from the UI.
 
 lumicube_say:
   alias: LumiCube say
@@ -37,9 +45,10 @@ lumicube_say:
         # Keys are only sent when set: an absent language means "the cube's
         # selected language", an absent volume means "do not touch it".
         payload: >-
-          {{ {'text': sentence or states('input_text.lumicube_say_text')}
-             | combine({'language': language} if language else {})
-             | combine({'volume': volume | int} if volume else {})
+          {{ {'text': sentence | default('')
+                     or states('input_text.lumicube_say_text')}
+             | combine({'language': language} if language is defined and language else {})
+             | combine({'volume': volume | int} if volume is defined and volume else {})
              | tojson }}
 
 lumicube_scroll:
@@ -135,8 +144,10 @@ lumicube_screen_text:
       data:
         topic: lumicube/screen/text
         payload: >-
-          {{ {'text': text or states('input_text.lumicube_say_text'),
-              'size': size | int, 'y': y | int, 'colour': colour} | tojson }}
+          {{ {'text': text | default('')
+                     or states('input_text.lumicube_say_text'),
+              'size': size | default(2) | int, 'y': y | default(10) | int,
+              'colour': colour | default('#ffffff')} | tojson }}
 
 lumicube_tone:
   alias: LumiCube tone
@@ -169,7 +180,8 @@ lumicube_tone:
       data:
         topic: lumicube/speaker/tone
         payload: >-
-          {{ {'frequency': frequency | int, 'duration': duration | float} | tojson }}
+          {{ {'frequency': frequency | default(880) | int,
+              'duration': duration | default(0.4) | float} | tojson }}
 
 lumicube_stop:
   alias: LumiCube stop
