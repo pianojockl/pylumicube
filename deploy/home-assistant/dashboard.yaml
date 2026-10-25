@@ -44,6 +44,10 @@ views:
             entities:
               - entity: number.lumicube_display_brightness
                 name: Helligkeit
+              - entity: number.lumicube_scroll_repeats
+                name: Wiederholungen
+              - entity: number.lumicube_scroll_speed
+                name: Geschwindigkeit
           - type: custom:mushroom-template-card
             primary: Laufschrift
             secondary: Text über die LED-Matrix

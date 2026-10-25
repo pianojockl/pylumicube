@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **How a scroll runs is a setting now, not a hardcoded guess.** `times` says
+  how many times a message travels past and `speed` how fast, both settable
+  over MQTT (`display/scroll/times/set`, `display/scroll/speed/set` — published
+  as two `number` entities so Home Assistant gets sliders for them) and both
+  overridable per command in a `display/scroll` payload. They live in the
+  bridge, so the dashboard's scroll button needs no fields at all, and a second
+  scroll arriving while one is running is logged and ignored rather than
+  interleaving its frames with the first. `Display.scroll_text`/`scroll_pixels`
+  grew the same `times` argument (one pass by default, as upstream did, and the
+  compat shim forwards it), and the clock's hourly scroll and top button share
+  `DEFAULT_SCROLL_TIMES = 5` — the time scrolls past five times, about 19 s,
+  where the script this replaced re-called `scroll_text` every half second and
+  scrolled until the minute was over (~60 s). The clock's `SCROLL_TIMES` in
+  `~/.config/pylumicube/clock.py` changes it. Repeating costs real link time —
+  a scroll holds the serial link for its whole duration, so five passes of a
+  long sentence is half a minute — which is why the count is clamped to 1..20
+  and a payload can still say `times: 1`.
 - **A LumiCube control panel in Home Assistant.** `select.lumicube_speak_language`
   (its options are the languages espeak actually has on the cube) sets the
   default speak language, so the existing `text.lumicube_speak` entity speaks

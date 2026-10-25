@@ -45,6 +45,7 @@ Every name is optional. The ones worth knowing about:
 | `ADAPT`, `LOW`, `HIGH` | auto-range the dimming curve, or pin the light range |
 | `BRIGHTNESS_MIN` | floor in a dark room — `0.02` is a barely-visible glow |
 | `SPEAKER_VOLUME` | 0..200; the firmware powers up at full blast |
+| `SCROLL_TIMES`, `SCROLL_SPEED` | how many times the time scrolls past at the top of the hour and on the top button (5 is ~19 s; the old script scrolled for a whole minute), and how fast |
 | `ALLOW_REBOOT` | whether the middle button reboots the Pi |
 | `TEMP_SAMPLE_SECONDS`, `TEMP_HISTORY` | CPU-temperature chart on the LCD |
 | `STATUS_INTERVAL` | seconds between `ambient X -> brightness Y` log lines |
@@ -104,6 +105,7 @@ so Home Assistant creates the entities by itself:
 | `sensor.lumicube_something_within_proximity` | proximity flag |
 | `number.lumicube_speaker_volume` | 0..200, two-way |
 | `number.lumicube_display_brightness` | 0..100, two-way — the LED matrix's level, named "Matrix brightness" in Home Assistant (the range is the one the firmware declares, and it clamps to it) |
+| `number.lumicube_scroll_speed`, `..._scroll_repeats` | 0.25..5 and 1..20, two-way — how a scroll runs when the command does not say. They live in the bridge, so the dashboard's scroll button needs no fields. (The entity is named after the wording Home Assistant shows; the MQTT topics are `display/scroll/speed` and `display/scroll/times`) |
 | `text.lumicube_speak` | type a sentence, the cube says it |
 | `select.lumicube_speak_language` | language for spoken messages, from the cube's installed espeak voices |
 | `event.lumicube_top_button`, `..._middle`, `..._bottom`, `..._base` | button presses, for automations |
@@ -120,15 +122,19 @@ Commands are plain payloads where that makes sense:
 | `lumicube/screen/text` | `{"text": "hello", "size": 2, "colour": "#ffffff"}` |
 | `lumicube/screen/image` | an image path on the cube |
 | `lumicube/screen/clear`, `lumicube/display/fill` | a colour (`#rrggbb` or a number) |
-| `lumicube/display/scroll` | a sentence to scroll across the 16x8 matrix |
+| `lumicube/display/scroll` | a sentence to scroll across the 16x8 matrix; `{"text": ..., "colour": ..., "speed": 1.0, "times": 5}` overrides the two settings below for that one scroll |
+| `lumicube/display/scroll/speed/set` | 0.25..5 (state on `lumicube/display/scroll/speed`) — how fast, default 1.5 |
+| `lumicube/display/scroll/times/set` | 1..20 (state on `lumicube/display/scroll/times`) — how many times the message travels past, default 5 |
 | `lumicube/display/brightness/set` | 0..100 (state on `lumicube/display/brightness`) — the LED matrix's global level, which the firmware clamps to 100 |
 
 `lumicube/display/scroll` holds the serial link for the whole scroll (one frame
 per column, and the firmware services one request at a time), so with the
-clock running its frames and the light-sensor telemetry time out. Use it when
-the clock is stopped; while it runs, `lumicube/screen/text` is the free
-surface — the LCD takes 128 characters and nothing else but the temperature
-chart uses it.
+clock running its frames and the light-sensor telemetry time out. `times`
+multiplies that: five passes of "16:00" is ~19 s, and five passes of a long
+sentence is half a minute — set `times` to 1, or use `lumicube/screen/text`
+(the LCD takes 128 characters and nothing else but the temperature chart uses
+it) while the clock runs. A scroll that arrives while one is running is
+logged and ignored rather than interleaved with it.
 
 Spoken messages are espeak, so the language is espeak's: `language` (or
 `voice`) takes a language or voice name — `de`, `en-gb`, `de+f3`, `german`.

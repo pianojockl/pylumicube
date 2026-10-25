@@ -232,7 +232,15 @@ def test_scroll_text_delegates_to_the_display() -> None:
     shim.scroll_text("A", colour=0x00FF00, speed=1000)
     fake.scroll_text.assert_called_once_with("A", colour=0x00FF00,
                                             background_colour=0x000000,
-                                            speed=1000, with_gap=True)
+                                            speed=1000, with_gap=True, times=1)
+
+
+def test_scroll_text_can_repeat_in_one_call() -> None:
+    """Upstream scrolled once and the script looped; `times` does it in one
+    call, so the message does not have to be re-sent between passes."""
+    shim, fake = _make_shim()
+    shim.scroll_text("16:00", times=5)
+    assert fake.scroll_text.call_args.kwargs["times"] == 5
 
 
 

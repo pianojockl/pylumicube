@@ -57,6 +57,10 @@ HOUR_WORDS = ("twelve", "one", "two", "three", "four", "five", "six",
 CHIME_PHRASE = "it's {hour} o'clock"
                          # ...and the phrase around them.
 SCROLL_SPEED = 0.7       # higher = faster scroll
+SCROLL_TIMES = 5         # how many times the time scrolls past when the top
+                         # button or the top of the hour asks for it. 5 is
+                         # ~19 s at the speed above; the script this replaced
+                         # re-scrolled until the minute was over (~60 s)
 SCROLL_FONT = "digits"   # "digits" = the clock's own 3x5 glyphs (matches
                          # the static display); "firmware" = the taller
                          # built-in 5x7 font that upstream scrolled with

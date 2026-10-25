@@ -73,8 +73,8 @@ class FakeDisplay:
         self.brightness = max(0, min(100, int(value)))
 
     def scroll_text(self, text, colour=0xFFFFFF, background=0x000000, speed=1.0,
-                    timeout=None) -> None:
-        self.scrolls.append((text, colour, background, speed, timeout))
+                    times=1, timeout=None) -> None:
+        self.scrolls.append((text, colour, background, speed, times, timeout))
 
 
 class FakeSensor:
@@ -197,8 +197,9 @@ def test_display_scroll_takes_text_and_options(bridge) -> None:
                                        "colour": "#ff8800", "speed": 1.5}))
     assert bridge._scroll_thread is not None, "the scroll did not run"
     bridge._scroll_thread.join(timeout=5)
+    # Five times, the shared default: an explicit speed, but no `times`.
     assert bridge.cube.display.scrolls == [
-        ("Waschmaschine fertig!", 0xFF8800, 0, 1.5, SCROLL_FRAME_TIMEOUT)]
+        ("Waschmaschine fertig!", 0xFF8800, 0, 1.5, 5, SCROLL_FRAME_TIMEOUT)]
 
     bridge._handle_command("display/scroll", "plain text")
     bridge._scroll_thread.join(timeout=5)
@@ -206,6 +207,65 @@ def test_display_scroll_takes_text_and_options(bridge) -> None:
 
     bridge._handle_command("display/scroll", "")
     assert len(bridge.cube.display.scrolls) == 2, "empty text scrolled"
+
+
+def test_the_scroll_settings_persist_and_a_payload_can_override_them(bridge) -> None:
+    """Speed and repeats live in the bridge, so Home Assistant sets them once
+    and the dashboard's scroll button needs no fields at all."""
+    bridge._handle_command("display/scroll/times/set", "2")
+    bridge._handle_command("display/scroll/speed/set", "3")
+    assert (bridge.scroll_speed, bridge.scroll_times) == (3.0, 2)
+    assert bridge._client.topics()["lumicube/display/scroll/speed"] == 3.0
+    assert bridge._client.topics()["lumicube/display/scroll/times"] == 2
+
+    bridge._handle_command("display/scroll", "hello")
+    bridge._scroll_thread.join(timeout=5)
+    text, _colour, _bg, speed, times, _timeout = bridge.cube.display.scrolls[-1]
+    assert (text, speed, times) == ("hello", 3.0, 2)
+
+    bridge._handle_command("display/scroll",
+                           json.dumps({"text": "hi", "speed": 0.5, "times": 1}))
+    bridge._scroll_thread.join(timeout=5)
+    _text, _colour, _bg, speed, times, _timeout = bridge.cube.display.scrolls[-1]
+    assert (speed, times) == (0.5, 1)
+    assert (bridge.scroll_speed, bridge.scroll_times) == (3.0, 2), \
+        "a per-scroll override changed the settings"
+
+
+def test_the_scroll_settings_are_clamped(bridge) -> None:
+    """They arrive over MQTT from anywhere, so the bounds are enforced here:
+    `times: 0` would scroll nothing, `times: 10000` would hold the link for
+    hours."""
+    bridge._handle_command("display/scroll/times/set", "0")
+    assert bridge.scroll_times == 1
+    bridge._handle_command("display/scroll/times/set", "10000")
+    assert bridge.scroll_times == 20
+    bridge._handle_command("display/scroll/speed/set", "99")
+    assert bridge.scroll_speed == 5.0
+    bridge._handle_command("display/scroll/speed/set", "0")
+    assert bridge.scroll_speed == 0.25
+
+
+def test_a_second_scroll_is_refused_while_one_runs(bridge) -> None:
+    """Two threads would interleave frames on the same panel and neither would
+    be readable — and at five passes a scroll lasts ~20 s, so it would happen."""
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    def slow_scroll(text, *args, **kwargs):
+        calls.append(text)
+        started.set()
+        release.wait(5)
+
+    bridge.cube.display.scroll_text = slow_scroll
+    bridge._handle_command("display/scroll", "first")
+    assert started.wait(2), "the first scroll never started"
+    try:
+        bridge._handle_command("display/scroll", "second")
+        assert calls == ["first"], "the second scroll ran alongside the first"
+    finally:
+        release.set()
 
 
 def test_an_announcement_is_not_delayed_behind_a_scroll(bridge) -> None:
@@ -363,6 +423,7 @@ def test_the_bridge_subscribes_to_every_command_it_handles(bridge) -> None:
         "lumicube/screen/text", "lumicube/screen/image",
         "lumicube/screen/clear", "lumicube/display/fill",
         "lumicube/display/scroll", "lumicube/display/brightness/set",
+        "lumicube/display/scroll/speed/set", "lumicube/display/scroll/times/set",
     }
 
 
@@ -537,6 +598,16 @@ def test_discovery_covers_the_entities_ha_should_create(bridge) -> None:
     # 155 positions that do nothing.
     assert (brightness["min"], brightness["max"]) == (0, 100)
     assert brightness["command_topic"] == "lumicube/display/brightness/set"
+    # A scroll's two knobs are the bridge's own settings, published so Home
+    # Assistant can change them without a script field in sight.
+    speed = configs["homeassistant/number/pylumicube/scroll_speed/config"]
+    assert speed["name"] == "Scroll speed"
+    assert (speed["min"], speed["max"], speed["step"]) == (0.25, 5.0, 0.25)
+    assert speed["command_topic"] == "lumicube/display/scroll/speed/set"
+    times = configs["homeassistant/number/pylumicube/scroll_times/config"]
+    assert times["name"] == "Scroll repeats"
+    assert (times["min"], times["max"], times["step"]) == (1, 20, 1)
+    assert times["command_topic"] == "lumicube/display/scroll/times/set"
 
 
 def test_discovery_can_be_switched_off() -> None:

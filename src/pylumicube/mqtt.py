@@ -14,7 +14,11 @@ can publish the sentence it wants spoken:
     lumicube/screen/clear       a colour (hex like "#000000" or a number)
     lumicube/display/fill       a colour
     lumicube/display/scroll     "hello" or {"text": ..., "colour": ..., "speed": 1.0}
+                                "speed" and "times" override the settings below
+                                for that one scroll
     lumicube/display/brightness/set  0..100
+    lumicube/display/scroll/speed/set  0.25..5 (state on the bare topic)
+    lumicube/display/scroll/times/set  1..20   (state on the bare topic)
 
 Note the `/set` suffix on the two settable values: their *state* is published
 on the bare topic (`lumicube/speaker/volume`), and a bridge that subscribed
@@ -36,7 +40,7 @@ import time
 from typing import Any
 
 from . import speaker as speaker_module
-from .display import MAX_BRIGHTNESS
+from .display import DEFAULT_SCROLL_TIMES, MAX_BRIGHTNESS
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +61,14 @@ _SENSOR_DEADBAND_FLOOR = 32.0
 #: (2 s) turns a contended scroll into minutes of stalling: one frame per
 #: column, each waiting out its timeout, with the speaker starved meanwhile.
 SCROLL_FRAME_TIMEOUT = 0.25
+
+#: What a scroll does when the command does not say: the same defaults the
+#: clock uses, so a message scrolls past the same number of times whichever
+#: side asked for it. Both are settable at runtime — see the `number` entities
+#: the bridge publishes — and a single command can still override either.
+SCROLL_SPEED_DEFAULT = 1.5
+SCROLL_SPEED_RANGE = (0.25, 5.0)
+SCROLL_TIMES_RANGE = (1, 20)
 
 
 def parse_colour(payload: str) -> int:
@@ -127,6 +139,12 @@ class MqttBridge:
         self._last_state: dict[str, Any] = {}
         self._last_publish: dict[str, float] = {}
         self._scroll_thread: threading.Thread | None = None
+        #: How a scroll behaves when the command does not say. Home Assistant
+        #: sets these through `display/scroll/speed` and `display/scroll/times`
+        #: (they are published as `number` entities), so the dashboard's scroll
+        #: button needs no fields at all — it just inherits them.
+        self.scroll_speed = float(SCROLL_SPEED_DEFAULT)
+        self.scroll_times = int(DEFAULT_SCROLL_TIMES)
 
     # ---------------- lifecycle ----------------
 
@@ -175,7 +193,8 @@ class MqttBridge:
 
     # ---------------- paho callbacks ----------------
 
-    def _scroll(self, text: str, colour: int, background: int, speed: float) -> None:
+    def _scroll(self, text: str, colour: int, background: int, speed: float,
+                times: int) -> None:
         """Scroll `text` on the 16x8 matrix, in the background.
 
         A scroll is one frame per column and the firmware services one request
@@ -188,8 +207,13 @@ class MqttBridge:
         which is the right trade, and it keeps an announcement from waiting
         for a scroll to finish. The short frame timeout keeps a contended
         scroll from retrying its way through the whole alphabet.
+
+        `times` multiplies all of that: five passes of a long sentence holds
+        the link for half a minute, so the caller is told (the bridge logs
+        the pair it is about to use) and the count is clamped.
         """
         self.cube.display.scroll_text(text, colour, background, speed,
+                                      times=times,
                                       timeout=SCROLL_FRAME_TIMEOUT)
 
     def _command_topics(self) -> tuple[str, ...]:
@@ -208,6 +232,7 @@ class MqttBridge:
             "speaker/volume/set", "speaker/language/set",
             "screen/text", "screen/image", "screen/clear",
             "display/fill", "display/scroll", "display/brightness/set",
+            "display/scroll/speed/set", "display/scroll/times/set",
         ))
 
     def _on_connect(self, client: Any, userdata: Any, flags: Any, reason_code: Any,
@@ -317,12 +342,42 @@ class MqttBridge:
             cube.display.fill(parse_colour(str(payload)))
             return
 
+        if suffix in ("display/scroll/speed/set", "display/scroll/speed"):
+            self.scroll_speed = self._clamp(float(value), SCROLL_SPEED_RANGE)
+            log.info("MQTT: scroll speed %.2f", self.scroll_speed)
+            self._publish_state(self._topic("display/scroll/speed"),
+                                self.scroll_speed)
+            return
+
+        if suffix in ("display/scroll/times/set", "display/scroll/times"):
+            self.scroll_times = int(round(self._clamp(float(value),
+                                                      SCROLL_TIMES_RANGE)))
+            log.info("MQTT: scroll times %d", self.scroll_times)
+            self._publish_state(self._topic("display/scroll/times"),
+                                self.scroll_times)
+            return
+
         if suffix == "display/scroll":
             options = value if isinstance(value, dict) else {"text": str(value)}
             text = str(options.get("text", ""))
             if not text:
                 return
-            log.info("MQTT: scroll %r", text)
+            # A payload may override either setting for this one scroll; an
+            # absent one means "whatever the settings say".
+            speed = self._clamp(float(options.get("speed", self.scroll_speed)),
+                                SCROLL_SPEED_RANGE)
+            times = int(round(self._clamp(
+                float(options.get("times", self.scroll_times)),
+                SCROLL_TIMES_RANGE)))
+            # One scroll at a time: the two threads would interleave frames on
+            # the same panel and neither would be readable. At five passes a
+            # scroll lasts ~20 s, so a second command arriving mid-scroll is
+            # likely rather than theoretical.
+            if self._scroll_thread is not None and self._scroll_thread.is_alive():
+                log.warning("MQTT: a scroll is already running; ignoring %r",
+                            text)
+                return
+            log.info("MQTT: scroll %r (speed %.2f, %d times)", text, speed, times)
             # The 16x8 matrix fits about three characters, so anything longer
             # has to travel. That takes seconds, so it runs off the MQTT loop:
             # the callback must not stall other commands (including the `say`
@@ -330,15 +385,16 @@ class MqttBridge:
             #
             # Caveat, measured: a scroll is one frame per column and the
             # firmware services one request at a time, so it holds the link
-            # for its duration. With the clock running, the clock's frames
-            # time out and the light-sensor telemetry does too. Prefer
-            # `screen/text` (the LCD, 128 characters, nothing else uses it)
-            # while the clock runs; this is for when it is stopped.
+            # for its duration — `times` times over, which is why five passes
+            # of a sentence is a half-minute takeover. With the clock running,
+            # the clock's frames time out and the light-sensor telemetry does
+            # too. Prefer `screen/text` (the LCD, 128 characters, nothing else
+            # uses it) while the clock runs; this is for when it is stopped.
             self._scroll_thread = threading.Thread(
                 target=self._scroll,
                 args=(text, parse_colour(str(options.get("colour", "#ffffff"))),
                       parse_colour(str(options.get("background", "#000000"))),
-                      float(options.get("speed", 1.0))),
+                      speed, times),
                 name="lumicube-mqtt-scroll", daemon=True)
             self._scroll_thread.start()
             return
@@ -394,6 +450,18 @@ class MqttBridge:
             except Exception:  # noqa: BLE001 — telemetry may not be up yet
                 log.debug("publishing state failed", exc_info=True)
 
+    @staticmethod
+    def _clamp(value: float, bounds: tuple[float, float]) -> float:
+        """Keep a setting inside the range Home Assistant is offered.
+
+        A command can always arrive from anywhere — an automation, `mosquitto_pub`
+        — so the bounds are enforced here rather than trusted from the sender.
+        A `times` of 0 would scroll nothing and 10000 would hold the link for
+        hours.
+        """
+        low, high = bounds
+        return max(low, min(high, value))
+
     def _brightness_max(self) -> int:
         """The firmware's declared maximum for `display.brightness`.
 
@@ -428,6 +496,12 @@ class MqttBridge:
         if brightness is not None:
             self._publish_state(self._topic("display/brightness"),
                                 int(brightness))
+        # The scroll settings are the bridge's own (nothing on the cube stores
+        # them), so they are published from here rather than read back.
+        self._publish_state(self._topic("display/scroll/speed"),
+                            self.scroll_speed)
+        self._publish_state(self._topic("display/scroll/times"),
+                            self.scroll_times)
         if self._speak_language:
             self._publish_state(self._topic("speaker/language"),
                                 self._speak_language)
@@ -537,6 +611,27 @@ class MqttBridge:
             "min": 0, "max": self._brightness_max(), "step": 5,
             "mode": "slider",
             "icon": "mdi:brightness-6",
+        })
+        # A scroll's two knobs, as settable numbers. They live in the bridge
+        # rather than on the cube, so they are published here and the dashboard
+        # scroll button needs no fields: press it and the message travels the
+        # same way every time. A single `display/scroll` payload can still
+        # override either for that one scroll.
+        self._discover(client, "number", "scroll_speed", {
+            "name": "Scroll speed",
+            "state_topic": self._topic("display/scroll/speed"),
+            "command_topic": self._topic("display/scroll/speed/set"),
+            "min": SCROLL_SPEED_RANGE[0], "max": SCROLL_SPEED_RANGE[1],
+            "step": 0.25, "mode": "slider",
+            "icon": "mdi:speedometer",
+        })
+        self._discover(client, "number", "scroll_times", {
+            "name": "Scroll repeats",
+            "state_topic": self._topic("display/scroll/times"),
+            "command_topic": self._topic("display/scroll/times/set"),
+            "min": SCROLL_TIMES_RANGE[0], "max": SCROLL_TIMES_RANGE[1],
+            "step": 1, "mode": "slider",
+            "icon": "mdi:repeat",
         })
         languages = speaker_module.available_languages()
         if languages:

@@ -263,21 +263,18 @@ class DisplayShim:
 
     def scroll_text(self, text: str, colour: int = WHITE,
                     background_colour: int = BLACK, speed: float = 1.0,
-                    with_gap: bool = True) -> None:
-        """Scroll ``text`` once across the 16x8 LED area."""
+                    with_gap: bool = True, *, times: int = 1) -> None:
+        """Scroll ``text`` across the 16x8 LED area, ``times`` over.
+
+        Upstream scrolled once per call and a script looped if it wanted more
+        (the old clock re-called it every half second, which is why its
+        hourly scroll ran for a whole minute); `times` does that in one call.
+        It defaults to a single pass, as upstream did — the clock's own scroll
+        and the MQTT bridge pass `DEFAULT_SCROLL_TIMES` instead.
+        """
         self._display.scroll_text(text, colour=colour,
                                   background_colour=background_colour,
-                                  speed=speed, with_gap=with_gap)
-
-    # ----- text scroller -----
-
-    def scroll_text(self, text: str, colour: int = WHITE,
-                    background_colour: int = BLACK, speed: float = 1.0,
-                    with_gap: bool = True) -> None:
-        """Scroll ``text`` once across the 16x8 LED area."""
-        self._display.scroll_text(text, colour=colour,
-                                  background_colour=background_colour,
-                                  speed=speed, with_gap=with_gap)
+                                  speed=speed, with_gap=with_gap, times=times)
 
 
 def _coerce_index(key: Any) -> int | None:

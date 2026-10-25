@@ -57,6 +57,12 @@ BRIGHTNESS_KEY = 256
 #: `SetBrightnessAndGamma` heartbeat sets 65).
 MAX_BRIGHTNESS = 100
 
+#: How many times the project's own callers scroll a message by default — the
+#: clock's hourly scroll and the MQTT bridge. The primitive itself defaults to
+#: a single pass; this is what "scroll the time" means to a user, and the two
+#: callers share it so they cannot drift apart.
+DEFAULT_SCROLL_TIMES = 5
+
 #: How many animation frames `scroll_pixels` keeps on the wire. Frames are
 #: sent without waiting for a ServiceResponse (each one costs ~50-100 ms of
 #: latency, which would pin a scroll at a few frames per second), so this is
@@ -290,8 +296,9 @@ class Display:
 
     def scroll_text(self, text: str, colour: int = 0xFFFFFF,
                     background_colour: int = 0x000000, speed: float = 1.0,
-                    with_gap: bool = True, *, timeout: float = 2.0) -> None:
-        """Scroll ``text`` once across the 16x8 LED area (blocking).
+                    with_gap: bool = True, *, times: int = 1,
+                    timeout: float = 2.0) -> None:
+        """Scroll ``text`` across the 16x8 LED area (blocking), ``times`` over.
 
         Renders with the built-in 5x7 font (`pylumicube.font`) — upstream
         drew the same text with PIL and `slkscr.ttf` at size 8, which is
@@ -299,6 +306,11 @@ class Display:
         per column. For a caller that wants its own glyphs (the clock
         scrolls the same 3x5 digits it displays statically), render them
         into an 8-row bitmap and use `scroll_pixels`.
+
+        ``times`` is how many times the whole message travels past; each
+        pass ends with the display blank, so they are separated by one
+        screen-width. See `DEFAULT_SCROLL_TIMES` for what the clock and the
+        MQTT bridge use when nobody says otherwise.
         """
         glyph_rows = font.render_text(text)
         if not glyph_rows or not glyph_rows[0]:
@@ -307,18 +319,21 @@ class Display:
         rows = [blank_row] + [[colour if pixel else 0 for pixel in row]
                               for row in glyph_rows]
         self.scroll_pixels(rows, speed=speed, with_gap=with_gap,
-                           background_colour=background_colour, timeout=timeout)
+                           background_colour=background_colour, times=times,
+                           timeout=timeout)
 
     def scroll_pixels(self, rows: Sequence[Sequence[int]], *,
                       speed: float = 1.0, with_gap: bool = True,
                       background_colour: int = 0x000000,
+                      times: int = 1,
                       timeout: float = 2.0) -> None:
         """Scroll a pre-rendered bitmap across the 16x8 LED area (blocking).
 
         ``rows`` is up to 8 rows of colours, top row first, one entry per
         column; a zero means "background". The bitmap is padded 16 columns
         either side, so it enters from the right and leaves to the left, at
-        ``0.05 / speed`` seconds per column (upstream's timing).
+        ``0.05 / speed`` seconds per column (upstream's timing), ``times``
+        times over.
 
         Frames are **pipelined**, which is what makes this watchable: a
         display write costs ~50-100 ms of *latency* regardless of payload,
@@ -333,6 +348,10 @@ class Display:
         changed are written — a steady-state frame is a few LEDs, not 128.
         A final full frame (sent synchronously) guarantees the end state
         even if a frame was dropped along the way.
+
+        Repeating costs real time on the serial link: the scroll holds it
+        for ``times`` passes, and the clock's frames and the light-sensor
+        telemetry time out meanwhile. Five passes of "16:00" is about 19 s.
         """
         width = max((len(row) for row in rows), default=0)
         if width == 0:
@@ -342,7 +361,14 @@ class Display:
         padded = [[0] * pad + row + [0] * pad for row in padded]
         total = width + pad * 2
         period = 0.05 / max(speed, 0.0001)
+        for _ in range(max(1, int(times))):
+            self._scroll_pass(padded, total, period, with_gap,
+                              background_colour, timeout)
 
+    def _scroll_pass(self, padded: Sequence[Sequence[int]], total: int,
+                     period: float, with_gap: bool, background_colour: int,
+                     timeout: float) -> None:
+        """One pass of `scroll_pixels`: in from the right, out to the left."""
         inflight: list[Future] = []
         previous: dict[tuple[int, int], int] = {}
         current: dict[tuple[int, int], int] = {}

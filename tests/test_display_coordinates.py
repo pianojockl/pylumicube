@@ -262,6 +262,28 @@ def test_scroll_text_emits_frames_and_clears() -> None:
     assert pending is None or pending.done()
 
 
+def test_scroll_repeats_send_the_frames_again() -> None:
+    """`times` is how many times the message travels past. Each pass costs the
+    same frames, which is what makes the count matter: five passes of a long
+    sentence is a half-minute takeover of the serial link."""
+    once, transport_once = _display()
+    once.scroll_pixels([[0xFFFFFF] * 12], speed=1000)
+    thrice, transport_thrice = _display()
+    thrice.scroll_pixels([[0xFFFFFF] * 12], speed=1000, times=3)
+    assert len(transport_thrice.payloads) > 2.5 * len(transport_once.payloads)
+    # Every pass still ends with the display blank, not a stray column.
+    frames = [_led_frame(payload) for payload in transport_thrice.payloads]
+    assert set(frames[-1].values()) == {0x000000}
+
+
+def test_scroll_times_below_one_still_scrolls_once() -> None:
+    """The primitive never does nothing; the bridge clamps to 1 as well, so a
+    `times: 0` over MQTT cannot silently swallow a message."""
+    display, transport = _display()
+    display.scroll_pixels([[0xFFFFFF] * 12], speed=1000, times=0)
+    assert transport.payloads, "times=0 scrolled nothing at all"
+
+
 def test_display_frames_wait_for_the_link_ack_not_a_service_response() -> None:
     """SET_FIELDS responses are unreliable: 22 were lost in an hour on this cube.
 

@@ -46,10 +46,11 @@ class FakeDisplay:
         self.panels.append((panel, [list(row) for row in rows]))
 
     def scroll_text(self, text, colour=0xFFFFFF, speed=1.0, **kwargs):
-        self.scrolls.append((text, colour, speed))
+        self.scrolls.append((text, colour, speed, kwargs.get("times")))
 
     def scroll_pixels(self, rows, *, speed=1.0, **kwargs):
-        self.scrolled_pixels.append(([list(row) for row in rows], speed))
+        self.scrolled_pixels.append(([list(row) for row in rows], speed,
+                                     kwargs.get("times")))
 
     def set_all(self, colour, show=True):
         self.fills.append(colour)
@@ -317,12 +318,24 @@ def test_top_button_scrolls_the_time() -> None:
     instance.poll_buttons(now)
     # The clock scrolls its own 3x5 digits, not the taller built-in font.
     assert cube.display.scrolled_pixels
-    rows, speed = cube.display.scrolled_pixels[0]
+    rows, speed, times = cube.display.scrolled_pixels[0]
     assert speed == clock.SCROLL_SPEED
+    assert times == clock.SCROLL_TIMES == 5       # the shared default
     assert len(rows) == 8
     assert len(rows[0]) == 5 * 4                  # "14:05": 4 columns each
     lit_rows = [index for index, row in enumerate(rows) if any(row)]
     assert lit_rows == [1, 2, 3, 4, 5]            # same rows as the static digits
+
+
+def test_scroll_times_is_configurable(monkeypatch) -> None:
+    """The old script scrolled the time until the minute was over (~60 s);
+    this is the knob that replaced it."""
+    monkeypatch.setattr(clock, "SCROLL_TIMES", 2)
+    instance, cube, _curve = _clock()
+    instance.scroll_time(datetime.datetime(2026, 10, 23, 14, 5))
+    assert cube.display.scrolled_pixels[0][2] == 2
+    assert "SCROLL_TIMES" in clock.CONFIG_NAMES, \
+        "a config file could not change it"
 
 
 def test_scroll_font_firmware_uses_the_builtin_font(monkeypatch) -> None:

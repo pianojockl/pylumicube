@@ -523,19 +523,22 @@ fresh install needs no daemon.
 With a broker configured, the daemon bridges to MQTT, which is how Home
 Assistant drives the cube and reads it back. Discovery creates the entities
 itself: the light sensor, CPU temperature, speaker volume, display
-brightness, a text box that speaks, a **language picker** (its options are the
-languages espeak has on the cube) and the cube's buttons as event entities.
+brightness, how a scroll runs (speed and repeats), a text box that speaks, a
+**language picker** (its options are the languages espeak has on the cube) and
+the cube's buttons as event entities.
 
 Commands are plain payloads where that makes sense and JSON where they need
 options — `lumicube/speaker/say` takes `"hello"` or
-`{"text": ..., "language": "de", "volume": 60}`. The two *settable* values
-publish their state on the bare topic and take commands on `/set`
-(`speaker/volume/set`, `display/brightness/set`, `speaker/language/set`): a
-bridge that listened on both would hear its own state as a command, which is
-exactly the loop that had Home Assistant's volume slider cycling 0/5/10 at
-~25 Hz. `deploy/README.md` §4 has the topic table, and
-`deploy/home-assistant/` the scripts and dashboard that make a control panel
-out of it.
+`{"text": ..., "language": "de", "volume": 60}`, and
+`lumicube/display/scroll` takes `{"text": ..., "speed": 1.0, "times": 5}`.
+The *settable* values publish their state on the bare topic and take commands
+on `/set` (`speaker/volume/set`, `display/brightness/set`,
+`display/scroll/speed/set`, `display/scroll/times/set`,
+`speaker/language/set`): a bridge that listened on both would hear its own
+state as a command, which is exactly the loop that had Home Assistant's volume
+slider cycling 0/5/10 at ~25 Hz. `deploy/README.md` §4 has the topic table,
+and `deploy/home-assistant/` the scripts and dashboard that make a control
+panel out of it.
 
 The light sensor publishes on a slower cadence than the rest: its readings
 wobble by a few percent on their own, so it is throttled to one message a

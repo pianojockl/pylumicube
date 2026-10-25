@@ -54,6 +54,7 @@ from pylumicube.compat import open_or_use_hosted  # noqa: E402
 from pylumicube.constants import SERIAL_DEVICE  # noqa: E402
 from pylumicube.control import ControlError  # noqa: E402
 from pylumicube.dimming import BrightnessCurve, scale_colour  # noqa: E402
+from pylumicube.display import DEFAULT_SCROLL_TIMES  # noqa: E402
 from pylumicube.speaker import resolve_voice  # noqa: E402
 
 #: Control errors that mean the link itself is gone, so the client should
@@ -87,6 +88,9 @@ ALLOW_REBOOT = True        # middle button reboots the Pi
 HOURLY_SCROLL = True       # scroll the time at the top of each hour
 HOURLY_SPEAK = True        # ...and speak it, if a speaker is available
 SCROLL_SPEED = 0.7
+SCROLL_TIMES = DEFAULT_SCROLL_TIMES   # how many times the time scrolls past;
+                                      # 5 is ~19 s at the speed above (the old
+                                      # script re-scrolled for a whole minute)
 SCROLL_FONT = "digits"     # "digits" = the clock's own 3x5 glyphs;
                            # "firmware" = the built-in 5x7 font (taller)
 SPEAKER_VOLUME = 100       # 0..200; the firmware powers up loud, so set it
@@ -141,7 +145,7 @@ CONFIG_NAMES = ("BRIGHTNESS_MIN", "BRIGHTNESS_MAX", "GAMMA", "SMOOTHING", "ADAPT
                 "LOW", "HIGH", "HUE_FOLLOWS_HOUR", "HUE", "SATURATION", "JITTER",
                 "ALLOW_REBOOT", "HOURLY_SCROLL", "HOURLY_SPEAK", "HOUR_WORDS",
                 "CHIME_PHRASE", "SPEAK_LANGUAGE", "SPEAK_LANGUAGES",
-                "SCROLL_SPEED",
+                "SCROLL_SPEED", "SCROLL_TIMES",
                 "SCROLL_FONT", "SPEAKER_VOLUME", "DISPLAY_BRIGHTNESS",
                 "TEMP_SAMPLE_SECONDS", "TEMP_HISTORY", "CHART_REFRESH",
                 "STATUS_INTERVAL", "LIGHT_LOG")
@@ -443,11 +447,12 @@ class AmbientClock:
         colour = scale_colour(hsv_colour(0.25, 1.0, 1.0), self.brightness())
         if SCROLL_FONT == "firmware":
             self.cube.display.scroll_text(now.strftime("%H:%M"), colour,
-                                          speed=SCROLL_SPEED)
+                                          speed=SCROLL_SPEED,
+                                          times=SCROLL_TIMES)
         else:
             self.cube.display.scroll_pixels(
                 render_scroll_rows(now.strftime("%H:%M"), colour),
-                speed=SCROLL_SPEED)
+                speed=SCROLL_SPEED, times=SCROLL_TIMES)
         self._rendered = None      # the scroll overwrote the digits
 
     def say(self, text: str) -> None:

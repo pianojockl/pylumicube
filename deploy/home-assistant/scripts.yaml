@@ -62,22 +62,36 @@ lumicube_scroll:
         text:
     speed:
       name: Speed
-      description: Higher scrolls faster.
+      description: Higher scrolls faster. Empty uses the cube's scroll speed setting.
       required: false
-      default: 1.5
       selector:
         number:
           min: 0.25
           max: 5
           step: 0.25
           mode: box
+    times:
+      name: Repeats
+      description: How many times the text travels past. Empty uses the cube's scroll repeats setting.
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 20
+          step: 1
+          mode: box
   sequence:
     - action: mqtt.publish
       data:
         topic: lumicube/display/scroll
+        # Speed and repeats are only sent when set: absent means "whatever the
+        # cube's scroll settings say", which is what the dashboard button wants.
         payload: >-
           {{ {'text': text or states('input_text.lumicube_say_text'),
-              'colour': colour, 'speed': speed | float} | tojson }}
+              'colour': colour}
+             | combine({'speed': speed | float} if speed else {})
+             | combine({'times': times | int} if times else {})
+             | tojson }}
 
 lumicube_screen_text:
   alias: LumiCube screen text
