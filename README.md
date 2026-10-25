@@ -537,6 +537,12 @@ exactly the loop that had Home Assistant's volume slider cycling 0/5/10 at
 `deploy/home-assistant/` the scripts and dashboard that make a control panel
 out of it.
 
+The light sensor publishes on a slower cadence than the rest: its readings
+wobble by a few percent on their own, so it is throttled to one message a
+minute unless the value really moves (`PYLUMICUBE_MQTT_SENSOR_INTERVAL`,
+`PYLUMICUBE_MQTT_SENSOR_DEADBAND`). The clock's dimming is unaffected — it
+reads the sensor locally, not through MQTT.
+
 `lumicube-do stats` reports the link's health alongside the audio counters —
 queue depth, window occupancy, drops, re-handshakes and latency per frame
 class. A lagging or wedged link raises no errors, so that block is the only way

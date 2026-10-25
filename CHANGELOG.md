@@ -65,6 +65,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they heard: a German sentence spoken in an English voice. A test now
   snapshots the whole command-topic list, because a handler with no
   subscription is dead code.
+- **The light sensor no longer publishes on every tick.** Its readings are
+  32-bit counts that wobble by a few percent on their own (measured on this
+  cube: 464..480, 3.4%), so the skip-unchanged logic could not help and Home
+  Assistant received roughly 0.7 messages a second — about 60k a day — for
+  entities that keep no long-term statistics, churning the recorder instead.
+  (The readings quantise: the value toggles by 16 counts on its own, which is
+  3% of a bright channel but 6.7% of red, so a percentage band alone still
+  chattered.) The analog readings (ambient, red, green, blue) are now
+  published at most
+  once a minute, or earlier if the value moves by more than a deadband
+  percent: `--mqtt-sensor-interval` (default 60) and
+  `--mqtt-sensor-deadband` (default 5), settable as
+  `PYLUMICUBE_MQTT_SENSOR_INTERVAL` / `..._DEADBAND` in `mqtt.env`. The
+  deadband is `max(32 counts, 5% of the reading)` — the floor is twice the
+  measured quantisation, so the sensor's own jitter never counts as a change
+  while a light switched
+  on still shows up at once while daylight drift does not.
+  `within_proximity` is a flag and stays on the fast tick, and the
+  connect-time publish is forced, so Home Assistant is never left with a
+  stale value after a restart.
 - **The link could wedge permanently, and that was the "lag".** The firmware's
   receive sequence only advances when it *accepts* a frame, so one frame it
   never accepts blocks the window for good — everything behind it waits

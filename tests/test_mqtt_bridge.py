@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -225,6 +226,126 @@ def test_an_announcement_is_not_delayed_behind_a_scroll(bridge) -> None:
         assert bridge.cube.said == [("hallo", None, None)],             "the announcement waited for the scroll"
     finally:
         release.set()
+
+
+
+# ----- the light sensor's noisy readings are throttled ---------------------
+
+
+class MutableSensor:
+    """A light sensor whose readings the test can move."""
+
+    def __init__(self) -> None:
+        self.values = {"ambient_light": 1000, "red": 10, "green": 20,
+                       "blue": 30, "within_proximity": 0}
+
+    def get(self, field, default=None):
+        return self.values.get(field, default)
+
+
+class FakeClock:
+    """Replaces the bridge module's `time`: only `monotonic` is faked."""
+
+    def __init__(self, now: list) -> None:
+        self._now = now
+
+    def monotonic(self) -> float:
+        return self._now[0]
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def _sensor_bridge(bridge, monkeypatch, now: list, **kwargs):
+    sensor = MutableSensor()
+    bridge.cube.modules["light_sensor"] = sensor
+    monkeypatch.setattr("pylumicube.mqtt.time", FakeClock(now))
+    for key, value in kwargs.items():
+        setattr(bridge, key, value)
+    return sensor
+
+
+def _count(bridge, topic: str) -> int:
+    return sum(1 for published, _payload, _retain in bridge._client.published  # noqa: SLF001
+               if published == topic)
+
+
+def test_a_noisy_reading_is_throttled_to_the_interval(bridge, monkeypatch) -> None:
+    """1 s ticks of a drifting 32-bit count is ~345k messages a day."""
+    now = [0.0]
+    sensor = _sensor_bridge(bridge, monkeypatch, now)
+    topic = "lumicube/light_sensor/ambient_light"
+
+    bridge._publish_all_state(bridge._client, force=True)   # noqa: SLF001
+    assert _count(bridge, topic) == 1
+
+    now[0] = 1.0
+    sensor.values["ambient_light"] = 1010          # 1%: below the deadband
+    bridge._publish_all_state(bridge._client)               # noqa: SLF001
+    assert _count(bridge, topic) == 1, "a small change slipped through"
+
+    now[0] = 61.0
+    bridge._publish_all_state(bridge._client)               # noqa: SLF001
+    assert _count(bridge, topic) == 2, "the interval did not release it"
+
+
+def test_the_sensors_own_quantisation_does_not_publish(bridge, monkeypatch) -> None:
+    """The reading toggles by 16 counts on its own; on red that is 6.7%, so a
+    percentage band alone would let the channel chatter every tick."""
+    now = [0.0]
+    sensor = _sensor_bridge(bridge, monkeypatch, now)
+    sensor.values["red"] = 240
+    topic = "lumicube/light_sensor/red"
+
+    bridge._publish_all_state(bridge._client, force=True)   # noqa: SLF001
+    for step in (1.0, 2.0, 3.0):
+        now[0] = step
+        sensor.values["red"] = 240 + (16 if int(step) % 2 else 0)
+        bridge._publish_all_state(bridge._client)           # noqa: SLF001
+    assert _count(bridge, topic) == 1, "the 16-count wobble was published"
+
+    sensor.values["red"] = 480                      # a light switched on
+    bridge._publish_all_state(bridge._client)               # noqa: SLF001
+    assert _count(bridge, topic) == 2
+
+
+def test_a_big_change_publishes_before_the_interval(bridge, monkeypatch) -> None:
+    """A light switched on must show up at once, not in a minute."""
+    now = [0.0]
+    sensor = _sensor_bridge(bridge, monkeypatch, now)
+    topic = "lumicube/light_sensor/ambient_light"
+
+    bridge._publish_all_state(bridge._client, force=True)   # noqa: SLF001
+    now[0] = 1.0
+    sensor.values["ambient_light"] = 1500          # 50%: well past 5%
+    bridge._publish_all_state(bridge._client)               # noqa: SLF001
+    assert _count(bridge, topic) == 2
+
+
+def test_proximity_is_not_throttled(bridge, monkeypatch) -> None:
+    """It is a flag, and already change-gated."""
+    now = [0.0]
+    sensor = _sensor_bridge(bridge, monkeypatch, now)
+    topic = "lumicube/light_sensor/within_proximity"
+
+    bridge._publish_all_state(bridge._client, force=True)   # noqa: SLF001
+    now[0] = 1.0
+    sensor.values["within_proximity"] = 1
+    bridge._publish_all_state(bridge._client)               # noqa: SLF001
+    assert _count(bridge, topic) == 2
+
+
+def test_an_interval_of_zero_publishes_on_every_change(bridge, monkeypatch) -> None:
+    now = [0.0]
+    sensor = _sensor_bridge(bridge, monkeypatch, now, sensor_interval=0.0)
+    topic = "lumicube/light_sensor/ambient_light"
+
+    bridge._publish_all_state(bridge._client, force=True)   # noqa: SLF001
+    for step, value in ((1.0, 1001), (2.0, 1002)):
+        now[0] = step
+        sensor.values["ambient_light"] = value
+        bridge._publish_all_state(bridge._client)           # noqa: SLF001
+    assert _count(bridge, topic) == 3
 
 
 def test_the_bridge_subscribes_to_every_command_it_handles(bridge) -> None:

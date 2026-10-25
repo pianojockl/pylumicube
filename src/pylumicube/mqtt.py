@@ -39,6 +39,19 @@ from . import speaker as speaker_module
 
 log = logging.getLogger(__name__)
 
+#: The light sensor's analog readings move almost every tick, so they are
+#: throttled (see `MqttBridge._publish_state`). `within_proximity` is a flag
+#: and already change-gated, so it stays on the fast tick.
+_SLOW_SENSOR_FIELDS = ("ambient_light", "red", "green", "blue")
+
+#: Smallest change, in counts, that counts as a real move. Every channel of
+#: this sensor quantises, and the reading toggles by 16 counts on its own
+#: (measured: ambient 464<->480, red 240<->256): on a bright channel that is
+#: only 3%, but on red it is 6.7%, so a percentage band alone lets a channel
+#: chatter. The floor is twice the measured quantisation, and the percentage
+#: takes over above a reading of 640, where the noise scales with the value.
+_SENSOR_DEADBAND_FLOOR = 32.0
+
 #: How long a single scroll frame waits for its acknowledgement. The default
 #: (2 s) turns a contended scroll into minutes of stalling: one frame per
 #: column, each waiting out its timeout, with the speaker starved meanwhile.
@@ -80,7 +93,8 @@ class MqttBridge:
                  prefix: str = "lumicube", discovery: bool = True,
                  discovery_prefix: str = "homeassistant",
                  client_id: str = "pylumicube", state_interval: float = 1.0,
-                 keepalive: int = 60) -> None:
+                 keepalive: int = 60, sensor_interval: float = 60.0,
+                 sensor_deadband: float = 5.0) -> None:
         self.daemon = daemon
         self.cube = daemon.cube
         self.host = host
@@ -93,6 +107,11 @@ class MqttBridge:
         self.client_id = client_id
         self.state_interval = float(state_interval)
         self.keepalive = int(keepalive)
+        #: Seconds between publishes of the noisy analog readings, and the
+        #: percent change that publishes one early. 1 s ticks of a 32-bit
+        #: light count that drifts every tick is ~345k messages a day.
+        self.sensor_interval = float(sensor_interval)
+        self.sensor_deadband = float(sensor_deadband)
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._client: Any = None
@@ -202,7 +221,7 @@ class MqttBridge:
         for topic in self._command_topics():
             client.subscribe(topic)
         self._publish_discovery(client)
-        self._publish_all_state(client)
+        self._publish_all_state(client, force=True)
 
     def _on_disconnect(self, *args: Any) -> None:
         self._connected.clear()
@@ -357,7 +376,11 @@ class MqttBridge:
         self._publish_state(self._topic("pi/cpu_temp"), round(float(value), 1))
 
     def _state_loop(self) -> None:
-        """Publish the slow-changing state on a timer."""
+        """Publish the state on a timer.
+
+        The analog light readings are throttled inside `_publish_state`;
+        everything else here only changes on command.
+        """
         while not self._stop.wait(self.state_interval):
             if not self._connected.is_set():
                 continue
@@ -366,7 +389,7 @@ class MqttBridge:
             except Exception:  # noqa: BLE001 — telemetry may not be up yet
                 log.debug("publishing state failed", exc_info=True)
 
-    def _publish_all_state(self, client: Any) -> None:
+    def _publish_all_state(self, client: Any, *, force: bool = False) -> None:
         sensor = self.cube.modules.get("light_sensor")
         if sensor is not None:
             for field in ("ambient_light", "red", "green", "blue",
@@ -374,7 +397,8 @@ class MqttBridge:
                 value = sensor.get(field)
                 if value is not None:
                     self._publish_state(self._topic(f"light_sensor/{field}"),
-                                        int(value))
+                                        int(value), force=force,
+                                        slow=field in _SLOW_SENSOR_FIELDS)
         volume = getattr(self.cube.speaker, "volume", None)
         if volume is not None:
             self._publish_state(self._topic("speaker/volume"), int(volume))
@@ -382,10 +406,36 @@ class MqttBridge:
             self._publish_state(self._topic("speaker/language"),
                                 self._speak_language)
 
-    def _publish_state(self, topic: str, value: Any, *, force: bool = False) -> None:
-        """Publish a retained value, skipping an unchanged one."""
-        if not force and self._last_state.get(topic) == value:
+    def _publish_state(self, topic: str, value: Any, *, force: bool = False,
+                       slow: bool = False) -> None:
+        """Publish a retained value, skipping an unchanged one.
+
+        `slow` marks a noisy analog reading: those are published at most once
+        per `sensor_interval`, or earlier if the value moved by more than
+        `sensor_deadband` percent of the last published one — so a light
+        switched on still shows up at once while daylight drift does not. The
+        early exit is what a noisy reading could exploit, which is why the band
+        has a floor (`_SENSOR_DEADBAND_FLOOR`) above the sensor's own
+        quantisation: with the band above the jitter, the interval is what
+        actually paces these messages.
+
+        `force` (used on connect) ignores both, so Home Assistant is never
+        left with a stale value after a daemon restart. An interval of 0
+        disables the throttle.
+        """
+        previous = self._last_state.get(topic)
+        if not force and previous == value:
             return
+        if slow and not force and previous is not None:
+            elapsed = time.monotonic() - self._last_publish.get(topic, 0.0)
+            if elapsed < self.sensor_interval:
+                if self.sensor_deadband <= 0:
+                    band = 1.0          # a deadband of 0 publishes on any change
+                else:
+                    band = max(_SENSOR_DEADBAND_FLOOR,
+                               abs(previous) * self.sensor_deadband / 100.0)
+                if abs(value - previous) < band:
+                    return
         self._last_state[topic] = value
         self._last_publish[topic] = time.monotonic()
         self._publish(topic, value, retain=True)

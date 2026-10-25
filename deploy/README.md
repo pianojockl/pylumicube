@@ -140,6 +140,31 @@ entity, `lumicube-say`, and the clock's chime if it does not set its own),
 start the daemon with `--speak-language de` or set
 `PYLUMICUBE_SPEAK_LANGUAGE=de`.
 
+The light sensor is published on its own, slower cadence. Its readings are
+counts that quantise: the value toggles by 16 counts on its own (measured:
+ambient 464<->480, red 240<->256), which is 3% of a bright channel but 6.7%
+of red — so publishing on every state tick is mostly jitter, and Home
+Assistant keeps no long-term statistics for these entities, so each message
+only churns the recorder. Two settings in `mqtt.env` control it:
+
+```bash
+PYLUMICUBE_MQTT_SENSOR_INTERVAL=60   # seconds between sensor publishes
+PYLUMICUBE_MQTT_SENSOR_DEADBAND=5    # percent change that publishes early
+```
+
+A reading is published when the interval has passed *or* when it moved by
+more than the deadband, so a light switched on still shows up at once while
+daylight drift does not; the interval caps the worst case however noisy the
+reading is. The deadband is `max(32 counts, 5% of the reading)`: the floor is
+twice the measured 16-count quantisation, because a percentage alone lets a
+channel whose value is small (red at 240, where 16 counts is 6.7%) chatter
+every tick. The percentage takes over above a reading of 640, where the
+noise does scale with the value.
+(3.4%) on purpose, so ordinary wobble does not count as a change.
+`within_proximity` is a flag and stays on the fast tick, as do volume,
+brightness and the language (they only change on command). Set
+`..._SENSOR_INTERVAL=0` to publish on every change again.
+
 The two settable values publish their *state* on the bare topic and take
 *commands* on `/set`. Keep it that way: a bridge that listened on both would
 hear its own state as a command, and Home Assistant's number entity would

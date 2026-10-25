@@ -264,6 +264,17 @@ def build_parser() -> "argparse.ArgumentParser":
                         help="publish state but no Home Assistant discovery")
     parser.add_argument("--mqtt-state-interval", type=float, default=1.0,
                         help="seconds between state publishes (default 1)")
+    parser.add_argument("--mqtt-sensor-interval", type=float,
+                        default=float(os.environ.get(
+                            "PYLUMICUBE_MQTT_SENSOR_INTERVAL", "60")),
+                        help="seconds between light-sensor publishes "
+                             "(default 60; 0 publishes on every change)")
+    parser.add_argument("--mqtt-sensor-deadband", type=float,
+                        default=float(os.environ.get(
+                            "PYLUMICUBE_MQTT_SENSOR_DEADBAND", "5")),
+                        help="percent change in a light reading that "
+                             "publishes early, before the interval "
+                             "(default 5)")
     parser.add_argument("--no-mqtt", action="store_true",
                         help="run without the MQTT bridge")
     parser.add_argument("--debug", action="store_true")
@@ -286,7 +297,9 @@ def main(argv: list[str] | None = None) -> int:
                 "username": args.mqtt_username, "password": args.mqtt_password,
                 "prefix": args.mqtt_prefix, "discovery": not args.no_mqtt_discovery,
                 "discovery_prefix": args.mqtt_discovery_prefix,
-                "state_interval": args.mqtt_state_interval}
+                "state_interval": args.mqtt_state_interval,
+                "sensor_interval": args.mqtt_sensor_interval,
+                "sensor_deadband": args.mqtt_sensor_deadband}
     elif not args.no_mqtt:
         log.info("no --mqtt-host given; running without the MQTT bridge")
 
