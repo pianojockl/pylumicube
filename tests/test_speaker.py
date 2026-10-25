@@ -358,3 +358,28 @@ def test_an_unknown_default_language_leaves_the_old_one(monkeypatch) -> None:
     assert set_speak_language("deu") == "de"
     assert set_speak_language("klingon") == "de"
     assert set_speak_language(None) is None
+
+
+# ----- link classification -------------------------------------------------
+
+
+def test_audio_frames_are_classified_so_speech_never_queues() -> None:
+    """The link orders its queue by class: audio first, display last.
+
+    Speech stutters exactly when its frames wait behind display traffic on a
+    busy link, which is what this pins.
+    """
+    calls: list[dict] = []
+
+    def run(samples, **kwargs):
+        calls.append(kwargs)
+        future: Future = Future()
+        future.set_result(b"")
+        return future
+
+    speaker = Speaker(write=None, run=run, read=lambda *a, **k: None, pace=False)
+    speaker.write_pcm(b"\x00\x00" * 224)          # two 112-sample chunks
+
+    assert calls, "nothing was written at all"
+    assert all(call.get("label") == "audio" for call in calls), calls
+    assert all(call.get("droppable") is True for call in calls), calls

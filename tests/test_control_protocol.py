@@ -80,11 +80,14 @@ class FakeSpeaker:
 class FakeTransport:
     def __init__(self) -> None:
         self.frames: list[tuple[int, int, bytes, bool]] = []
+        self.classes: list[tuple[str, bool]] = []
 
     def send_request(self, dest_id: int, type_id: int, payload: bytes,
                      priority: int = 20, timeout: float = 5.0,
-                     expect_response: bool = True) -> Future:
+                     expect_response: bool = True, *, label: str = "control",
+                     droppable: bool = False) -> Future:
         self.frames.append((dest_id, type_id, payload, expect_response))
+        self.classes.append((label, droppable))
         future: Future = Future()
         future.set_result(b"")
         return future
@@ -239,6 +242,13 @@ def test_stats_report_the_audio_counters(server) -> None:
     assert audio["written_chunks"] == 2600
     assert audio["dropped_chunks"] == 14
     assert audio["loss_percent"] == pytest.approx(0.54, abs=0.01)
+
+
+def test_link_stats_is_a_method_not_a_property() -> None:
+    """`stats` calls `cube.link_stats()` — a stray @property breaks the op."""
+    from pylumicube.node import LumiCube
+
+    assert callable(LumiCube.link_stats), "link_stats must be callable"
 
 
 def test_stats_omit_audio_when_there_is_no_speaker(server) -> None:

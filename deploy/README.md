@@ -248,6 +248,10 @@ and `~/AbstractFoundry/` is untouched.
   by hand. Ops: `hello`, `schemas`, `walk`, `subscribe`, `read`, `read_all`,
   `write`, `run`, `frame`, `say`, `tone`, `play`, `stop_audio`, `snapshot`,
   `stats`, `ping`.
+  `stats` also carries `link` (`pending`, `window`, `dropped`, `by_label`,
+  `latency_ms`) and `audio` (`written_chunks`, `dropped_chunks`,
+  `loss_percent`). The link block is how a *lagging* link is seen at all: a
+  queue that is filling raises no errors, it just makes every frame later.
 - **Why the daemon walks the cube board but does not subscribe to it**: the
   drivers resolve their field keys through the board's schema, but the cube
   board's telemetry stream competes with speaker writes for the link

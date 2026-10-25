@@ -179,13 +179,17 @@ class RemoteTransport:
 
     def send_request(self, dest_id: int, type_id: int, payload: bytes,
                      priority: int = 20, timeout: float = 5.0,
-                     expect_response: bool = True) -> Future:
+                     expect_response: bool = True, *,
+                     label: str = "control", droppable: bool = False) -> Future:
         future = self._client.control.request_async(
             "frame",
             dest_id=int(dest_id),
             type_id=int(type_id),
             payload=_b64encode(payload),
             expect_response=bool(expect_response),
+            priority=int(priority),
+            label=label,
+            droppable=bool(droppable),
             wait=bool(expect_response),
             timeout=float(timeout),
         )

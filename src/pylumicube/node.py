@@ -173,6 +173,16 @@ class LumiCube:
 
     # ---------------- public accessors ----------------
 
+    def link_stats(self) -> dict[str, object]:
+        """Serial link queue depth and latency, or {} when it is not open.
+
+        The daemon surfaces this in its `stats` op: a lagging link still
+        delivers every frame, so nothing appears in the logs — `pending` is
+        the number that shows a queue building up behind the link.
+        """
+        link = self._link
+        return link.stats() if link is not None else {}
+
     @property
     def link(self) -> SerialLink:
         if self._link is None:
@@ -457,7 +467,8 @@ class LumiCube:
     def write_run(self, module_name: str, field_name: str,
                   values: Iterable[int], *, timeout: float = 2.0,
                   await_response: bool = False,
-                  wait: bool = True) -> "Future | None":
+                  wait: bool = True, label: str = "control",
+                  droppable: bool = False) -> "Future | None":
         """Fast path for streaming: write a contiguous run starting at a field.
 
         `values[i]` goes to `field + i`, which is how the speaker's 112-sample
@@ -471,7 +482,8 @@ class LumiCube:
         payload = flat_dictionary.serialise_run(ref.key, values, ref.spec)
         future = self._transport.send_request(
             dest_id=ref.node_id, type_id=TYPE_SET_FIELDS, payload=payload,
-            timeout=timeout, expect_response=await_response)
+            timeout=timeout, expect_response=await_response,
+            label=label, droppable=droppable)
         if not wait:
             return future
         future.result(timeout=timeout)

@@ -49,6 +49,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not even restart.
 
 ### Fixed
+- **Speech stuttering while other traffic was on the link, and intermittent
+  display lag** — both from comparing this implementation against the original
+  daemon's source (`lumicube-daemon-2024`, 99 Java files: `serial/`,
+  `uavcan/`, `server/method/`, `heartbeat/`, `audio/`). Three differences
+  mattered:
+  - **The queue was unbounded.** `SerialLink.submit()` appended to a plain
+    list, so when callers outpaced the link every frame's latency grew without
+    limit. Upstream refuses instead (`ServiceTable` allows 32 concurrent
+    requests per type+node, then `BackoffException` → the display retries
+    later). The queue is now ordered by frame class (**audio, then control,
+    then display**) and bounded at 64: a droppable frame is dropped, the
+    *oldest* first, while reliable frames never are. Measured during a matrix
+    scroll with an announcement playing: **the announcement went from losing
+    every chunk to 5 of 1225 (0.41 %)**, with 1274 display frames shed to keep
+    latency bounded.
+  - **Display writes waited for a ServiceResponse the firmware often does not
+    send** (22 lost in an hour, `no response for type_id=216`), each costing a
+    2 s timeout on a frame that had arrived. Upstream blocked on the *link*
+    acknowledgement. Display writes are now ACK-level; the link retransmits
+    until the firmware ACKs, so delivery is still guaranteed.
+  - **Retransmission was 4× too slow** — 50 ms against upstream's 12.5 ms
+    (`CURSOR_RESET_DELAY_NANOSECONDS`) — so every lost frame stalled its
+    waiter four times longer than necessary.
+- **The lag is now measurable.** `stats` reports the link's `pending` depth,
+  window occupancy, drop count, per-class breakdown, and submit→ACK latency
+  percentiles — upstream's `inboxBacklog()`/`outboxBacklog()` equivalent. A
+  queueing lag raises no errors, so without this number it is invisible: at
+  rest on this cube the round trip is **p50 19.6 ms, p90 72 ms, max 84 ms**.
+
+### Fixed
 - **The hourly chime said "sixteen o'clock".** It handed espeak-ng the raw
   24-hour number (`f"it's {now.hour} o'clock"`), and espeak reads a bare
   number literally — verified with its phoneme output: `it's 16 o'clock` →

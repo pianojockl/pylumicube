@@ -199,23 +199,29 @@ def test_display_scroll_takes_text_and_options(bridge) -> None:
     assert len(bridge.cube.display.scrolls) == 2, "empty text scrolled"
 
 
-def test_a_scroll_waits_for_the_speaker(bridge) -> None:
-    """Scroll and speech must not overlap: on the shared link they starve.
+def test_an_announcement_is_not_delayed_behind_a_scroll(bridge) -> None:
+    """Speech is served first on the link, so it must not wait for a scroll.
 
-    Measured on the cube: run together, a 21-character message was still
-    scrolling 90 s later while the announcement dropped every chunk.
+    The two used to be kept apart by holding the speaker's lock for the whole
+    scroll, which meant an announcement waited for it. The link orders its
+    queue by frame class instead, so this is now a property of the link
+    rather than of the bridge's threading.
     """
-    lock = threading.RLock()
-    bridge.daemon.server = SimpleNamespace(audio_lock=lock)
-    lock.acquire()                        # pretend a `say` is in progress
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_scroll(*args, **kwargs):
+        started.set()
+        release.wait(5)
+
+    bridge.cube.display.scroll_text = slow_scroll
+    bridge._handle_command("display/scroll", "a long message")
+    assert started.wait(2), "the scroll never started"
     try:
-        bridge._handle_command("display/scroll", "hello")
-        bridge._scroll_thread.join(timeout=0.3)
-        assert bridge.cube.display.scrolls == [], "scrolled over the speaker"
+        bridge._handle_command("speaker/say", "hallo")
+        assert bridge.cube.said == [("hallo", None, None)],             "the announcement waited for the scroll"
     finally:
-        lock.release()
-    bridge._scroll_thread.join(timeout=5)
-    assert bridge.cube.display.scrolls[-1][0] == "hello"
+        release.set()
 
 
 def test_say_takes_a_language(bridge) -> None:

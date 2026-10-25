@@ -28,8 +28,6 @@ entities for the cube's buttons.
 
 from __future__ import annotations
 
-import contextlib
-
 import json
 import logging
 import threading
@@ -148,20 +146,21 @@ class MqttBridge:
     # ---------------- paho callbacks ----------------
 
     def _scroll(self, text: str, colour: int, background: int, speed: float) -> None:
-        """Scroll `text` on the 16x8 matrix, one utterance at a time.
+        """Scroll `text` on the 16x8 matrix, in the background.
 
-        The matrix and the speaker share the serial link, and a scroll is one
-        frame per column. Run alongside speech, each frame waits out its
-        timeout and the two starve each other — measured: a 21-character
-        message was still scrolling 90 s later while the announcement dropped
-        every chunk. The clock never hits this because it scrolls *then*
-        speaks; taking the same lock as `say` makes that sequencing a
-        property of the daemon rather than of whoever publishes the topics.
+        A scroll is one frame per column and the firmware services one request
+        at a time, so it is heavy traffic on a link shared with the clock and
+        the speaker. It used to hold the speaker's lock to keep the two apart
+        (run together they starved each other: a 21-character message was
+        still scrolling 90 s later while the announcement dropped every
+        chunk). The link's queue is ordered by frame class now, so speech is
+        served first on its own merits and the scroll simply takes longer —
+        which is the right trade, and it keeps an announcement from waiting
+        for a scroll to finish. The short frame timeout keeps a contended
+        scroll from retrying its way through the whole alphabet.
         """
-        lock = getattr(getattr(self.daemon, "server", None), "audio_lock", None)
-        with (lock if lock is not None else contextlib.nullcontext()):
-            self.cube.display.scroll_text(text, colour, background, speed,
-                                          timeout=SCROLL_FRAME_TIMEOUT)
+        self.cube.display.scroll_text(text, colour, background, speed,
+                                      timeout=SCROLL_FRAME_TIMEOUT)
 
     def _command_topics(self) -> tuple[str, ...]:
         """The topics we listen on — commands only, never our own state.

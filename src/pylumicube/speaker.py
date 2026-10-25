@@ -385,9 +385,15 @@ class Speaker:
             samples.frombytes(chunk)
             try:
                 if self._run is not None:
+                    # Classified as audio: the link's queue is ordered by class,
+                    # so a speech frame is never stuck behind display frames —
+                    # which is what makes speech stutter when other traffic is
+                    # on the link. Droppable because a late audio chunk is
+                    # worthless anyway (the schedule is absolute).
                     future = self._run(samples, timeout=self.timeout,
                                        await_response=self.await_response,
-                                       wait=False)
+                                       wait=False, label="audio",
+                                       droppable=True)
                 else:
                     values: dict[str, int] = {
                         f"data+{index}": sample for index, sample in enumerate(samples)

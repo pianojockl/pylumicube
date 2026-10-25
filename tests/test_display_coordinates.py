@@ -37,12 +37,15 @@ class RecordingTransport:
         self.payloads: list[bytes] = []
         self.fail = False
         self.expect_response: list[bool] = []
+        self.classes: list[tuple[str, bool]] = []
 
     def send_request(self, dest_id: int, type_id: int, payload: bytes,
                      timeout: float = 5.0, priority: int = 20,
-                     expect_response: bool = True) -> Future:
+                     expect_response: bool = True, *, label: str = "control",
+                     droppable: bool = False) -> Future:
         assert type_id == TYPE_SET_FIELDS
         self.expect_response.append(expect_response)
+        self.classes.append((label, droppable))
         future: Future = Future()
         if self.fail:
             future.set_exception(TimeoutError("nope"))
@@ -71,9 +74,11 @@ class DeferredTransport(RecordingTransport):
 
     def send_request(self, dest_id: int, type_id: int, payload: bytes,
                      timeout: float = 5.0, priority: int = 20,
-                     expect_response: bool = True) -> Future:
+                     expect_response: bool = True, *, label: str = "control",
+                     droppable: bool = False) -> Future:
         assert type_id == TYPE_SET_FIELDS
         self.expect_response.append(expect_response)
+        self.classes.append((label, droppable))
         self.payloads.append(payload)
         future: Future = Future()
         self.pending.append(future)
@@ -151,6 +156,14 @@ def test_set_led_delegates() -> None:
     display.set_led(0, 0, 0x123456, await_ack=True)
     values = flat_dictionary.deserialise(transport.payloads[-1], display_specs())
     assert values[LED_KEY_OFFSET + 63] == 0x123456
+
+
+def test_display_frames_are_classified_for_the_link_queue() -> None:
+    """Display frames are droppable, so a busy link drops them instead of
+    letting them pile up behind the audio (and behind each other)."""
+    display, transport = _display()
+    display.set_led(0, 0, 0x123456, await_ack=True)
+    assert transport.classes == [("display", True)]
 
 
 def test_set_all_fills_every_led() -> None:
@@ -237,17 +250,18 @@ def test_scroll_text_emits_frames_and_clears() -> None:
     assert pending is None or pending.done()
 
 
-def test_scroll_frames_do_not_wait_for_a_service_response() -> None:
-    """Every animation frame is sent fire-and-forget (the speaker's mode).
+def test_display_frames_wait_for_the_link_ack_not_a_service_response() -> None:
+    """SET_FIELDS responses are unreliable: 22 were lost in an hour on this cube.
 
-    Waiting for each frame's ServiceResponse costs ~50-100 ms of latency,
-    which is what made the scroll crawl.
+    Waiting for one costs a full timeout on a frame that *has* arrived, which
+    is the intermittent lag. Every display write — the scroll's exact end
+    frame included — waits only for the link's acknowledgement, which the
+    link guarantees by retransmitting until the firmware ACKs.
     """
     display, transport = _display()
     display.scroll_pixels([[0xFFFFFF] * 12], speed=1000)
-    assert transport.expect_response
-    assert not any(transport.expect_response[:-1])     # all but the last frame
-    assert transport.expect_response[-1] is True       # the final full frame waits
+    assert transport.expect_response, "nothing was sent"
+    assert not any(transport.expect_response), "a frame waited for a response"
 
 
 def test_scroll_pipelines_frames_without_blocking() -> None:

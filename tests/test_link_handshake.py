@@ -13,6 +13,8 @@ import time
 
 import pytest
 
+from concurrent.futures import Future
+
 import pylumicube.framing as framing
 import pylumicube.link as link_module
 from pylumicube.constants import (
@@ -24,6 +26,7 @@ from pylumicube.constants import (
     CMD_PONG,
     FLUSH_COUNT,
     PROTOCOL_VERSION,
+    WINDOW_SIZE,
 )
 
 
@@ -203,3 +206,79 @@ def test_handshake_and_message(fake_link, monkeypatch):
             link.stop()
     finally:
         cube.stop()
+
+
+# ----- metrics -------------------------------------------------------------
+
+
+def test_link_stats_report_queue_depth_and_latency() -> None:
+    """A lagging link raises nothing, so the queue depth is the only tell."""
+    link = link_module.SerialLink("/dev/null", message_handler=None)
+    assert link.stats()["pending"] == 0
+    assert link.stats()["latency_ms"] == {"p50": 0.0, "p90": 0.0,
+                                          "p99": 0.0, "max": 0.0}
+
+    link._running = True                                    # noqa: SLF001
+    for _ in range(7):
+        link.submit(b"payload", label="display", droppable=True)
+    link._latencies_ms.extend([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+    link._completed = 10                                    # noqa: SLF001
+
+    stats = link.stats()
+    assert stats["pending"] == 7, "the queue depth is the lag metric"
+    assert stats["window_size"] == WINDOW_SIZE
+    assert stats["completed"] == 10
+    assert stats["latency_ms"]["p50"] == 6.0
+    assert stats["latency_ms"]["max"] == 10.0
+    assert stats["latency_ms"]["p99"] >= stats["latency_ms"]["p90"]
+    assert stats["by_label"] == {"display": 7}
+
+
+def _drain(link) -> list[bytes]:
+    """Pop the queue the way the egress driver does."""
+    import heapq
+    order = []
+    with link._pending_lock:                                # noqa: SLF001
+        while link._pending:                                # noqa: SLF001
+            order.append(heapq.heappop(link._pending).payload)   # noqa: SLF001
+    return order
+
+
+def test_audio_jumps_ahead_of_display_frames() -> None:
+    """Speech must not queue behind LEDs — that is the audible stutter."""
+    link = link_module.SerialLink("/dev/null", message_handler=None)
+    link._running = True                                    # noqa: SLF001
+    link.submit(b"display-1", label="display", droppable=True)
+    link.submit(b"audio", label="audio", droppable=True)
+    link.submit(b"display-2", label="display", droppable=True)
+    assert _drain(link) == [b"audio", b"display-1", b"display-2"]
+
+
+def test_a_full_queue_drops_the_oldest_droppable_frame() -> None:
+    """Bounded latency: drop rather than fall further behind."""
+    bound = link_module.SerialLink._MAX_PENDING             # noqa: SLF001
+    link = link_module.SerialLink("/dev/null", message_handler=None)
+    link._running = True                                    # noqa: SLF001
+    for index in range(bound):
+        link.submit(f"display-{index}".encode(), label="display",
+                    droppable=True)
+    link.submit(b"display-new", label="display", droppable=True)
+
+    stats = link.stats()
+    assert stats["pending"] == bound, "the queue grew past its bound"
+    assert stats["dropped"] == 1
+    remaining = _drain(link)
+    assert b"display-0" not in remaining, "the oldest frame should go, not the newest"
+    assert b"display-new" in remaining
+
+
+def test_a_reliable_frame_is_never_dropped() -> None:
+    """Control ops would rather wait than lose their answer."""
+    bound = link_module.SerialLink._MAX_PENDING             # noqa: SLF001
+    link = link_module.SerialLink("/dev/null", message_handler=None)
+    link._running = True                                    # noqa: SLF001
+    for index in range(bound + 8):
+        link.submit(f"control-{index}".encode(), label="control")
+    stats = link.stats()
+    assert stats["dropped"] == 0
+    assert stats["pending"] == bound + 8

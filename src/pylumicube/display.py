@@ -370,6 +370,8 @@ class Display:
                 payload=payload,
                 timeout=timeout,
                 expect_response=False,
+                label="display",
+                droppable=True,
             )
         if future is None:  # pragma: no cover - empty frame
             future = Future()
@@ -467,8 +469,16 @@ class Display:
                 type_id=TYPE_SET_FIELDS,
                 payload=payload,
                 timeout=timeout,
+                # Wait for the *link* acknowledgement, not the service
+                # response. The firmware services SET_FIELDS but does not
+                # always answer it — measured on this cube, 22 lost responses
+                # in an hour — and each one used to cost a full timeout here
+                # (2 s) for a frame that had in fact arrived. The Java daemon
+                # blocked on the ACK for exactly this reason.
+                expect_response=False,
+                label="display",
+                droppable=True,
             )
-            # Java returns empty body on SET_FIELDS success; we just block for ACK.
             future.result(timeout=timeout)
 
 

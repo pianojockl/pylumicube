@@ -13,12 +13,14 @@ the frame is ACKed (or rejected, e.g. on shutdown).
 
 from __future__ import annotations
 
+import heapq
 import logging
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import serial  # pyserial
 
@@ -43,16 +45,53 @@ log = logging.getLogger(__name__)
 MessageHandler = Callable[[bytes], None]
 
 
+@dataclass(order=True)
+class _Queued:
+    """A submitted frame waiting for a window slot.
+
+    Ordered by `priority` (lower first, as on the wire), then by arrival, so
+    audio at priority 0 is pulled before display traffic at 20 — upstream used
+    a single FIFO and relied on its bounded service table to keep the queue
+    short, which is why a stutter shows up when the queue grows.
+    """
+
+    priority: int
+    order: int
+    payload: bytes = field(compare=False, default=b"")
+    future: Future = field(compare=False, default=None)      # type: ignore[assignment]
+    submitted_ns: int = field(compare=False, default=0)
+    label: str = field(compare=False, default="control")
+    droppable: bool = field(compare=False, default=False)
+
+
 @dataclass
 class _Slot:
     payload: bytes = b""              # raw uavcan body (without seq)
     encoded: bytes = b""              # full COBS-framed bytes (including seq+CRC+delimiter)
     last_sent_ns: int = 0
     future: Future | None = None
+    submitted_ns: int = 0             # when the caller handed it to `submit()`
+
+
+#: Result of a future whose frame the link dropped instead of queueing it
+#: (only ever `droppable` frames, and only when the queue is over its bound).
+DROPPED = "dropped"
+
+
+class LinkBusy(RuntimeError):
+    """The link refused a frame because its queue is full."""
 
 
 class HandshakeError(RuntimeError):
     pass
+
+
+#: Local queue order by frame class. The *wire* priority stays at upstream's 20
+#: for everything (it is inert on a point-to-point link, and the firmware's
+#: handling of it is untested), so this is purely about which frame the link
+#: picks up next: real-time audio first, then control ops, then the bulk display
+#: traffic that can afford to wait and be dropped.
+_QUEUE_ORDER = {"audio": 0, "control": 1, "display": 2}
 
 
 class SerialLink:
@@ -63,7 +102,16 @@ class SerialLink:
     # Idle period when egress window is empty after handshake.
     _IDLE_PERIOD_S = 0.05
     # Retransmit a slot if it has not been ACKed within this many seconds.
-    _RETRANSMIT_AFTER_S = 0.05
+    # Upstream's equivalent (`CURSOR_RESET_DELAY_NANOSECONDS`) is 12.5 ms, and
+    # a lost frame is on the critical path for whatever is waiting on it.
+    _RETRANSMIT_AFTER_S = 0.0125
+    # Latency samples kept for the percentiles in `stats()` (a fixed window).
+    _LATENCY_SAMPLES = 256
+    #: Queue bound. Reliable frames are never dropped, but a droppable one is
+    #: dropped once the queue is this deep — bounded latency instead of the
+    #: ever-growing delay an unbounded queue produces. Upstream refuses the
+    #: same way ("Busy, retry later"); this is the same rule, applied locally.
+    _MAX_PENDING = 64
 
     def __init__(self, port: str, baudrate: int = BAUD,
                  message_handler: MessageHandler | None = None) -> None:
@@ -83,7 +131,17 @@ class SerialLink:
         self._egress_initialised = False
         self._countdown = FLUSH_COUNT
         self._slots: list[_Slot] = [_Slot() for _ in range(256)]
-        self._pending: list[tuple[bytes, Future]] = []
+        self._pending: list[_Queued] = []
+        self._order = 0                    # arrival counter, for stable ordering
+        self._dropped = 0
+
+        # Metrics for `stats()`: the queue depth is what turns a busy link into
+        # a *lagging* one, and it is invisible without a number. Upstream
+        # exposes the same thing (`inboxBacklog()`, `outboxBacklog()`,
+        # `collectorBacklog()`).
+        self._submitted = 0
+        self._completed = 0
+        self._latencies_ms: deque[float] = deque(maxlen=self._LATENCY_SAMPLES)
         self._pending_lock = threading.Lock()
 
         # Ingress state (mirrors IngressThread.java)
@@ -136,9 +194,9 @@ class SerialLink:
             self._serial = None
         # Cancel any unresolved futures
         with self._pending_lock:
-            for _, fut in self._pending:
-                if not fut.done():
-                    fut.set_exception(RuntimeError("link stopped"))
+            for entry in self._pending:
+                if not entry.future.done():
+                    entry.future.set_exception(RuntimeError("link stopped"))
             self._pending.clear()
         for slot in self._slots:
             if slot.future is not None and not slot.future.done():
@@ -148,15 +206,48 @@ class SerialLink:
             slot.last_sent_ns = 0
             slot.future = None
 
-    def submit(self, uavcan_payload: bytes) -> Future:
-        """Enqueue a MESSAGE for transmission. Returns a Future that resolves
-        when the MCU ACKs the frame."""
+    def submit(self, uavcan_payload: bytes, *, label: str = "control",
+               droppable: bool = False) -> Future:
+        """Enqueue a MESSAGE for transmission; the Future resolves on ACK.
+
+        `label` is the frame's class ("audio", "control", "display") and
+        decides the order the link picks frames up in, so real-time audio is
+        not stuck behind display frames. `droppable` marks frames whose loss
+        is survivable: when the queue is over `_MAX_PENDING` the oldest such
+        frame is dropped instead of queueing, which keeps latency bounded.
+        Reliable frames are never dropped — they would rather wait.
+        """
         if not self._running:
             raise RuntimeError("link not started")
         fut: Future = Future()
         with self._pending_lock:
-            self._pending.append((uavcan_payload, fut))
+            entry = _Queued(_QUEUE_ORDER.get(label, 1), self._order,
+                            uavcan_payload, fut, time.monotonic_ns(),
+                            label, droppable)
+            self._order += 1
+            if droppable and len(self._pending) >= self._MAX_PENDING:
+                victim = self._oldest_droppable()
+                if victim is not None:
+                    self._pending.remove(victim)
+                    heapq.heapify(self._pending)
+                    victim.future.set_result(DROPPED)
+                    self._dropped += 1
+            heapq.heappush(self._pending, entry)
+            self._submitted += 1
         return fut
+
+    def _oldest_droppable(self) -> "_Queued | None":
+        """The droppable frame that has waited longest (caller holds the lock).
+
+        The *oldest*, not the newest: for a display the freshest frame is the
+        one worth showing, and for audio the schedule is absolute, so a stale
+        chunk is worthless either way.
+        """
+        victim: _Queued | None = None
+        for entry in self._pending:
+            if entry.droppable and (victim is None or entry.order < victim.order):
+                victim = entry
+        return victim
 
     def set_message_handler(self, handler: MessageHandler) -> None:
         self._message_handler = handler
@@ -245,10 +336,15 @@ class SerialLink:
                 slot = self._slots[cursor]
                 if slot.future is not None and not slot.future.done():
                     slot.future.set_result(None)
+                if slot.submitted_ns:
+                    self._latencies_ms.append(
+                        (time.monotonic_ns() - slot.submitted_ns) / 1e6)
+                    self._completed += 1
                 slot.payload = b""
                 slot.encoded = b""
                 slot.last_sent_ns = 0
                 slot.future = None
+                slot.submitted_ns = 0
                 cursor = (cursor + 1) & 0xFF
             self._head = new_head
 
@@ -284,13 +380,14 @@ class SerialLink:
         # Pull pending submits into the window
         with self._pending_lock:
             while self._pending and ((self._tail - self._head) & 0xFF) < WINDOW_SIZE:
-                payload, fut = self._pending.pop(0)
+                entry = heapq.heappop(self._pending)
                 seq = self._tail
                 slot = self._slots[seq]
-                slot.payload = payload
-                slot.encoded = framing.build_message(payload, seq)
+                slot.payload = entry.payload
+                slot.encoded = framing.build_message(entry.payload, seq)
                 slot.last_sent_ns = 0
-                slot.future = fut
+                slot.future = entry.future
+                slot.submitted_ns = entry.submitted_ns
                 self._tail = (self._tail + 1) & 0xFF
 
         # Transmit slots that have never been sent or whose retry timer expired.
@@ -323,9 +420,48 @@ class SerialLink:
                 log.exception("write failure")
                 self._running = False
 
+    def stats(self) -> dict[str, object]:
+        """Queue depth and submit-to-ACK latency, for the daemon's `stats`.
+
+        A lagging link does not raise: frames still arrive, just later, so
+        nothing shows up in the logs. `pending` is the number that does show
+        it — if it grows, callers are outpacing the link and every frame's
+        latency grows with it.
+        """
+        with self._pending_lock:
+            pending = len(self._pending)
+        samples = sorted(self._latencies_ms)
+
+        def percentile(fraction: float) -> float:
+            if not samples:
+                return 0.0
+            index = min(len(samples) - 1, int(len(samples) * fraction))
+            return round(samples[index], 2)
+
+        return {
+            "pending": pending,
+            "window": (self._tail - self._head) & 0xFF,
+            "window_size": WINDOW_SIZE,
+            "submitted": self._submitted,
+            "completed": self._completed,
+            "dropped": self._dropped,
+            "by_label": _count_labels(self._pending),
+            "latency_ms": {"p50": percentile(0.5), "p90": percentile(0.9),
+                           "p99": percentile(0.99),
+                           "max": round(samples[-1], 2) if samples else 0.0},
+        }
+
     def _has_pending(self) -> bool:
         with self._pending_lock:
             return bool(self._pending)
+
+
+def _count_labels(entries: "list[_Queued]") -> dict[str, int]:
+    """How much of the queue is audio, display, control — the lag breakdown."""
+    counts: dict[str, int] = {}
+    for entry in entries:
+        counts[entry.label] = counts.get(entry.label, 0) + 1
+    return counts
 
 
 def _in_window(seq: int, head: int, tail: int) -> bool:

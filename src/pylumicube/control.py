@@ -544,6 +544,8 @@ class ControlServer:
                     payload=_b64decode(str(request.get("payload", ""))),
                     timeout=float(request.get("timeout", 2.0)),
                     expect_response=bool(request.get("expect_response", True)),
+                    label=str(request.get("label", "control")),
+                    droppable=bool(request.get("droppable", False)),
                 )
                 if request.get("wait", True) and future is not None:
                     future.result(timeout=float(request.get("timeout", 2.0)) + 1.0)
@@ -608,6 +610,8 @@ class ControlServer:
                        "telemetry": telemetry.stats() if hasattr(telemetry, "stats") else {},
                        "subscriptions": sorted(connection.subscriptions)}
             payload["audio"] = _audio_stats(cube)
+            payload["link"] = (cube.link_stats()
+                               if hasattr(cube, "link_stats") else {})
             return payload
 
         raise ControlError(f"unknown op {op!r}", code="no_op")

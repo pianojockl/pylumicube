@@ -80,7 +80,8 @@ class Transport:
     def send_request(self, dest_id: int, type_id: int, payload: bytes,
                      priority: int = DEFAULT_PRIORITY,
                      timeout: float = 5.0,
-                     expect_response: bool = True) -> Future:
+                     expect_response: bool = True, *,
+                     label: str = "control", droppable: bool = False) -> Future:
         """Send a service request.
 
         With `expect_response=True` (the default) the returned future
@@ -103,7 +104,7 @@ class Transport:
                 inflight_key = (dest_id, type_id, transfer_id)
                 self._inflight[inflight_key] = response_fut
         body = u.pack_message(transfer_id, message_id, payload)
-        link_fut = self._link.submit(body)
+        link_fut = self._link.submit(body, label=label, droppable=droppable)
 
         if not expect_response:
             return link_fut
