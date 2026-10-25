@@ -93,8 +93,10 @@ def test_set_panel_invalid_name() -> None:
 def test_brightness_round_trip_via_property() -> None:
     shim, fake = _make_shim()
     shim.brightness = 50
-    # 50/100 → 128/255 (rounded)
-    fake.set_brightness.assert_called_once_with(128)
+    # Upstream's scale *is* the wire scale: the firmware declares 0..100 for
+    # display.brightness. This used to scale to 0..255, which made every
+    # script 2.55x brighter than it asked for.
+    fake.set_brightness.assert_called_once_with(50)
     assert shim.brightness == 50
 
 

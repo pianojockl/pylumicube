@@ -38,7 +38,7 @@ views:
       - type: grid
         cards:
           - type: heading
-            heading: Anzeige
+            heading: LED-Matrix
             icon: mdi:led-strip-variant
           - type: entities
             entities:
@@ -52,6 +52,12 @@ views:
             tap_action:
               action: perform-action
               perform_action: script.lumicube_scroll
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: Display (LCD)
+            icon: mdi:monitor
           - type: custom:mushroom-template-card
             primary: Auf dem LCD zeigen
             secondary: Text aufs Display

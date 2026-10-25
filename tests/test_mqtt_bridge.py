@@ -58,14 +58,19 @@ class FakeScreen:
 class FakeDisplay:
     def __init__(self) -> None:
         self.fills: list[int] = []
-        self.brightness: list[int] = []
+        self.writes: list[int] = []            # every set_brightness call
+        self.brightness: int | None = None     # what the matrix is at
         self.scrolls: list[tuple] = []
 
     def fill(self, colour: int) -> None:
         self.fills.append(colour)
 
     def set_brightness(self, value: int) -> None:
-        self.brightness.append(value)
+        self.writes.append(value)
+        self.brightness = value
+
+    def note_brightness(self, value: int) -> None:
+        self.brightness = max(0, min(100, int(value)))
 
     def scroll_text(self, text, colour=0xFFFFFF, background=0x000000, speed=1.0,
                     timeout=None) -> None:
@@ -418,10 +423,50 @@ def test_screen_commands(bridge) -> None:
 
 def test_display_commands(bridge) -> None:
     bridge._handle_command("display/fill", "#00ff00")
-    bridge._handle_command("display/brightness", "128")
+    bridge._handle_command("display/brightness", "60")
     assert bridge.cube.display.fills == [0x00FF00]
-    assert bridge.cube.display.brightness == [128]
-    assert bridge._client.topics()["lumicube/display/brightness"] == 128
+    assert bridge.cube.display.writes == [60]
+    assert bridge._client.topics()["lumicube/display/brightness"] == 60
+
+
+def _display_module(max_value):
+    """Stands in for the display module: only the declared range is read."""
+    return SimpleNamespace(refs={"brightness": SimpleNamespace(
+        spec=SimpleNamespace(min_value=None, max_value=max_value))})
+
+
+def test_the_brightness_command_is_clamped_to_the_firmware_range(bridge) -> None:
+    """The wire would carry 255, but the firmware caps the field at 100 — so
+    echoing the request back would leave Home Assistant showing a brightness
+    the matrix is not at."""
+    bridge._handle_command("display/brightness/set", "200")
+    assert bridge.cube.display.writes == [100]
+    assert bridge._client.topics()["lumicube/display/brightness"] == 100
+
+
+def test_the_brightness_range_comes_from_the_firmware(bridge) -> None:
+    """Not hardcoded: if the firmware ever declares a different ceiling, the
+    slider and the clamp both follow it."""
+    bridge.cube.modules["display"] = _display_module(80)
+    assert bridge._brightness_max() == 80             # noqa: SLF001
+    bridge._handle_command("display/brightness/set", "200")
+    assert bridge.cube.display.writes == [80]
+
+
+def test_the_brightness_state_is_the_one_on_the_matrix(bridge) -> None:
+    """A client writing through the control socket — the clock re-asserts its
+    own at startup — has to reach Home Assistant, or the slider lies."""
+    bridge.cube.display.note_brightness(40)
+    bridge._publish_all_state(bridge._client)         # noqa: SLF001
+    assert bridge._client.topics()["lumicube/display/brightness"] == 40
+
+
+def test_an_unknown_brightness_publishes_nothing(bridge) -> None:
+    """Nothing has set it, so there is no honest value to report — and the
+    firmware cannot be asked without a wire round-trip."""
+    assert bridge.cube.display.brightness is None
+    bridge._publish_all_state(bridge._client)         # noqa: SLF001
+    assert "lumicube/display/brightness" not in bridge._client.topics()
 
 
 def test_unknown_command_is_ignored(bridge) -> None:
@@ -485,6 +530,13 @@ def test_discovery_covers_the_entities_ha_should_create(bridge) -> None:
     assert button["event_types"] == ["press"]
     temperature = configs["homeassistant/sensor/pylumicube/cpu_temp/config"]
     assert temperature["device_class"] == "temperature"
+    brightness = configs["homeassistant/number/pylumicube/brightness/config"]
+    assert brightness["name"] == "Matrix brightness"
+    # The range is the firmware's, not the wire's: it declares max_value = 100
+    # for display.brightness and clamps to it, so a 0..255 slider would have
+    # 155 positions that do nothing.
+    assert (brightness["min"], brightness["max"]) == (0, 100)
+    assert brightness["command_topic"] == "lumicube/display/brightness/set"
 
 
 def test_discovery_can_be_switched_off() -> None:

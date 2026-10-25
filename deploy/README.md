@@ -103,7 +103,7 @@ so Home Assistant creates the entities by itself:
 | `sensor.lumicube_cube_cpu_temperature` | the Pi's CPU temperature |
 | `sensor.lumicube_something_within_proximity` | proximity flag |
 | `number.lumicube_speaker_volume` | 0..200, two-way |
-| `number.lumicube_display_brightness` | 0..255, two-way |
+| `number.lumicube_display_brightness` | 0..100, two-way — the LED matrix's level, named "Matrix brightness" in Home Assistant (the range is the one the firmware declares, and it clamps to it) |
 | `text.lumicube_speak` | type a sentence, the cube says it |
 | `select.lumicube_speak_language` | language for spoken messages, from the cube's installed espeak voices |
 | `event.lumicube_top_button`, `..._middle`, `..._bottom`, `..._base` | button presses, for automations |
@@ -121,6 +121,7 @@ Commands are plain payloads where that makes sense:
 | `lumicube/screen/image` | an image path on the cube |
 | `lumicube/screen/clear`, `lumicube/display/fill` | a colour (`#rrggbb` or a number) |
 | `lumicube/display/scroll` | a sentence to scroll across the 16x8 matrix |
+| `lumicube/display/brightness/set` | 0..100 (state on `lumicube/display/brightness`) — the LED matrix's global level, which the firmware clamps to 100 |
 
 `lumicube/display/scroll` holds the serial link for the whole scroll (one frame
 per column, and the firmware services one request at a time), so with the
@@ -128,7 +129,6 @@ clock running its frames and the light-sensor telemetry time out. Use it when
 the clock is stopped; while it runs, `lumicube/screen/text` is the free
 surface — the LCD takes 128 characters and nothing else but the temperature
 chart uses it.
-| `lumicube/display/brightness/set` | 0..255 (state on `lumicube/display/brightness`) |
 
 Spoken messages are espeak, so the language is espeak's: `language` (or
 `voice`) takes a language or voice name — `de`, `en-gb`, `de+f3`, `german`.

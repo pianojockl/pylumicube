@@ -90,9 +90,10 @@ SCROLL_SPEED = 0.7
 SCROLL_FONT = "digits"     # "digits" = the clock's own 3x5 glyphs;
                            # "firmware" = the built-in 5x7 font (taller)
 SPEAKER_VOLUME = 100       # 0..200; the firmware powers up loud, so set it
-DISPLAY_BRIGHTNESS = 255   # the matrix's own brightness (0..255): the firmware
-                           # boots at 65, which multiplies with the dimming
-                           # below — 0.5 brightness then means 13%, not 50%
+DISPLAY_BRIGHTNESS = 100   # the matrix's own brightness (0..100 — the firmware
+                           # clamps there). It boots at 65, which multiplies
+                           # with the dimming below: at 65 a brightness of 0.5
+                           # is really 32%, not 50%
 
 #: Language the clock speaks: an espeak language or voice (`en`, `de`,
 #: `en-gb`, `de+f3`). ISO-639-3 codes work too (`deu` -> `de`). It picks the
@@ -338,10 +339,10 @@ class AmbientClock:
     def _configure_display(self) -> None:
         """Set the matrix's own brightness, which the dimming multiplies with.
 
-        The firmware boots it at 65/255, so a per-pixel brightness of 0.5
-        lands at 13% — dim enough to look broken in a dark room. Setting it
-        here (once, at startup) keeps the ambient response as the only
-        thing varying.
+        The firmware boots it at 65 (of 100), so a per-pixel brightness of
+        0.5 lands at 32% — dimmer than the curve asked for, and dim enough
+        to look broken in a dark room. Setting it here (once, at startup)
+        keeps the ambient response as the only thing varying.
         """
         if DISPLAY_BRIGHTNESS is None:
             return

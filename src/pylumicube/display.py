@@ -48,6 +48,15 @@ NUM_LEDS = 192
 SHOW_KEY = 1266
 BRIGHTNESS_KEY = 256
 
+#: `display.brightness` is a percentage, not a byte. The firmware's own
+#: metadata declares `max_value = 100` for key 256 and it enforces that:
+#: writing 105 leaves the field at 100 (read back on hardware). The wire
+#: would carry a 1-byte value, so the extra range silently does nothing —
+#: which is why Home Assistant's 0..255 slider stopped getting brighter
+#: above 100. Upstream's script API uses this scale too (the daemon's
+#: `SetBrightnessAndGamma` heartbeat sets 65).
+MAX_BRIGHTNESS = 100
+
 #: How many animation frames `scroll_pixels` keeps on the wire. Frames are
 #: sent without waiting for a ServiceResponse (each one costs ~50-100 ms of
 #: latency, which would pin a scroll at a few frames per second), so this is
@@ -124,6 +133,11 @@ class Display:
         self._transport = transport
         self._node_id = node_id
         self._specs = display_specs()
+        #: Last brightness written, or None until something sets it. The
+        #: firmware cannot be asked for it without a wire round-trip, so
+        #: whoever writes it records it here (`note_brightness`) — the MQTT
+        #: bridge publishes this, exactly as it publishes the volume.
+        self._brightness: Optional[int] = None
         # Async worker state. Lazily created on first async write so
         # purely-sync callers never spawn a thread.
         self._lock = threading.Lock()
@@ -167,11 +181,34 @@ class Display:
              timeout: float = 2.0) -> Optional[Future]:
         return self._dispatch({SHOW_KEY: 1}, await_ack=await_ack, timeout=timeout)
 
+    # ------------------------------------------------------------------
+    # Brightness
+    # ------------------------------------------------------------------
+
+    @property
+    def brightness(self) -> Optional[int]:
+        """Last brightness written (0..100), or None if nothing set it yet."""
+        return self._brightness
+
+    def note_brightness(self, value: int) -> None:
+        """Record a brightness someone else wrote, without writing it again.
+
+        A client setting the brightness through the control socket takes
+        this path, so the value the daemon reports to Home Assistant is the
+        one the matrix is actually at. Clamped, because the firmware clamps
+        to the same range.
+        """
+        self._brightness = max(0, min(MAX_BRIGHTNESS, int(value)))
+
     def set_brightness(self, brightness: int,
                        *, await_ack: bool = False,
                        timeout: float = 2.0) -> Optional[Future]:
-        if not 0 <= brightness <= 255:
-            raise ValueError("brightness must be 0..255")
+        if not 0 <= brightness <= MAX_BRIGHTNESS:
+            raise ValueError(
+                f"brightness must be 0..{MAX_BRIGHTNESS} — that is the range "
+                "the firmware declares for display.brightness, and it clamps "
+                "to it")
+        self.note_brightness(brightness)
         return self._dispatch({BRIGHTNESS_KEY: brightness},
                               await_ack=await_ack, timeout=timeout)
 

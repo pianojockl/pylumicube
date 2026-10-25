@@ -149,6 +149,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   percentiles — upstream's `inboxBacklog()`/`outboxBacklog()` equivalent. A
   queueing lag raises no errors, so without this number it is invisible: at
   rest on this cube the round trip is **p50 19.6 ms, p90 72 ms, max 84 ms**.
+- **Brightness is 0..100, not 0..255 — and Home Assistant's slider now says
+  so.** The firmware's own metadata declares `max_value = 100` for
+  `display.brightness` and it enforces that (writing 105 leaves the field at
+  100, read back on hardware). Home Assistant was told 0..255, so everything
+  above 100 was written, clamped, and changed nothing — found by the user,
+  who noticed the slider stopped getting brighter at 100. The range now comes
+  from the field's declared metadata (falling back to the constant), and it
+  drives both the discovery payload and the incoming command, so the slider
+  matches the firmware and would follow it if the range ever changed. The
+  entity is also named "Matrix brightness" instead of "Display brightness":
+  it is the LED matrix's global level (the firmware's `display` module), and
+  the cube's LCD is a separate module — "Anzeige" described the wrong one.
+  Two related bugs came out of the same mistake: the compatibility shim was
+  scaling upstream's 0..100 to 0..255, which made every community script
+  2.55x brighter than it asked for (`display.brightness = 40` arrived as 102
+  and landed at full), and the bridge echoed the *requested* brightness back
+  as state, so Home Assistant showed 105 while the matrix sat at 100. The
+  daemon now records the brightness a client writes through the control
+  socket — the clock re-asserts its own at startup — the same way it records
+  the speaker volume, so the published state is the one on the matrix.
 
 ### Fixed
 - **The hourly chime said "sixteen o'clock".** It handed espeak-ng the raw

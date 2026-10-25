@@ -297,7 +297,7 @@ from pylumicube import LumiCube
 with LumiCube('/dev/ttyAMA0') as cube:
     cube.display.fill(0x00FF00)                          # whole matrix green
     cube.display.set_leds({0: 0xFF0000, 1: 0xFFFFFF})    # by 0..191 index
-    cube.display.set_brightness(128)                     # 0..255
+    cube.display.set_brightness(60)                      # 0..100
 ```
 
 **Async by default.** `set_leds`, `fill`, `show`, and `set_brightness`

@@ -508,6 +508,17 @@ class ControlServer:
                     cube.speaker.note_volume(int(values["volume"]))
                 except Exception:  # noqa: BLE001 — cosmetic only
                     log.debug("could not mirror the speaker volume", exc_info=True)
+            if module == "display" and "brightness" in values:
+                # Same reason: the bridge publishes the brightness the daemon
+                # believes the matrix is at, and the clock re-asserts its own
+                # at startup, which arrives here. `note_brightness` clamps to
+                # the firmware's declared range, so a client asking for 200
+                # does not leave Home Assistant showing 200.
+                try:
+                    cube.display.note_brightness(int(values["brightness"]))
+                except Exception:  # noqa: BLE001 — cosmetic only
+                    log.debug("could not mirror the display brightness",
+                              exc_info=True)
             return {"ok": True}
 
         if op == "run":

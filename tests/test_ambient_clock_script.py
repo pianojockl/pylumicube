@@ -463,7 +463,7 @@ def test_speaker_volume_is_pinned_at_startup(monkeypatch) -> None:
 def test_reapply_settings_restores_both_after_a_daemon_restart(monkeypatch) -> None:
     """The volume lives in the daemon, so a restart needs it re-asserted."""
     monkeypatch.setattr(clock, "SPEAKER_VOLUME", 20)
-    monkeypatch.setattr(clock, "DISPLAY_BRIGHTNESS", 255)
+    monkeypatch.setattr(clock, "DISPLAY_BRIGHTNESS", 100)
     speaker = FakeSpeaker()
     instance, cube, _curve = _clock(speaker=speaker)
     assert speaker.volume == 20
@@ -472,14 +472,15 @@ def test_reapply_settings_restores_both_after_a_daemon_restart(monkeypatch) -> N
     speaker.volume = 40
     instance.reapply_settings()
     assert speaker.volume == 20
-    assert cube.display.brightness == [255]
+    assert cube.display.brightness == [100]
 
 
 def test_display_brightness_is_set_at_startup(monkeypatch) -> None:
-    """The firmware boots the matrix at 65/255, which would scale 0.5 to 13%."""
-    monkeypatch.setattr(clock, "DISPLAY_BRIGHTNESS", 255)
+    """The firmware boots the matrix at 65 (of 100), so a per-pixel brightness
+    of 0.5 would land at 32% — dimmer than the curve asked for."""
+    monkeypatch.setattr(clock, "DISPLAY_BRIGHTNESS", 100)
     instance, cube, _curve = _clock()
-    assert cube.display.brightness == [255]
+    assert cube.display.brightness == [100]
 
 
 def test_display_brightness_can_be_left_alone(monkeypatch) -> None:

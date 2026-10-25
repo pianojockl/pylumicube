@@ -222,11 +222,23 @@ def test_set_3d_ignores_non_face_coordinates() -> None:
 
 def test_brightness_write_uses_the_display_key() -> None:
     display, transport = _display()
-    display.set_brightness(128, await_ack=True)
+    display.set_brightness(60, await_ack=True)
     values = flat_dictionary.deserialise(transport.payloads[-1], display_specs())
-    assert values[BRIGHTNESS_KEY] == 128
+    assert values[BRIGHTNESS_KEY] == 60
     with pytest.raises(ValueError):
-        display.set_brightness(256)
+        display.set_brightness(101)
+
+
+def test_brightness_is_cached_and_clamped() -> None:
+    """The field is a percentage: the firmware declares 100 as its maximum and
+    clamps to it, so the API does too — and the MQTT bridge reads the value
+    back from here (a wire read is a round trip it does not need)."""
+    display, _transport = _display()
+    assert display.brightness is None
+    display.set_brightness(40, await_ack=True)
+    assert display.brightness == 40
+    display.note_brightness(150)      # a client asking for more than exists
+    assert display.brightness == 100
 
 
 def _led_frame(payload: bytes) -> dict[int, int]:

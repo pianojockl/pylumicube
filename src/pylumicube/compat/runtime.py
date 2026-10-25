@@ -232,11 +232,14 @@ class DisplayShim:
     @brightness.setter
     def brightness(self, value: int) -> None:
         value = int(value)
-        # Upstream API documents brightness as 0..100; pylumicube's wire
-        # field is 0..255. Translate so old scripts behave the same.
-        wire = max(0, min(255, round(value * 255 / 100)))
+        # Upstream documents brightness as 0..100, and that *is* the wire
+        # field's range: the firmware declares max_value = 100 and clamps to
+        # it, so there is nothing to translate. (This used to scale to
+        # 0..255, which made every script 2.55x brighter than it asked for —
+        # `brightness = 40` arrived as 102 and landed at full.)
+        wire = max(0, min(100, value))
         self._display.set_brightness(wire)
-        self._brightness = max(0, min(100, value))
+        self._brightness = wire
 
     # ----- LED writers -----
 

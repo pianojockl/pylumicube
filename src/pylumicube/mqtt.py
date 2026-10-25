@@ -14,7 +14,7 @@ can publish the sentence it wants spoken:
     lumicube/screen/clear       a colour (hex like "#000000" or a number)
     lumicube/display/fill       a colour
     lumicube/display/scroll     "hello" or {"text": ..., "colour": ..., "speed": 1.0}
-    lumicube/display/brightness/set  0..255
+    lumicube/display/brightness/set  0..100
 
 Note the `/set` suffix on the two settable values: their *state* is published
 on the bare topic (`lumicube/speaker/volume`), and a bridge that subscribed
@@ -36,6 +36,7 @@ import time
 from typing import Any
 
 from . import speaker as speaker_module
+from .display import MAX_BRIGHTNESS
 
 log = logging.getLogger(__name__)
 
@@ -356,11 +357,15 @@ class MqttBridge:
             return
 
         if suffix in ("display/brightness/set", "display/brightness"):
-            level = int(value)
+            # Clamp to the firmware's own range before anything else: the
+            # wire would carry 255, but the firmware caps the field at 100,
+            # so echoing the request back would leave Home Assistant showing
+            # a brightness the matrix is not at.
+            level = max(0, min(self._brightness_max(), int(value)))
             if level == self._last_state.get(self._topic("display/brightness")):
                 return                      # our own state echoing back
             log.info("MQTT: display brightness %d", level)
-            cube.display.set_brightness(max(0, min(255, level)))
+            cube.display.set_brightness(level)
             self._publish_state(self._topic("display/brightness"), level)
             return
 
@@ -389,6 +394,23 @@ class MqttBridge:
             except Exception:  # noqa: BLE001 — telemetry may not be up yet
                 log.debug("publishing state failed", exc_info=True)
 
+    def _brightness_max(self) -> int:
+        """The firmware's declared maximum for `display.brightness`.
+
+        The cube's own metadata reports `max_value = 100` for that field and
+        the firmware clamps to it, so taking the range from the firmware is
+        what keeps Home Assistant's slider honest — and it follows the
+        firmware if the range ever changes. Falls back to the documented
+        constant when the schema has not been walked or reports nothing.
+        """
+        display = self.cube.modules.get("display")
+        refs = getattr(display, "refs", None) or {}
+        spec = getattr(refs.get("brightness"), "spec", None)
+        declared = getattr(spec, "max_value", None)
+        if isinstance(declared, int) and declared > 0:
+            return declared
+        return MAX_BRIGHTNESS
+
     def _publish_all_state(self, client: Any, *, force: bool = False) -> None:
         sensor = self.cube.modules.get("light_sensor")
         if sensor is not None:
@@ -402,6 +424,10 @@ class MqttBridge:
         volume = getattr(self.cube.speaker, "volume", None)
         if volume is not None:
             self._publish_state(self._topic("speaker/volume"), int(volume))
+        brightness = getattr(self.cube.display, "brightness", None)
+        if brightness is not None:
+            self._publish_state(self._topic("display/brightness"),
+                                int(brightness))
         if self._speak_language:
             self._publish_state(self._topic("speaker/language"),
                                 self._speak_language)
@@ -501,11 +527,15 @@ class MqttBridge:
             "min": 0, "max": 200, "step": 5, "mode": "slider",
             "icon": "mdi:volume-high",
         })
+        # "Matrix brightness", not "Display brightness": this is the LED
+        # matrix's global level (the firmware's `display` module), and the
+        # cube has a separate LCD that this does not touch.
         self._discover(client, "number", "brightness", {
-            "name": "Display brightness",
+            "name": "Matrix brightness",
             "state_topic": self._topic("display/brightness"),
             "command_topic": self._topic("display/brightness/set"),
-            "min": 0, "max": 255, "step": 5, "mode": "slider",
+            "min": 0, "max": self._brightness_max(), "step": 5,
+            "mode": "slider",
             "icon": "mdi:brightness-6",
         })
         languages = speaker_module.available_languages()

@@ -200,7 +200,7 @@ def test_show_set_brightness_have_async_knob() -> None:
         assert display.set_brightness(64, await_ack=True) is None
         # Async paths return Futures.
         f1 = display.show()
-        f2 = display.set_brightness(128)
+        f2 = display.set_brightness(60)
         assert isinstance(f1, Future)
         assert isinstance(f2, Future)
         f2.result(timeout=2.0)
@@ -209,11 +209,14 @@ def test_show_set_brightness_have_async_knob() -> None:
 
 
 def test_set_brightness_validates_range() -> None:
+    """0..100, because that is the range the firmware declares (it clamps to
+    it, so 101..255 would be accepted and ignored)."""
     display = Display(MagicMock(), node_id=124)
     try:
         with pytest.raises(ValueError):
             display.set_brightness(-1)
         with pytest.raises(ValueError):
-            display.set_brightness(256)
+            display.set_brightness(101)
+        assert display.set_brightness(100, await_ack=True) is None
     finally:
         display.close()
