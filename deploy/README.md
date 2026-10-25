@@ -111,7 +111,7 @@ Commands are plain payloads where that makes sense:
 
 | Topic | Payload |
 | --- | --- |
-| `lumicube/speaker/say` | the sentence (`{"text": ..., "volume": 60}` also works) |
+| `lumicube/speaker/say` | the sentence, or `{"text": ..., "language": "de", "volume": 60}` |
 | `lumicube/speaker/tone` | `440` or `{"frequency": 880, "duration": 0.3, "waveform": "square"}` |
 | `lumicube/speaker/play` | a WAV path on the cube |
 | `lumicube/speaker/stop` | anything — also stops a stream another client started |
@@ -119,7 +119,25 @@ Commands are plain payloads where that makes sense:
 | `lumicube/screen/text` | `{"text": "hello", "size": 2, "colour": "#ffffff"}` |
 | `lumicube/screen/image` | an image path on the cube |
 | `lumicube/screen/clear`, `lumicube/display/fill` | a colour (`#rrggbb` or a number) |
+| `lumicube/display/scroll` | a sentence to scroll across the 16x8 matrix |
+
+`lumicube/display/scroll` holds the serial link for the whole scroll (one frame
+per column, and the firmware services one request at a time), so with the
+clock running its frames and the light-sensor telemetry time out. Use it when
+the clock is stopped; while it runs, `lumicube/screen/text` is the free
+surface — the LCD takes 128 characters and nothing else but the temperature
+chart uses it.
 | `lumicube/display/brightness/set` | 0..255 (state on `lumicube/display/brightness`) |
+
+Spoken messages are espeak, so the language is espeak's: `language` (or
+`voice`) takes a language or voice name — `de`, `en-gb`, `de+f3`, `german`.
+ISO-639-3 codes are accepted too and mapped, because espeak itself rejects
+`deu` with "the specified espeak-ng voice does not exist"; an unknown name is
+logged and falls back to the default rather than being passed through. To
+make German the default for everything spoken (the `text.lumicube_speak`
+entity, `lumicube-say`, and the clock's chime if it does not set its own),
+start the daemon with `--speak-language de` or set
+`PYLUMICUBE_SPEAK_LANGUAGE=de`.
 
 The two settable values publish their *state* on the bare topic and take
 *commands* on `/set`. Keep it that way: a bridge that listened on both would

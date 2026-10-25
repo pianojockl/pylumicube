@@ -54,6 +54,7 @@ from pylumicube.compat import open_or_use_hosted  # noqa: E402
 from pylumicube.constants import SERIAL_DEVICE  # noqa: E402
 from pylumicube.control import ControlError  # noqa: E402
 from pylumicube.dimming import BrightnessCurve, scale_colour  # noqa: E402
+from pylumicube.speaker import resolve_voice  # noqa: E402
 
 #: Control errors that mean the link itself is gone, so the client should
 #: reconnect rather than merely retry: the daemon restarted, or is not up yet.
@@ -93,10 +94,28 @@ DISPLAY_BRIGHTNESS = 255   # the matrix's own brightness (0..255): the firmware
                            # boots at 65, which multiplies with the dimming
                            # below — 0.5 brightness then means 13%, not 50%
 
-#: How the hour is spoken at the top of the hour, indexed by `hour % 12`. The
-#: clock is 12-hour by ear: `now.hour` runs 0..23, and espeak reads a bare
-#: number literally, so handing it `16` gets you "sixteen o'clock". Words
-#: (never digits) are the point — `08` would be read as "zero eight".
+#: Language the clock speaks: an espeak language or voice (`en`, `de`,
+#: `en-gb`, `de+f3`). ISO-639-3 codes work too (`deu` -> `de`). It picks the
+#: voice *and*, unless `HOUR_WORDS`/`CHIME_PHRASE` are set directly, the
+#: chime's wording.
+SPEAK_LANGUAGE = "en"
+
+#: Chime wording per language: the phrase (with `{hour}`) and the hour words
+#: indexed by `hour % 12`. Words, never digits — the clock is 12-hour by ear
+#: and espeak reads a bare number literally, so `16` gives "sixteen o'clock"
+#: and `08` gives "zero eight". German says "ein Uhr", not "eins Uhr".
+SPEAK_LANGUAGES = {
+    "en": ("it's {hour} o'clock",
+           ("twelve", "one", "two", "three", "four", "five", "six",
+            "seven", "eight", "nine", "ten", "eleven")),
+    "de": ("es ist {hour} Uhr",
+           ("zwölf", "ein", "zwei", "drei", "vier", "fünf", "sechs",
+            "sieben", "acht", "neun", "zehn", "elf")),
+}
+
+#: The phrase and hour words the chime uses. Filled from `SPEAK_LANGUAGES`
+#: for `SPEAK_LANGUAGE` at startup, unless a config file sets them itself.
+CHIME_PHRASE = "it's {hour} o'clock"
 HOUR_WORDS = ("twelve", "one", "two", "three", "four", "five", "six",
               "seven", "eight", "nine", "ten", "eleven")
 
@@ -120,6 +139,7 @@ LIGHT_LOG = os.path.join(
 CONFIG_NAMES = ("BRIGHTNESS_MIN", "BRIGHTNESS_MAX", "GAMMA", "SMOOTHING", "ADAPT",
                 "LOW", "HIGH", "HUE_FOLLOWS_HOUR", "HUE", "SATURATION", "JITTER",
                 "ALLOW_REBOOT", "HOURLY_SCROLL", "HOURLY_SPEAK", "HOUR_WORDS",
+                "CHIME_PHRASE", "SPEAK_LANGUAGE", "SPEAK_LANGUAGES",
                 "SCROLL_SPEED",
                 "SCROLL_FONT", "SPEAKER_VOLUME", "DISPLAY_BRIGHTNESS",
                 "TEMP_SAMPLE_SECONDS", "TEMP_HISTORY", "CHART_REFRESH",
@@ -140,8 +160,36 @@ def apply_config(config, *, source: str = "<config>") -> list[str]:
         if hasattr(config, field):
             globals()[field] = getattr(config, field)
             applied.append(field)
+    _CONFIGURED.update(applied)
     log.info("config %s: applied %s", source, ", ".join(applied) or "nothing")
     return applied
+
+
+#: Which settings a config file actually set — an explicit `HOUR_WORDS` or
+#: `CHIME_PHRASE` must not be overwritten by a language's defaults.
+_CONFIGURED: set[str] = set()
+
+
+def resolve_language() -> str | None:
+    """Fill the chime's wording from `SPEAK_LANGUAGE`.
+
+    Returns a warning to log, or None. A config file that sets `HOUR_WORDS`
+    or `CHIME_PHRASE` itself always wins, so a language with no table here is
+    still just those two settings.
+    """
+    global HOUR_WORDS, CHIME_PHRASE
+    voice = resolve_voice(SPEAK_LANGUAGE) or ""
+    table = SPEAK_LANGUAGES.get(voice) or SPEAK_LANGUAGES.get(voice[:2])
+    if table is None:
+        return (f"no chime wording for language {SPEAK_LANGUAGE!r}: set "
+                f"HOUR_WORDS and CHIME_PHRASE, or use one of "
+                f"{', '.join(sorted(SPEAK_LANGUAGES))}")
+    phrase, words = table
+    if "CHIME_PHRASE" not in _CONFIGURED:
+        CHIME_PHRASE = phrase
+    if "HOUR_WORDS" not in _CONFIGURED:
+        HOUR_WORDS = words
+    return None
 
 
 def load_config(path: str | None = None) -> str | None:
@@ -166,6 +214,10 @@ def load_config(path: str | None = None) -> str | None:
 # A config file sitting next to this script is picked up automatically; an
 # explicit --config is applied on top of it (so the flag wins).
 load_config()
+
+_language_warning = resolve_language()
+if _language_warning:
+    log.warning("%s", _language_warning)
 
 
 # --------------------------------------------------------------------------
@@ -407,7 +459,7 @@ class AmbientClock:
         atomic = getattr(self.cube, "say", None)
         if atomic is not None:
             try:
-                atomic(text)
+                atomic(text, voice=SPEAK_LANGUAGE)
                 return
             except Exception:  # noqa: BLE001 — never let audio break the clock
                 log.warning("cube.say failed", exc_info=True)
@@ -415,7 +467,7 @@ class AmbientClock:
             log.info("speaker unavailable; would have said: %s", text)
             return
         try:
-            self._speaker.say(text)          # type: ignore[attr-defined]
+            self._speaker.say(text, voice=SPEAK_LANGUAGE)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 — never let audio break the clock
             log.warning("speaker.say failed", exc_info=True)
 
@@ -569,7 +621,7 @@ class AmbientClock:
         if HOURLY_SCROLL:
             self.scroll_time(now)
         if HOURLY_SPEAK and 7 < now.hour < 20:
-            self.say(f"it's {HOUR_WORDS[now.hour % 12]} o'clock")
+            self.say(CHIME_PHRASE.format(hour=HOUR_WORDS[now.hour % 12]))
 
 
 def _open_light_log(path: str | None = None):

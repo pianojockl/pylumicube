@@ -23,6 +23,7 @@ from typing import Any
 from .constants import SERIAL_DEVICE
 from .control import ControlServer, resolve_socket_path
 from .node import LumiCube
+from .speaker import set_speak_language
 from .telemetry import DEFAULT_CADENCE
 
 log = logging.getLogger(__name__)
@@ -241,6 +242,11 @@ def build_parser() -> "argparse.ArgumentParser":
                         help="let clients subscribe to the cube board (needed for "
                              "the microphone; it floods the link, so it is off by "
                              "default)")
+    parser.add_argument("--speak-language",
+                        default=os.environ.get("PYLUMICUBE_SPEAK_LANGUAGE"),
+                        help="default espeak language or voice for spoken "
+                             "messages (de, en-gb, deu, german); a client "
+                             "can override it per call")
     parser.add_argument("--mqtt-host", default=os.environ.get("PYLUMICUBE_MQTT_HOST"),
                         help="MQTT broker for the Home Assistant bridge")
     parser.add_argument("--mqtt-port", type=int,
@@ -270,6 +276,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    voice = set_speak_language(args.speak_language)
+    if voice:
+        log.info("spoken messages default to espeak voice %r", voice)
 
     mqtt = None
     if args.mqtt_host and not args.no_mqtt:

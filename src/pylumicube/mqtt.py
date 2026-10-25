@@ -3,7 +3,7 @@
 Commands arrive as plain payloads where that makes sense, so an automation
 can publish the sentence it wants spoken:
 
-    lumicube/speaker/say        "The washing machine has finished"
+    lumicube/speaker/say        "hello" or {"text": ..., "language": "de"}
     lumicube/speaker/tone       "440" or {"frequency": 440, "duration": 0.5}
     lumicube/speaker/play       a WAV path on the cube
     lumicube/speaker/stop       anything
@@ -12,6 +12,7 @@ can publish the sentence it wants spoken:
     lumicube/screen/image       an image path on the cube
     lumicube/screen/clear       a colour (hex like "#000000" or a number)
     lumicube/display/fill       a colour
+    lumicube/display/scroll     "hello" or {"text": ..., "colour": ..., "speed": 1.0}
     lumicube/display/brightness/set  0..255
 
 Note the `/set` suffix on the two settable values: their *state* is published
@@ -27,6 +28,8 @@ entities for the cube's buttons.
 
 from __future__ import annotations
 
+import contextlib
+
 import json
 import logging
 import threading
@@ -34,6 +37,11 @@ import time
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+#: How long a single scroll frame waits for its acknowledgement. The default
+#: (2 s) turns a contended scroll into minutes of stalling: one frame per
+#: column, each waiting out its timeout, with the speaker starved meanwhile.
+SCROLL_FRAME_TIMEOUT = 0.25
 
 
 def parse_colour(payload: str) -> int:
@@ -90,6 +98,7 @@ class MqttBridge:
         self._connected = threading.Event()
         self._last_state: dict[str, Any] = {}
         self._last_publish: dict[str, float] = {}
+        self._scroll_thread: threading.Thread | None = None
 
     # ---------------- lifecycle ----------------
 
@@ -138,6 +147,22 @@ class MqttBridge:
 
     # ---------------- paho callbacks ----------------
 
+    def _scroll(self, text: str, colour: int, background: int, speed: float) -> None:
+        """Scroll `text` on the 16x8 matrix, one utterance at a time.
+
+        The matrix and the speaker share the serial link, and a scroll is one
+        frame per column. Run alongside speech, each frame waits out its
+        timeout and the two starve each other — measured: a 21-character
+        message was still scrolling 90 s later while the announcement dropped
+        every chunk. The clock never hits this because it scrolls *then*
+        speaks; taking the same lock as `say` makes that sequencing a
+        property of the daemon rather than of whoever publishes the topics.
+        """
+        lock = getattr(getattr(self.daemon, "server", None), "audio_lock", None)
+        with (lock if lock is not None else contextlib.nullcontext()):
+            self.cube.display.scroll_text(text, colour, background, speed,
+                                          timeout=SCROLL_FRAME_TIMEOUT)
+
     def _command_topics(self) -> tuple[str, ...]:
         """The topics we listen on — commands only, never our own state.
 
@@ -152,7 +177,7 @@ class MqttBridge:
         return tuple(self._topic(suffix) for suffix in (
             "speaker/say", "speaker/tone", "speaker/play", "speaker/stop",
             "speaker/volume/set", "screen/text", "screen/image", "screen/clear",
-            "display/fill", "display/brightness/set",
+            "display/fill", "display/scroll", "display/brightness/set",
         ))
 
     def _on_connect(self, client: Any, userdata: Any, flags: Any, reason_code: Any,
@@ -199,7 +224,8 @@ class MqttBridge:
                 return
             options = value if isinstance(value, dict) else {}
             log.info("MQTT: say %r", text)
-            cube.say(str(text), voice=options.get("voice"),
+            cube.say(str(text),
+                     voice=options.get("voice") or options.get("language"),
                      volume=options.get("volume"))
             return
         if suffix in ("speaker/tone", "tone"):
@@ -258,6 +284,32 @@ class MqttBridge:
 
         if suffix == "display/fill":
             cube.display.fill(parse_colour(str(payload)))
+            return
+
+        if suffix == "display/scroll":
+            options = value if isinstance(value, dict) else {"text": str(value)}
+            text = str(options.get("text", ""))
+            if not text:
+                return
+            log.info("MQTT: scroll %r", text)
+            # The 16x8 matrix fits about three characters, so anything longer
+            # has to travel. That takes seconds, so it runs off the MQTT loop:
+            # the callback must not stall other commands (including the `say`
+            # that usually accompanies this) for that long.
+            #
+            # Caveat, measured: a scroll is one frame per column and the
+            # firmware services one request at a time, so it holds the link
+            # for its duration. With the clock running, the clock's frames
+            # time out and the light-sensor telemetry does too. Prefer
+            # `screen/text` (the LCD, 128 characters, nothing else uses it)
+            # while the clock runs; this is for when it is stopped.
+            self._scroll_thread = threading.Thread(
+                target=self._scroll,
+                args=(text, parse_colour(str(options.get("colour", "#ffffff"))),
+                      parse_colour(str(options.get("background", "#000000"))),
+                      float(options.get("speed", 1.0))),
+                name="lumicube-mqtt-scroll", daemon=True)
+            self._scroll_thread.start()
             return
 
         if suffix in ("display/brightness/set", "display/brightness"):

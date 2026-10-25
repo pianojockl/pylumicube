@@ -8,10 +8,17 @@ run without it installed.
 from __future__ import annotations
 
 import json
+import threading
+from types import SimpleNamespace
 
 import pytest
 
-from pylumicube.mqtt import MqttBridge, parse_colour, parse_payload
+from pylumicube.mqtt import (
+    SCROLL_FRAME_TIMEOUT,
+    MqttBridge,
+    parse_colour,
+    parse_payload,
+)
 
 
 class FakeSpeaker:
@@ -51,12 +58,17 @@ class FakeDisplay:
     def __init__(self) -> None:
         self.fills: list[int] = []
         self.brightness: list[int] = []
+        self.scrolls: list[tuple] = []
 
     def fill(self, colour: int) -> None:
         self.fills.append(colour)
 
     def set_brightness(self, value: int) -> None:
         self.brightness.append(value)
+
+    def scroll_text(self, text, colour=0xFFFFFF, background=0x000000, speed=1.0,
+                    timeout=None) -> None:
+        self.scrolls.append((text, colour, background, speed, timeout))
 
 
 class FakeSensor:
@@ -167,6 +179,54 @@ def test_an_echo_of_our_own_state_is_ignored(bridge) -> None:
     bridge.cube.speaker.volume = 99                         # would-be change
     bridge._handle_command("speaker/volume", "70")          # our own state back
     assert bridge.cube.speaker.volume == 99, "the echo was applied as a command"
+
+
+def test_display_scroll_takes_text_and_options(bridge) -> None:
+    """The 16x8 matrix fits ~3 characters, so a message has to travel."""
+    bridge._handle_command("display/scroll",
+                           json.dumps({"text": "Waschmaschine fertig!",
+                                       "colour": "#ff8800", "speed": 1.5}))
+    assert bridge._scroll_thread is not None, "the scroll did not run"
+    bridge._scroll_thread.join(timeout=5)
+    assert bridge.cube.display.scrolls == [
+        ("Waschmaschine fertig!", 0xFF8800, 0, 1.5, SCROLL_FRAME_TIMEOUT)]
+
+    bridge._handle_command("display/scroll", "plain text")
+    bridge._scroll_thread.join(timeout=5)
+    assert bridge.cube.display.scrolls[-1][0] == "plain text"
+
+    bridge._handle_command("display/scroll", "")
+    assert len(bridge.cube.display.scrolls) == 2, "empty text scrolled"
+
+
+def test_a_scroll_waits_for_the_speaker(bridge) -> None:
+    """Scroll and speech must not overlap: on the shared link they starve.
+
+    Measured on the cube: run together, a 21-character message was still
+    scrolling 90 s later while the announcement dropped every chunk.
+    """
+    lock = threading.RLock()
+    bridge.daemon.server = SimpleNamespace(audio_lock=lock)
+    lock.acquire()                        # pretend a `say` is in progress
+    try:
+        bridge._handle_command("display/scroll", "hello")
+        bridge._scroll_thread.join(timeout=0.3)
+        assert bridge.cube.display.scrolls == [], "scrolled over the speaker"
+    finally:
+        lock.release()
+    bridge._scroll_thread.join(timeout=5)
+    assert bridge.cube.display.scrolls[-1][0] == "hello"
+
+
+def test_say_takes_a_language(bridge) -> None:
+    """`language` is the friendlier spelling of espeak's `voice`."""
+    bridge._handle_command("speaker/say",
+                           json.dumps({"text": "Die Wäsche ist fertig",
+                                       "language": "de"}))
+    assert bridge.cube.said == [("Die Wäsche ist fertig", "de", None)]
+
+    bridge._handle_command("speaker/say", json.dumps({"text": "hi", "voice": "en-gb"}))
+    assert bridge.cube.said[-1] == ("hi", "en-gb", None)
 
 
 def test_play_stop_and_volume(bridge) -> None:

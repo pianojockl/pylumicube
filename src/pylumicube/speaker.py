@@ -71,6 +71,92 @@ PACE_GROUP = 3
 #: skipping ahead is the lesser evil.
 MAX_LAG_SECONDS = 1.0
 
+#: Voice used when a caller does not name one: an espeak language or voice
+#: (``de``, ``de-DE``, ``en-gb``, ``german``, ``de+f3``). ``None`` = espeak's
+#: own default. Set it with `set_speak_language()`; the daemon wires that to
+#: ``--speak-language`` and the clock to its ``SPEAK_LANGUAGE`` setting.
+SPEAK_LANGUAGE: str | None = None
+
+#: ISO-639-3 codes people reach for and espeak rejects: it wants ISO-639-1
+#: (``de``), so ``deu`` fails with "The specified espeak-ng voice does not
+#: exist". Anything not listed here falls back to its first two letters.
+LANGUAGE_ALIASES = {
+    "deu": "de", "eng": "en", "fra": "fr", "fre": "fr", "nld": "nl",
+    "dut": "nl", "spa": "es", "ita": "it", "por": "pt", "rus": "ru",
+    "jpn": "ja", "zho": "zh", "chi": "zh", "ell": "el", "gre": "el",
+    "pol": "pl", "swe": "sv", "dan": "da", "fin": "fi", "ces": "cs",
+    "cze": "cs", "hun": "hu", "tur": "tr", "ukr": "uk", "ron": "ro",
+    "rum": "ro", "hrv": "hr", "slk": "sk", "slo": "sk", "cat": "ca",
+}
+
+_voices: set[str] | None = None
+
+
+def available_voices() -> set[str]:
+    """The voices espeak has here (lower-cased), listed once and cached.
+
+    espeak's own listing is the only honest source: it accepts a language
+    (``de``), a locale-ish code (``de-DE``) and a voice name (``german``),
+    but rejects ISO-639-3 (``deu``).
+    """
+    global _voices
+    if _voices is None:
+        _voices = set()
+        engine = shutil.which("espeak-ng") or shutil.which("espeak")
+        if engine is not None:
+            try:
+                result = subprocess.run([engine, "--voices"], timeout=10,
+                                        capture_output=True, text=True, check=False)
+                for line in result.stdout.splitlines()[1:]:
+                    columns = line.split()
+                    if len(columns) >= 4:
+                        _voices.add(columns[1].lower())     # language: de
+                        _voices.add(columns[3].lower())     # name: german
+            except (OSError, subprocess.SubprocessError):   # pragma: no cover
+                log.debug("could not list espeak voices", exc_info=True)
+    return _voices
+
+
+def resolve_voice(name: str | None) -> str | None:
+    """Turn a requested language/voice into one espeak will accept.
+
+    Unknown names return ``None`` (espeak's default) *after* logging, because
+    the alternatives are both worse: raising would break an announcement, and
+    passing the name through would have espeak read German in an English
+    accent, or refuse with an error mid-sentence.
+    """
+    if not name:
+        return None
+    wanted = str(name).strip()
+    voices = available_voices()
+    if not voices:                          # no espeak here: let it decide
+        return wanted
+    if wanted.lower() in voices:
+        return wanted
+    alias = LANGUAGE_ALIASES.get(wanted.lower(), wanted[:2].lower())
+    if alias in voices:
+        log.info("espeak voice %r -> %r", wanted, alias)
+        return alias
+    log.warning("no espeak voice for %r; using the default", wanted)
+    return None
+
+
+def set_speak_language(name: str | None) -> str | None:
+    """Set the default voice for `say()`; returns what it resolved to.
+
+    An unknown name leaves the previous default in place, so a typo in a
+    config file cannot quietly change how everything sounds.
+    """
+    global SPEAK_LANGUAGE
+    if name is None or str(name).strip() == "":
+        SPEAK_LANGUAGE = None
+    else:
+        resolved = resolve_voice(name)
+        if resolved is not None:
+            SPEAK_LANGUAGE = resolved
+    return SPEAK_LANGUAGE
+
+
 SINE = "sine"
 SQUARE = "square"
 TRIANGLE = "triangle"
@@ -383,8 +469,9 @@ class Speaker:
         if engine is None:
             raise RuntimeError("say() needs espeak-ng or espeak installed")
         command = [engine, "-s", str(speed), "--stdout"]
-        if voice:
-            command += ["-v", voice]
+        chosen = resolve_voice(voice) if voice else SPEAK_LANGUAGE
+        if chosen:
+            command += ["-v", chosen]
         command.append(text)
         result = subprocess.run(command, capture_output=True, check=False)
         if result.returncode != 0 or not result.stdout:

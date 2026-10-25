@@ -65,12 +65,14 @@ class FakeModule:
     def __init__(self, values=None) -> None:
         self.values = dict(values or {})
         self.said: list[str] = []
+        self.voices: list[str | None] = []
 
     def get(self, name, default=None):
         return self.values.get(name, default)
 
-    def say(self, text):
+    def say(self, text, *, voice=None):
         self.said.append(text)
+        self.voices.append(voice)
 
     def wait_for(self, name, timeout=None, default=None):
         return self.values.get(name)
@@ -109,8 +111,9 @@ class FakeSpeaker:
         self.volume: int | None = None
         self.said: list[str] = []
 
-    def say(self, text: str) -> None:
+    def say(self, text: str, *, voice: str | None = None) -> None:
         self.said.append(text)
+        self.voices.append(voice)
 
 
 class FakeCube:
@@ -636,5 +639,47 @@ def test_no_chime_ever_speaks_a_digit(monkeypatch) -> None:
     assert speaker.said, "the chime never spoke, so this proves nothing"
     for phrase in speaker.said:
         assert not any(char.isdigit() for char in phrase), phrase
+
+
+def test_the_chime_speaks_german_when_configured(monkeypatch) -> None:
+    """`SPEAK_LANGUAGE` changes the words *and* the voice they are said in."""
+    monkeypatch.setattr(clock, "SPEAK_LANGUAGE", "deu")      # ISO-639-3 works
+    monkeypatch.setattr(clock, "_CONFIGURED", set())
+    monkeypatch.setattr(clock, "HOUR_WORDS", ())
+    monkeypatch.setattr(clock, "CHIME_PHRASE", "")
+    assert clock.resolve_language() is None
+    assert clock.CHIME_PHRASE == "es ist {hour} Uhr"
+    assert clock.HOUR_WORDS[4] == "vier"
+    assert clock.HOUR_WORDS[1] == "ein"          # "ein Uhr", not "eins Uhr"
+
+    monkeypatch.setattr(clock, "HOURLY_SPEAK", True)
+    monkeypatch.setattr(clock, "HOURLY_SCROLL", False)
+    speaker = FakeModule()
+    instance, _cube, _curve = _clock({"speaker": speaker})
+    instance.hourly_chime(datetime.datetime(2026, 10, 23, 16, 0, 1))
+    assert speaker.said == ["es ist vier Uhr"]
+    assert speaker.voices == ["deu"], "the voice was not passed to the speaker"
+
+
+def test_a_config_file_can_override_the_language_wording(monkeypatch) -> None:
+    """A language with no table here is still just two settings."""
+    monkeypatch.setattr(clock, "SPEAK_LANGUAGE", "de")
+    monkeypatch.setattr(clock, "HOUR_WORDS", ("zwölf",))
+    monkeypatch.setattr(clock, "CHIME_PHRASE", "{hour} bimbam")
+    monkeypatch.setattr(clock, "_CONFIGURED", {"HOUR_WORDS", "CHIME_PHRASE"})
+    assert clock.resolve_language() is None
+    assert clock.HOUR_WORDS == ("zwölf",)
+    assert clock.CHIME_PHRASE == "{hour} bimbam"
+
+
+def test_an_unknown_language_is_reported_not_ignored(monkeypatch) -> None:
+    monkeypatch.setattr(clock, "SPEAK_LANGUAGE", "klingon")
+    monkeypatch.setattr(clock, "_CONFIGURED", set())
+    monkeypatch.setattr(clock, "HOUR_WORDS", ("twelve",))
+    monkeypatch.setattr(clock, "CHIME_PHRASE", "keep me")
+    warning = clock.resolve_language()
+    assert warning is not None and "klingon" in warning
+    assert clock.HOUR_WORDS == ("twelve",), "the wording changed anyway"
+    assert clock.CHIME_PHRASE == "keep me"
 
 

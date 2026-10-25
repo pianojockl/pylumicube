@@ -44,10 +44,18 @@ JITTER = 1.0             # per-pixel hue shimmer; 0 = steady colour
 ALLOW_REBOOT = True      # middle button reboots the Pi
 HOURLY_SCROLL = True     # scroll the time at the top of each hour
 HOURLY_SPEAK = True      # ...and speak it (needs the speaker module)
+SPEAK_LANGUAGE = "en"    # language of the chime and of spoken messages from
+                         # Home Assistant: an espeak language or voice ("de",
+                         # "en-gb", "de+f3"; ISO-639-3 like "deu" works too).
+                         # "de" switches the chime's wording as well —
+                         # "es ist vier Uhr" at 16:00 instead of "four o'clock".
 HOUR_WORDS = ("twelve", "one", "two", "three", "four", "five", "six",
               "seven", "eight", "nine", "ten", "eleven")
-                         # how the hour is spoken, indexed by `hour % 12`, so
-                         # 16:00 is "four o'clock" and not "sixteen o'clock"
+                         # the chime's hour words, indexed by `hour % 12`.
+                         # Taken from SPEAK_LANGUAGE; set them (with
+                         # CHIME_PHRASE) for a language that has no table.
+CHIME_PHRASE = "it's {hour} o'clock"
+                         # ...and the phrase around them.
 SCROLL_SPEED = 0.7       # higher = faster scroll
 SCROLL_FONT = "digits"   # "digits" = the clock's own 3x5 glyphs (matches
                          # the static display); "firmware" = the taller

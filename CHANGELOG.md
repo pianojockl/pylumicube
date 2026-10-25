@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **A language for spoken messages.** `language` (or espeak's own `voice`)
+  can be given per message over MQTT —
+  `{"text": "Die Wäsche ist fertig", "language": "de"}` — and a default
+  for everything spoken comes from `lumicube-daemon --speak-language de` or
+  `PYLUMICUBE_SPEAK_LANGUAGE=de`. ISO-639-3 codes are mapped to what espeak
+  actually accepts (`deu` -> `de`), because espeak rejects them outright with
+  "the specified espeak-ng voice does not exist"; an unknown name is logged
+  and ignored rather than passed through, so a typo cannot turn German into
+  English-accented speech. The clock's chime follows its own
+  `SPEAK_LANGUAGE`, taking its wording from `SPEAK_LANGUAGES` (English and
+  German built in — "es ist vier Uhr" at 16:00) unless a config file sets
+  `HOUR_WORDS`/`CHIME_PHRASE` itself.
+- **`lumicube/display/scroll`**, so a message longer than the three
+  characters a 16x8 matrix holds can travel across it. It runs off the MQTT
+  loop and takes the same lock as `say` (run together, the two starve each
+  other: a 21-character message was still scrolling 90 s later while the
+  announcement dropped every chunk).
+  **But it is not free**: a scroll is one frame per column and the firmware
+  services one request at a time, so it holds the serial link for its
+  duration — measured with the clock running, the clock's display frames
+  failed with 2 s timeouts and the light-sensor telemetry timed out with
+  them. `lumicube/screen/text` is the surface to use while the clock runs:
+  the LCD takes 128 characters and nothing else but the temperature chart
+  uses it.
 - **The `stats` op reports the speech path's counters** (`audio`:
   `written_chunks`, `dropped_chunks`, `loss_percent`), so smoothness is
   checkable from a running daemon — `lumicube-do stats` — instead of only by

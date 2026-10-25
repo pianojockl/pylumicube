@@ -25,6 +25,8 @@ from pylumicube.speaker import (
     NOISE,
     Speaker,
     pcm16,
+    resolve_voice,
+    set_speak_language,
     resample,
     wav_to_pcm,
 )
@@ -333,3 +335,26 @@ def test_play_reads_a_wav_file(tmp_path) -> None:
     assert SAMPLE_RATE <= total < SAMPLE_RATE + CHUNK_SAMPLES
 
 
+
+
+# ----- language resolution -------------------------------------------------
+
+
+def test_iso_639_3_codes_map_to_what_espeak_accepts(monkeypatch) -> None:
+    """espeak rejects `deu` with "voice does not exist"; `de` is what it wants."""
+    monkeypatch.setattr("pylumicube.speaker._voices", {"de", "en", "german", "en-gb"})
+    assert resolve_voice(None) is None
+    assert resolve_voice("de") == "de"
+    assert resolve_voice("deu") == "de"
+    assert resolve_voice("de-DE") == "de"
+    assert resolve_voice("german") == "german"
+    assert resolve_voice("klingon") is None
+
+
+def test_an_unknown_default_language_leaves_the_old_one(monkeypatch) -> None:
+    """A typo in a config file must not quietly change how things sound."""
+    monkeypatch.setattr("pylumicube.speaker._voices", {"de"})
+    monkeypatch.setattr("pylumicube.speaker.SPEAK_LANGUAGE", None)
+    assert set_speak_language("deu") == "de"
+    assert set_speak_language("klingon") == "de"
+    assert set_speak_language(None) is None
