@@ -115,6 +115,9 @@ def bridge():
     instance = MqttBridge(FakeDaemon(), host="broker", prefix="lumicube")
     instance._client = FakeClient()          # noqa: SLF001 - no broker here
     instance._connected.set()                # noqa: SLF001
+    # The bridge picks a speak language from espeak's installed voices, which
+    # differs by machine; tests that are not about it pin it instead.
+    instance._speak_language = None          # noqa: SLF001
     return instance
 
 
@@ -222,6 +225,43 @@ def test_an_announcement_is_not_delayed_behind_a_scroll(bridge) -> None:
         assert bridge.cube.said == [("hallo", None, None)],             "the announcement waited for the scroll"
     finally:
         release.set()
+
+
+def test_the_bridge_subscribes_to_every_command_it_handles(bridge) -> None:
+    """A handler with no subscription is dead code — that happened once with
+    `speaker/language/set`, so the whole list is pinned here."""
+    assert set(bridge._command_topics()) == {                   # noqa: SLF001
+        "lumicube/speaker/say", "lumicube/speaker/tone",
+        "lumicube/speaker/play", "lumicube/speaker/stop",
+        "lumicube/speaker/volume/set", "lumicube/speaker/language/set",
+        "lumicube/screen/text", "lumicube/screen/image",
+        "lumicube/screen/clear", "lumicube/display/fill",
+        "lumicube/display/scroll", "lumicube/display/brightness/set",
+    }
+
+
+def test_a_plain_say_uses_the_selected_language(bridge) -> None:
+    """Home Assistant's text entity sends a bare string, so the language has
+    to come from the select rather than from the payload."""
+    bridge._speak_language = "de"            # noqa: SLF001
+    bridge._handle_command("speaker/say", "hallo")
+    assert bridge.cube.said == [("hallo", "de", None)]
+
+
+def test_selecting_a_language_sets_the_default_and_reports_it(bridge) -> None:
+    bridge._handle_command("speaker/language/set", "de")
+    assert bridge._speak_language == "de"     # noqa: SLF001
+    assert bridge._last_state["lumicube/speaker/language"] == "de"  # noqa: SLF001
+
+
+def test_an_unknown_language_is_refused_not_applied(bridge, monkeypatch) -> None:
+    """A typo must not quietly change how everything sounds."""
+    # Pin what espeak has installed: without this the test depends on whether
+    # the machine running it has espeak at all.
+    monkeypatch.setattr("pylumicube.speaker._voices", {"de", "en"})
+    bridge._handle_command("speaker/language/set", "de")
+    bridge._handle_command("speaker/language/set", "klingon")
+    assert bridge._speak_language == "de"     # noqa: SLF001
 
 
 def test_say_takes_a_language(bridge) -> None:

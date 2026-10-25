@@ -1,0 +1,169 @@
+# Reference copy of the lumicube_* scripts, as written through the HA API
+# (`script/config/save`). Run from the UI they show a form; run from an
+# automation they take the same fields.
+
+lumicube_say:
+  alias: LumiCube say
+  icon: mdi:bullhorn
+  mode: single
+  fields:
+    sentence:
+      name: Sentence
+      description: What the cube should say. Empty uses the dashboard text box.
+      required: false
+      selector:
+        text:
+          multiline: true
+    language:
+      name: Language
+      description: espeak language, e.g. de or en-gb. Empty uses the language selected on the cube.
+      required: false
+      selector:
+        text:
+    volume:
+      name: Volume
+      description: 0..200 for this announcement only. Empty leaves the volume alone.
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 200
+          step: 5
+          mode: box
+  sequence:
+    - action: mqtt.publish
+      data:
+        topic: lumicube/speaker/say
+        # Keys are only sent when set: an absent language means "the cube's
+        # selected language", an absent volume means "do not touch it".
+        payload: >-
+          {{ {'text': sentence or states('input_text.lumicube_say_text')}
+             | combine({'language': language} if language else {})
+             | combine({'volume': volume | int} if volume else {})
+             | tojson }}
+
+lumicube_scroll:
+  alias: LumiCube scroll
+  icon: mdi:format-text-rotation-none
+  mode: single
+  fields:
+    text:
+      name: Text
+      description: Text to scroll across the 16x8 LED matrix. Empty uses the dashboard text box.
+      required: false
+      selector:
+        text:
+    colour:
+      name: Colour
+      description: Hex colour of the text.
+      required: false
+      default: "#ff8800"
+      selector:
+        text:
+    speed:
+      name: Speed
+      description: Higher scrolls faster.
+      required: false
+      default: 1.5
+      selector:
+        number:
+          min: 0.25
+          max: 5
+          step: 0.25
+          mode: box
+  sequence:
+    - action: mqtt.publish
+      data:
+        topic: lumicube/display/scroll
+        payload: >-
+          {{ {'text': text or states('input_text.lumicube_say_text'),
+              'colour': colour, 'speed': speed | float} | tojson }}
+
+lumicube_screen_text:
+  alias: LumiCube screen text
+  icon: mdi:monitor
+  mode: single
+  fields:
+    text:
+      name: Text
+      description: Up to 128 characters, drawn on the LCD. Empty uses the dashboard text box.
+      required: false
+      selector:
+        text:
+    size:
+      name: Size
+      required: false
+      default: 2
+      selector:
+        number:
+          min: 1
+          max: 4
+          step: 1
+          mode: box
+    y:
+      name: Y
+      required: false
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 200
+          step: 10
+          mode: box
+    colour:
+      name: Colour
+      required: false
+      default: "#ffffff"
+      selector:
+        text:
+  sequence:
+    - action: mqtt.publish
+      data:
+        topic: lumicube/screen/text
+        payload: >-
+          {{ {'text': text or states('input_text.lumicube_say_text'),
+              'size': size | int, 'y': y | int, 'colour': colour} | tojson }}
+
+lumicube_tone:
+  alias: LumiCube tone
+  icon: mdi:music-note
+  mode: single
+  fields:
+    frequency:
+      name: Frequency
+      description: Hertz.
+      required: false
+      default: 880
+      selector:
+        number:
+          min: 20
+          max: 5000
+          step: 10
+          mode: box
+    duration:
+      name: Duration (s)
+      required: false
+      default: 0.4
+      selector:
+        number:
+          min: 0.05
+          max: 5
+          step: 0.05
+          mode: box
+  sequence:
+    - action: mqtt.publish
+      data:
+        topic: lumicube/speaker/tone
+        payload: >-
+          {{ {'frequency': frequency | int, 'duration': duration | float} | tojson }}
+
+lumicube_stop:
+  alias: LumiCube stop
+  description: Stops whatever the cube is playing — including a stream another client started.
+  icon: mdi:stop
+  mode: single
+  sequence:
+    - action: mqtt.publish
+      data:
+        topic: lumicube/speaker/stop
+        payload: stop

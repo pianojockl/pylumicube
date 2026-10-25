@@ -352,6 +352,15 @@ def test_iso_639_3_codes_map_to_what_espeak_accepts(monkeypatch) -> None:
     assert resolve_voice("klingon") is None
 
 
+def test_a_bare_language_is_accepted_when_only_variants_are_listed(monkeypatch) -> None:
+    """espeak lists `en-us`/`en-gb` but not `en`, yet `-v en` works and is its
+    default — rejecting it made the default look unknown."""
+    monkeypatch.setattr("pylumicube.speaker._voices", {"en-us", "en-gb", "de"})
+    assert resolve_voice("en") == "en"
+    assert resolve_voice("de") == "de"
+    assert resolve_voice("zz") is None, "invented a language"
+
+
 def test_an_unknown_default_language_leaves_the_old_one(monkeypatch) -> None:
     """A typo in a config file must not quietly change how things sound."""
     monkeypatch.setattr("pylumicube.speaker._voices", {"de"})

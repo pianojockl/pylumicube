@@ -105,6 +105,7 @@ so Home Assistant creates the entities by itself:
 | `number.lumicube_speaker_volume` | 0..200, two-way |
 | `number.lumicube_display_brightness` | 0..255, two-way |
 | `text.lumicube_speak` | type a sentence, the cube says it |
+| `select.lumicube_speak_language` | language for spoken messages, from the cube's installed espeak voices |
 | `event.lumicube_top_button`, `..._middle`, `..._bottom`, `..._base` | button presses, for automations |
 
 Commands are plain payloads where that makes sense:

@@ -92,6 +92,7 @@ LANGUAGE_ALIASES = {
 }
 
 _voices: set[str] | None = None
+_languages: list[str] | None = None
 
 
 def available_voices() -> set[str]:
@@ -119,6 +120,38 @@ def available_voices() -> set[str]:
     return _voices
 
 
+def available_languages() -> list[str]:
+    """The language codes espeak has here, sorted, without the voice names.
+
+    This is what a picker wants: `de`, `en`, `en-gb`, ... — not the ~100
+    voice names (`german`, `mb-de1`) that `available_voices()` also carries
+    for resolving a caller's request.
+    """
+    global _languages
+    if _languages is None:
+        engine = shutil.which("espeak-ng") or shutil.which("espeak")
+        codes: set[str] = set()
+        if engine is not None:
+            try:
+                result = subprocess.run([engine, "--voices"], timeout=10,
+                                        capture_output=True, text=True, check=False)
+                for line in result.stdout.splitlines()[1:]:
+                    columns = line.split()
+                    if len(columns) >= 4:
+                        code = columns[1].lower()
+                        codes.add(code)
+                        # Also offer the bare language (espeak lists `en-us`
+                        # and `en-gb` but not `en`, which is what it uses by
+                        # default and what `-v en` means).
+                        base = code.split("-")[0]
+                        if 2 <= len(base) <= 3 and base.isalpha():
+                            codes.add(base)
+            except (OSError, subprocess.SubprocessError):  # pragma: no cover
+                log.debug("could not list espeak languages", exc_info=True)
+        _languages = sorted(codes)
+    return list(_languages)
+
+
 def resolve_voice(name: str | None) -> str | None:
     """Turn a requested language/voice into one espeak will accept.
 
@@ -139,6 +172,15 @@ def resolve_voice(name: str | None) -> str | None:
     if alias in voices:
         log.info("espeak voice %r -> %r", wanted, alias)
         return alias
+    # A bare language code is valid when espeak has *any* voice for it, even
+    # though its listing only names the variants: `en` is absent while
+    # `en-us`/`en-gb` are present, yet `espeak -v en` works and is the
+    # built-in default. Rejecting it made the default look unknown.
+    lowered = wanted.lower()
+    if 2 <= len(lowered) <= 3 and lowered.isalpha():
+        if any(voice.startswith(lowered + "-") for voice in voices):
+            log.info("espeak language %r (variants installed)", wanted)
+            return wanted
     log.warning("no espeak voice for %r; using the default", wanted)
     return None
 

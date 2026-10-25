@@ -1,0 +1,102 @@
+# Reference copy of the "LumiCube" dashboard (url_path: lumicube-controls),
+# as written through the HA API (`lovelace/config/save`).
+#
+# Mushroom cards are used for the buttons and entity rows (installed here as
+# a HACS frontend module); the text box and the language picker are standard
+# `entities` cards, because those render an editable field and a dropdown.
+
+views:
+  - title: LumiCube
+    path: cube
+    type: sections
+    max_columns: 3
+    sections:
+      - type: grid
+        cards:
+          - type: heading
+            heading: Sagen
+            icon: mdi:bullhorn
+          - type: entities
+            title: Satz
+            entities:
+              - entity: input_text.lumicube_say_text
+                name: Text
+          - type: entities
+            title: Sprache
+            entities:
+              - entity: select.lumicube_speak_language
+                name: Sprache
+          - type: custom:mushroom-template-card
+            primary: Sagen
+            secondary: Text aus dem Feld oben
+            icon: mdi:bullhorn
+            icon_color: amber
+            tap_action:
+              action: perform-action
+              perform_action: script.lumicube_say
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: Anzeige
+            icon: mdi:led-strip-variant
+          - type: entities
+            entities:
+              - entity: number.lumicube_display_brightness
+                name: Helligkeit
+          - type: custom:mushroom-template-card
+            primary: Laufschrift
+            secondary: Text über die LED-Matrix
+            icon: mdi:format-text-rotation-none
+            icon_color: orange
+            tap_action:
+              action: perform-action
+              perform_action: script.lumicube_scroll
+          - type: custom:mushroom-template-card
+            primary: Auf dem LCD zeigen
+            secondary: Text aufs Display
+            icon: mdi:monitor
+            icon_color: blue
+            tap_action:
+              action: perform-action
+              perform_action: script.lumicube_screen_text
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: Ton
+            icon: mdi:volume-high
+          - type: entities
+            entities:
+              - entity: number.lumicube_speaker_volume
+                name: Lautstärke
+          - type: custom:mushroom-template-card
+            primary: Ton
+            secondary: Kurzer Piepton
+            icon: mdi:music-note
+            icon_color: teal
+            tap_action:
+              action: perform-action
+              perform_action: script.lumicube_tone
+          - type: custom:mushroom-template-card
+            primary: Stop
+            secondary: Wiedergabe abbrechen
+            icon: mdi:stop
+            icon_color: red
+            tap_action:
+              action: perform-action
+              perform_action: script.lumicube_stop
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: Sensoren
+            icon: mdi:eye
+          - type: custom:mushroom-entity-card
+            entity: sensor.lumicube_ambient_light
+            name: Umgebungslicht
+            icon: mdi:brightness-5
+          - type: custom:mushroom-entity-card
+            entity: sensor.lumicube_cube_cpu_temperature
+            name: CPU-Temperatur
+            icon: mdi:thermometer

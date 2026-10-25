@@ -1,0 +1,8 @@
+# Reference copy of the helper the say button reads its sentence from.
+input_text:
+  lumicube_say_text:
+    name: LumiCube say text
+    icon: mdi:message-text
+    min: 0
+    max: 255
+    mode: text

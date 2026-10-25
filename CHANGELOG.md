@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **A LumiCube control panel in Home Assistant.** `select.lumicube_speak_language`
+  (its options are the languages espeak actually has on the cube) sets the
+  default speak language, so the existing `text.lumicube_speak` entity speaks
+  in it; a `say` payload naming a language still overrides it. On the Home
+  Assistant side: a `lumicube_say` script whose sentence falls back to a text
+  helper, plus scroll / screen-text / tone / stop scripts, and a "LumiCube"
+  dashboard of Mushroom cards. Reference copies are in `deploy/home-assistant/`.
+- **`resolve_voice` accepts a bare language when only its variants are
+  installed.** espeak lists `en-us` and `en-gb` but not `en`, which is what
+  `-v en` means and what it uses by default — rejecting it made the default
+  look unknown and left plain English out of the picker.
 - **A language for spoken messages.** `language` (or espeak's own `voice`)
   can be given per message over MQTT —
   `{"text": "Die Wäsche ist fertig", "language": "de"}` — and a default
@@ -49,6 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not even restart.
 
 ### Fixed
+- **The bridge's `speaker/language/set` handler had no subscription**, so the
+  language command was silently ignored — found by the user, who typed what
+  they heard: a German sentence spoken in an English voice. A test now
+  snapshots the whole command-topic list, because a handler with no
+  subscription is dead code.
 - **The link could wedge permanently, and that was the "lag".** The firmware's
   receive sequence only advances when it *accepts* a frame, so one frame it
   never accepts blocks the window for good — everything behind it waits

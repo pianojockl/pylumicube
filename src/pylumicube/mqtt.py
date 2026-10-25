@@ -8,6 +8,7 @@ can publish the sentence it wants spoken:
     lumicube/speaker/play       a WAV path on the cube
     lumicube/speaker/stop       anything
     lumicube/speaker/volume/set 0..200
+    lumicube/speaker/language/set  an espeak language (de, en-gb, ...)
     lumicube/screen/text        "hello" or {"text": ..., "size": 2, "colour": ...}
     lumicube/screen/image       an image path on the cube
     lumicube/screen/clear       a colour (hex like "#000000" or a number)
@@ -33,6 +34,8 @@ import logging
 import threading
 import time
 from typing import Any
+
+from . import speaker as speaker_module
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +97,13 @@ class MqttBridge:
         self._threads: list[threading.Thread] = []
         self._client: Any = None
         self._connected = threading.Event()
+        #: Language spoken when a `say` does not name one. Home Assistant's
+        #: text entity sends a bare string, so a selected language has to
+        #: live here rather than in the payload.
+        languages = speaker_module.available_languages()
+        self._speak_language = (speaker_module.SPEAK_LANGUAGE
+                                or ("en" if "en" in languages
+                                    else (languages[0] if languages else None)))
         self._last_state: dict[str, Any] = {}
         self._last_publish: dict[str, float] = {}
         self._scroll_thread: threading.Thread | None = None
@@ -175,7 +185,8 @@ class MqttBridge:
         """
         return tuple(self._topic(suffix) for suffix in (
             "speaker/say", "speaker/tone", "speaker/play", "speaker/stop",
-            "speaker/volume/set", "screen/text", "screen/image", "screen/clear",
+            "speaker/volume/set", "speaker/language/set",
+            "screen/text", "screen/image", "screen/clear",
             "display/fill", "display/scroll", "display/brightness/set",
         ))
 
@@ -224,7 +235,8 @@ class MqttBridge:
             options = value if isinstance(value, dict) else {}
             log.info("MQTT: say %r", text)
             cube.say(str(text),
-                     voice=options.get("voice") or options.get("language"),
+                     voice=(options.get("voice") or options.get("language")
+                            or self._speak_language),
                      volume=options.get("volume"))
             return
         if suffix in ("speaker/tone", "tone"):
@@ -311,6 +323,19 @@ class MqttBridge:
             self._scroll_thread.start()
             return
 
+        if suffix in ("speaker/language/set", "speaker/language"):
+            wanted = str(value).strip()
+            resolved = speaker_module.resolve_voice(wanted)
+            if resolved is None:
+                log.warning("MQTT: unknown speak language %r; keeping %s",
+                            wanted, self._speak_language)
+                return
+            speaker_module.set_speak_language(resolved)
+            self._speak_language = resolved
+            log.info("MQTT: speak language %s", resolved)
+            self._publish_state(self._topic("speaker/language"), resolved)
+            return
+
         if suffix in ("display/brightness/set", "display/brightness"):
             level = int(value)
             if level == self._last_state.get(self._topic("display/brightness")):
@@ -353,6 +378,9 @@ class MqttBridge:
         volume = getattr(self.cube.speaker, "volume", None)
         if volume is not None:
             self._publish_state(self._topic("speaker/volume"), int(volume))
+        if self._speak_language:
+            self._publish_state(self._topic("speaker/language"),
+                                self._speak_language)
 
     def _publish_state(self, topic: str, value: Any, *, force: bool = False) -> None:
         """Publish a retained value, skipping an unchanged one."""
@@ -430,6 +458,17 @@ class MqttBridge:
             "min": 0, "max": 255, "step": 5, "mode": "slider",
             "icon": "mdi:brightness-6",
         })
+        languages = speaker_module.available_languages()
+        if languages:
+            # The options come from the cube: espeak's own voice list is what
+            # decides whether a language can actually be spoken here.
+            self._discover(client, "select", "speak_language", {
+                "name": "Speak language",
+                "options": languages,
+                "state_topic": self._topic("speaker/language"),
+                "command_topic": self._topic("speaker/language/set"),
+                "icon": "mdi:translate",
+            })
         self._discover(client, "text", "speak", {
             "name": "Speak",
             "command_topic": self._topic("speaker/say"),
