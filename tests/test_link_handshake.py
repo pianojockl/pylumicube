@@ -13,6 +13,7 @@ import time
 
 import pytest
 
+from collections import deque
 from concurrent.futures import Future
 
 import pylumicube.framing as framing
@@ -222,6 +223,8 @@ def test_link_stats_report_queue_depth_and_latency() -> None:
     for _ in range(7):
         link.submit(b"payload", label="display", droppable=True)
     link._latencies_ms.extend([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+    link._latencies_by_label["audio"] = deque([1.0, 2.0])   # noqa: SLF001
+    link._latencies_by_label["control"] = deque([60.0])     # noqa: SLF001
     link._completed = 10                                    # noqa: SLF001
 
     stats = link.stats()
@@ -232,6 +235,11 @@ def test_link_stats_report_queue_depth_and_latency() -> None:
     assert stats["latency_ms"]["max"] == 10.0
     assert stats["latency_ms"]["p99"] >= stats["latency_ms"]["p90"]
     assert stats["by_label"] == {"display": 7}
+    # A control request's ACK waits for the firmware to service it; a
+    # streaming frame's does not, so the classes are reported separately.
+    assert stats["latency_by_label"]["audio"]["p50"] == 2.0   # nearest-rank
+    assert stats["latency_by_label"]["audio"]["max"] == 2.0
+    assert stats["latency_by_label"]["control"]["p50"] == 60.0
 
 
 def _drain(link) -> list[bytes]:
@@ -282,3 +290,70 @@ def test_a_reliable_frame_is_never_dropped() -> None:
     stats = link.stats()
     assert stats["dropped"] == 0
     assert stats["pending"] == bound + 8
+
+
+def test_a_deep_ingress_backlog_is_shed() -> None:
+    """Upstream drops bytes above its 16 KiB backlog to keep latency bounded."""
+    link = link_module.SerialLink("/dev/null", message_handler=None)
+    bound = link_module.SerialLink._MAX_BACKLOG               # noqa: SLF001
+    fake = FakeSerial()
+    link._serial = fake                                       # noqa: SLF001
+    link._running = True                                      # noqa: SLF001
+
+    fake.inject(b"\x00" * (bound + 500))
+    link._read_available()                                    # noqa: SLF001
+    assert link.stats()["skipped_bytes"] == 500
+
+    fake.inject(b"\x00" * (bound - 1))
+    link._read_available()                                    # noqa: SLF001
+    assert link.stats()["skipped_bytes"] == 500, "shed data it should not have"
+
+
+def test_egress_is_paced_within_a_byte_budget() -> None:
+    """Upstream sends at most `MAX_BATCH_BYTES` per 2.5 ms pass."""
+    link = link_module.SerialLink("/dev/null", message_handler=None)
+    fake = FakeSerial()
+    link._serial = fake                                       # noqa: SLF001
+    link._running = True                                      # noqa: SLF001
+    link._egress_initialised = True                           # noqa: SLF001
+
+    for _ in range(16):
+        link.submit(b"x" * 200, label="display", droppable=True)
+    link._service_egress()                                    # noqa: SLF001
+    first = len(fake.drain_tx())
+    assert 0 < first <= link_module.SerialLink._MAX_BATCH_BYTES, first  # noqa: SLF001
+
+    link._service_egress()                                    # noqa: SLF001
+    assert len(fake.drain_tx()) > 0, "the rest never went out"
+
+
+def test_a_stalled_window_is_re_initialised() -> None:
+    """One frame the firmware never accepts must not wedge the link forever.
+
+    Measured after a display flood: `last_ack` froze at 99 with 16 frames in
+    the window and 75 queued behind them, and only a daemon restart cleared
+    it. The firmware's receive sequence moves only when it *accepts* a frame,
+    so the link has to reset itself.
+    """
+    link = link_module.SerialLink("/dev/null", message_handler=None)
+    fake = FakeSerial()
+    link._serial = fake                                       # noqa: SLF001
+    link._running = True                                      # noqa: SLF001
+    link._egress_initialised = True                           # noqa: SLF001
+
+    stuck = link.submit(b"x" * 100)
+    link._service_egress()                                    # noqa: SLF001
+    assert link.stats()["window"] == 1
+
+    # No ACK arrived for longer than the stall threshold.
+    link._head_advanced_ns = (                                 # noqa: SLF001
+        time.monotonic_ns() - int(2 * link_module.SerialLink._WINDOW_STALL_S * 1e9))
+    link._service_egress()                                    # noqa: SLF001
+
+    stats = link.stats()
+    assert stats["resets"] == 1, "the watchdog did not fire"
+    assert stats["window"] == 0, "the stuck window was not cleared"
+    with pytest.raises(Exception):
+        stuck.result(timeout=0)          # the caller hears about it
+    assert link._egress_initialised is False, "no re-handshake"  # noqa: SLF001
+    assert fake.drain_tx(), "nothing was sent to re-initialise"

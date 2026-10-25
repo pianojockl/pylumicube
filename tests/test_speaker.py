@@ -16,6 +16,7 @@ import wave
 
 import pytest
 
+from pylumicube.constants import DROPPED
 from pylumicube.speaker import (
     CHUNK_SAMPLES,
     MAX_VOLUME,
@@ -361,6 +362,22 @@ def test_an_unknown_default_language_leaves_the_old_one(monkeypatch) -> None:
 
 
 # ----- link classification -------------------------------------------------
+
+
+def test_a_frame_dropped_by_the_link_counts_as_lost_audio() -> None:
+    """The link sheds the oldest droppable frame under load. For audio that is
+    a hole, and it used to be invisible: the future was discarded unread, so
+    `dropped_chunks` never showed it."""
+    results: list = [DROPPED, None]
+
+    def run(samples, **kwargs):
+        future: Future = Future()
+        future.set_result(results.pop(0) if results else None)
+        return future
+
+    speaker = Speaker(write=None, run=run, read=lambda *a, **k: None, pace=False)
+    speaker.write_pcm(b"\x00\x00" * 224)          # two chunks, so one is examined
+    assert speaker.dropped_chunks >= 1, "a link-dropped frame went uncounted"
 
 
 def test_audio_frames_are_classified_so_speech_never_queues() -> None:

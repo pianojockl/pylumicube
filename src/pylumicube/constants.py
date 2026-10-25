@@ -27,6 +27,12 @@ PROTOCOL_VERSION = 1
 FLUSH_COUNT = 256                  # PONGs to drain before sending INITIALISE
 WINDOW_SIZE = 16                   # outstanding MESSAGE frames
 
+#: Result of a future whose frame the link dropped instead of queueing it —
+#: only ever `droppable` frames, and only when the queue is over its bound.
+#: Callers that care (the speaker counts them as lost audio) can test for it;
+#: callers that do not simply see a resolved future.
+DROPPED = "dropped"
+
 # UAVCAN type IDs (TypeId.java)
 TYPE_ALLOCATION = 1
 TYPE_NODE_STATUS = 341

@@ -462,6 +462,17 @@ class Display:
         # See PROTOCOL.md §7 item 6.
         batches = list(_batch_for_frame(values, self._specs))
         log.debug("set_fields: %d values across %d batch(es)", len(values), len(batches))
+        # One batch at a time, waiting for each ACK before the next. The
+        # original daemon pipelined them as a single request with a countdown
+        # continuation, but this firmware drops *concurrent* SET_FIELDS on the
+        # display node: pipelining was tried here before and a `fill` loop on
+        # a Pi hit exactly that — later batches never applied. Upstream could
+        # afford to pipeline because it tracked each response and retried on
+        # the timeout task; waiting per batch is the price of not tracking
+        # them (which is what keeps a lost response from costing 2 s here).
+        # Worth re-testing one day as *pipeline + countdown*, not pipeline
+        # alone. The audio's runs on the cube node do pipeline safely — the
+        # speaker streams many frames deep and is smooth.
         for batch in batches:
             payload = flat_dictionary.serialise(batch, self._specs)
             future = self._transport.send_request(

@@ -34,6 +34,8 @@ from collections import deque
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future
 
+from .constants import DROPPED
+
 log = logging.getLogger(__name__)
 
 #: The firmware's sample rate, from `speaker.frequency`.
@@ -374,7 +376,17 @@ class Speaker:
                     time.sleep(due - now)
                 self._wait_for_space()
             while in_flight and in_flight[0].done():
-                in_flight.popleft()
+                finished = in_flight.popleft()
+                # The link may have dropped the frame instead of queueing it
+                # (bounded queue, oldest droppable frame first). That is a hole
+                # in the audio, and it used to be invisible: the future was
+                # discarded without being read, so the loss never showed up in
+                # `dropped_chunks`.
+                try:
+                    if finished.result() == DROPPED:
+                        self.dropped_chunks += 1
+                except Exception:  # noqa: BLE001 — a failed frame is a lost frame
+                    self.dropped_chunks += 1
             if len(in_flight) >= self.max_in_flight:
                 # Do not block. The future is only for error reporting and
                 # audio does not need it; waiting turns a busy link into a

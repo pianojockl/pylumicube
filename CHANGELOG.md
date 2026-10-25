@@ -49,6 +49,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not even restart.
 
 ### Fixed
+- **The link could wedge permanently, and that was the "lag".** The firmware's
+  receive sequence only advances when it *accepts* a frame, so one frame it
+  never accepts blocks the window for good — everything behind it waits
+  forever, and only a daemon restart cleared it. Measured after a display
+  flood: `last_ack` frozen at 99 with 16 frames in the window and 75 queued
+  behind them (`submitted 1534, completed 172`), while the ACKs kept arriving
+  (21920 of them — the firmware answering "I still have 99"). The egress now
+  watches for a window whose head has not moved for a second and re-initialises
+  the link: the stuck frames are already lost, so it fails them, re-handshakes,
+  and lets the pending queue out on a clean sequence space. Same flood after
+  the fix: `submitted 1541, completed 1423, window 0, pending 0`, drops down
+  from **1274 to 94**, and the clock never stopped. Two re-handshakes were
+  logged, each recovering in about a second.
+- **Audio frames dropped by the link were invisible.** The queue sheds the
+  oldest droppable frame under load, and the speaker discarded those futures
+  unread, so a hole in the speech never appeared in `dropped_chunks`.
+- **Ingress backlog is shed above 16 KiB** (upstream's `MAX_BACKLOG`, "to
+  reduce ingress latency"), and the egress paces itself to `MAX_BATCH_BYTES`
+  per 2.5 ms pass so a burst cannot overrun the firmware's receive buffer.
+- **Expired requests are swept by one thread**, not one thread per request
+  (upstream's `AbortExpiredRequestsTask` equivalent); a streaming caller that
+  never waits now starts no thread at all.
+- **The link reports what it is doing**: `stats` gained `pending`, `window`,
+  `window_labels`, `dropped`, `skipped_bytes`, `acks`, `last_ack`, `resets`,
+  `by_label` and per-class `latency_by_label`. A wedged or filling link raises
+  no errors — these numbers are the only way to see it. At rest on this cube
+  the round trip is p50 19.6 ms; a control request waits for the firmware to
+  service it (p50 ~60 ms) while display frames answer faster (p50 ~35 ms).
+- **Pipelining the display batches was tried and reverted.** The original
+  daemon sent all batches as one request with a countdown continuation — but
+  the repo already had hardware evidence against it on this firmware (a `fill`
+  loop on a Pi hit dropped concurrent SET_FIELDS on the display node), and now
+  that display writes no longer wait for a service response a dropped batch
+  would fail silently. Upstream could pipeline *because* it tracked responses;
+  doing one without the other is the dangerous combination. The evidence is
+  recorded in `display.py` so it is not re-litigated.
 - **Speech stuttering while other traffic was on the link, and intermittent
   display lag** — both from comparing this implementation against the original
   daemon's source (`lumicube-daemon-2024`, 99 Java files: `serial/`,

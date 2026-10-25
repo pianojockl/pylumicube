@@ -27,6 +27,7 @@ import serial  # pyserial
 from . import framing
 from .constants import (
     BAUD,
+    DROPPED,
     CMD_ACKNOWLEDGE,
     CMD_INITIALISE,
     CMD_INITIALISED,
@@ -71,11 +72,7 @@ class _Slot:
     last_sent_ns: int = 0
     future: Future | None = None
     submitted_ns: int = 0             # when the caller handed it to `submit()`
-
-
-#: Result of a future whose frame the link dropped instead of queueing it
-#: (only ever `droppable` frames, and only when the queue is over its bound).
-DROPPED = "dropped"
+    label: str = "control"            # frame class, for the latency breakdown
 
 
 class LinkBusy(RuntimeError):
@@ -107,6 +104,26 @@ class SerialLink:
     _RETRANSMIT_AFTER_S = 0.0125
     # Latency samples kept for the percentiles in `stats()` (a fixed window).
     _LATENCY_SAMPLES = 256
+    #: Bytes the egress may put on the wire per pass. Upstream derives the
+    #: same figure from the UART's capacity and its 2.5 ms active period
+    #: (`ALLOWABLE_BANDWIDTH * ACTIVE_PERIOD_NANOSECONDS / 1e9` = 750 bytes
+    #: at 3 Mbit/s), so that a burst cannot overrun the firmware's receive
+    #: buffer. Frames still go out as fast as they are acknowledged; this
+    #: only stops one pass from emptying a full window in a single burst.
+    #: How long the window may sit without its head advancing before the link
+    #: re-handshakes. The firmware's receive sequence only moves when it
+    #: *accepts* a frame, so one frame it never accepts wedges the link for
+    #: good: measured after a display flood, `last_ack` froze at 99 with 16
+    #: frames in the window and 75 queued behind them, and only a daemon
+    #: restart cleared it. Upstream never meets this because its frames are
+    #: always acceptable; this turns a permanent wedge into a hiccup.
+    _WINDOW_STALL_S = 1.0
+    _MAX_BATCH_BYTES = 750
+    #: Ingress backlog above which bytes are *dropped* rather than read.
+    #: Upstream's `MAX_BACKLOG` ("Maximum ingress latency in bytes") is the
+    #: same 16 KiB, for the same reason: a backlog this deep is stale, and
+    #: reading it out only adds latency to everything behind it.
+    _MAX_BACKLOG = 16384
     #: Queue bound. Reliable frames are never dropped, but a droppable one is
     #: dropped once the queue is this deep — bounded latency instead of the
     #: ever-growing delay an unbounded queue produces. Upstream refuses the
@@ -141,7 +158,16 @@ class SerialLink:
         # `collectorBacklog()`).
         self._submitted = 0
         self._completed = 0
+        self._skipped_bytes = 0
+        self._acks = 0
+        self._last_ack = -1
+        self._resets = 0
+        self._head_advanced_ns = time.monotonic_ns()
         self._latencies_ms: deque[float] = deque(maxlen=self._LATENCY_SAMPLES)
+        #: Per-class samples: a control request's ACK waits for the firmware to
+        #: service it (50-105 ms), while a streaming frame's does not, so one
+        #: aggregate figure would hide exactly the thing worth watching.
+        self._latencies_by_label: dict[str, deque[float]] = {}
         self._pending_lock = threading.Lock()
 
         # Ingress state (mirrors IngressThread.java)
@@ -271,9 +297,20 @@ class SerialLink:
 
     def _read_available(self) -> None:
         assert self._serial is not None
-        # serial.read with timeout returns up to N bytes within the timeout.
-        # Read whatever is in the OS buffer, plus block briefly for new data.
         try:
+            waiting = self._serial.in_waiting
+            if waiting > self._MAX_BACKLOG:
+                # Drop the stale head of the backlog, exactly as upstream does
+                # ("Skipped over {} bytes to reduce ingress latency"). The
+                # frame stream resyncs on the next delimiter, and the sender's
+                # window retransmits whatever went with it.
+                skip = waiting - self._MAX_BACKLOG
+                self._serial.read(skip)
+                self._skipped_bytes += skip
+                log.warning("skipped %d bytes of stale ingress (%d waiting)",
+                            skip, waiting)
+            # serial.read with timeout returns up to N bytes within the timeout.
+            # Read whatever is in the OS buffer, plus block briefly for new data.
             chunk = self._serial.read(self._serial.in_waiting or 1)
         except serial.SerialException:
             log.exception("read failure")
@@ -327,6 +364,8 @@ class SerialLink:
             self._handshake_event.set()
 
     def _handle_ack(self, ack_seq: int) -> None:
+        self._acks += 1
+        self._last_ack = ack_seq
         # Walk head over any acknowledged slots in window. See EgressThread.handleFeedback().
         if _in_window(ack_seq, self._head, self._tail):
             new_head = (ack_seq + 1) & 0xFF
@@ -337,16 +376,21 @@ class SerialLink:
                 if slot.future is not None and not slot.future.done():
                     slot.future.set_result(None)
                 if slot.submitted_ns:
-                    self._latencies_ms.append(
-                        (time.monotonic_ns() - slot.submitted_ns) / 1e6)
+                    elapsed = (time.monotonic_ns() - slot.submitted_ns) / 1e6
+                    self._latencies_ms.append(elapsed)
+                    series = self._latencies_by_label.setdefault(
+                        slot.label, deque(maxlen=self._LATENCY_SAMPLES))
+                    series.append(elapsed)
                     self._completed += 1
                 slot.payload = b""
                 slot.encoded = b""
                 slot.last_sent_ns = 0
                 slot.future = None
                 slot.submitted_ns = 0
+                slot.label = "control"
                 cursor = (cursor + 1) & 0xFF
             self._head = new_head
+            self._head_advanced_ns = time.monotonic_ns()
 
     def _handle_message(self, body: bytes) -> None:
         # body = [uavcan ...][seq]; we already stripped command and CRC.
@@ -376,6 +420,10 @@ class SerialLink:
         if not self._egress_initialised:
             self._service_handshake()
             return
+        self._check_window_stall()
+        if not self._egress_initialised:      # the watchdog just reset us
+            self._service_handshake()
+            return
 
         # Pull pending submits into the window
         with self._pending_lock:
@@ -388,18 +436,73 @@ class SerialLink:
                 slot.last_sent_ns = 0
                 slot.future = entry.future
                 slot.submitted_ns = entry.submitted_ns
+                slot.label = entry.label
                 self._tail = (self._tail + 1) & 0xFF
 
-        # Transmit slots that have never been sent or whose retry timer expired.
+        # Transmit slots that have never been sent or whose retry timer
+        # expired, within this pass's byte budget. Whatever is left goes out
+        # on the next pass (2.5 ms later), which is upstream's pacing: it
+        # keeps a burst from filling the firmware's receive buffer. The first
+        # frame always goes, so an oversized frame can never wedge the link.
         now = time.monotonic_ns()
         retry_threshold = self._RETRANSMIT_AFTER_S * 1e9
+        budget = self._MAX_BATCH_BYTES
         cursor = self._head
         while cursor != self._tail:
             slot = self._slots[cursor]
             if slot.encoded and (slot.last_sent_ns == 0 or now - slot.last_sent_ns >= retry_threshold):
+                # Decide *before* sending, as upstream does (it adds the
+                # length and breaks if that would breach the limit), so a pass
+                # never overshoots the budget. The head slot is exempt: one
+                # frame always goes, so the link cannot wedge on a frame
+                # larger than the budget.
+                if cursor != self._head and budget < len(slot.encoded):
+                    break
                 self._send_raw(slot.encoded)
                 slot.last_sent_ns = now
+                budget -= len(slot.encoded)
             cursor = (cursor + 1) & 0xFF
+
+    def _check_window_stall(self) -> None:
+        """Re-handshake if the window has stopped advancing.
+
+        A frame the firmware never accepts blocks its receive sequence, and
+        with it the whole link — the queue behind it grows while the clock's
+        display stops updating. Nothing on this side can tell *why* it was
+        rejected, so the recovery is the protocol's own reset: drop the stuck
+        window (those frames are already lost), re-initialise, and let the
+        pending queue go out on a clean sequence space.
+        """
+        if self._head == self._tail:
+            self._head_advanced_ns = time.monotonic_ns()
+            return
+        stalled = (time.monotonic_ns() - self._head_advanced_ns) / 1e9
+        if stalled < self._WINDOW_STALL_S:
+            return
+        log.warning("egress window stalled for %.1fs at sequence %d "
+                    "(last ACK %d, %d in flight); re-initialising the link",
+                    stalled, self._head, self._last_ack,
+                    (self._tail - self._head) & 0xFF)
+        self._reset_window()
+
+    def _reset_window(self) -> None:
+        """Fail the in-flight frames and start the handshake over."""
+        for slot in self._slots:
+            if slot.future is not None and not slot.future.done():
+                slot.future.set_exception(RuntimeError(
+                    "link re-initialised: frame was not accepted"))
+            slot.payload = b""
+            slot.encoded = b""
+            slot.last_sent_ns = 0
+            slot.future = None
+            slot.submitted_ns = 0
+            slot.label = "control"
+        self._head = 0
+        self._tail = 0
+        self._egress_initialised = False
+        self._countdown = 0          # straight to INITIALISE, not a PING drain
+        self._head_advanced_ns = time.monotonic_ns()
+        self._resets += 1
 
     def _service_handshake(self) -> None:
         if self._countdown > 0:
@@ -430,30 +533,51 @@ class SerialLink:
         """
         with self._pending_lock:
             pending = len(self._pending)
-        samples = sorted(self._latencies_ms)
-
-        def percentile(fraction: float) -> float:
-            if not samples:
-                return 0.0
-            index = min(len(samples) - 1, int(len(samples) * fraction))
-            return round(samples[index], 2)
-
+        # Which frames the *window* is holding: a window that stops advancing
+        # is what a wedged link looks like from outside, and the classes in it
+        # say whether it is the stream, the display or a control op. It is
+        # always the oldest frames (the window is a FIFO), so this is the
+        # queue's head.
+        in_window: dict[str, int] = {}
+        cursor = self._head
+        while cursor != self._tail:
+            slot = self._slots[cursor]
+            in_window[slot.label] = in_window.get(slot.label, 0) + 1
+            cursor = (cursor + 1) & 0xFF
         return {
             "pending": pending,
             "window": (self._tail - self._head) & 0xFF,
             "window_size": WINDOW_SIZE,
+            "window_labels": in_window,
             "submitted": self._submitted,
             "completed": self._completed,
             "dropped": self._dropped,
+            "acks": self._acks,
+            "resets": self._resets,
+            "last_ack": self._last_ack,
+            "skipped_bytes": self._skipped_bytes,
             "by_label": _count_labels(self._pending),
-            "latency_ms": {"p50": percentile(0.5), "p90": percentile(0.9),
-                           "p99": percentile(0.99),
-                           "max": round(samples[-1], 2) if samples else 0.0},
+            "latency_ms": _percentiles(self._latencies_ms),
+            "latency_by_label": {label: _percentiles(series)
+                                 for label, series in sorted(self._latencies_by_label.items())},
         }
 
     def _has_pending(self) -> bool:
         with self._pending_lock:
             return bool(self._pending)
+
+
+def _percentiles(samples: "deque[float] | list[float]") -> dict[str, float]:
+    """p50/p90/p99/max of a latency series, rounded for `stats`."""
+    ordered = sorted(samples)
+    if not ordered:
+        return {"p50": 0.0, "p90": 0.0, "p99": 0.0, "max": 0.0}
+
+    def at(fraction: float) -> float:
+        return round(ordered[min(len(ordered) - 1, int(len(ordered) * fraction))], 2)
+
+    return {"p50": at(0.5), "p90": at(0.9), "p99": at(0.99),
+            "max": round(ordered[-1], 2)}
 
 
 def _count_labels(entries: "list[_Queued]") -> dict[str, int]:

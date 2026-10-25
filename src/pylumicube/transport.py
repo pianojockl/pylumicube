@@ -24,6 +24,11 @@ from .link import SerialLink
 
 log = logging.getLogger(__name__)
 
+#: How often expired requests are swept. Upstream sweeps from a heartbeat
+#: every few seconds; a quarter second is cheap and lets a caller fail fast
+#: with a clear reason instead of waiting out its own timeout.
+_EXPIRY_SWEEP_S = 0.25
+
 
 BroadcastHandler = Callable[[u.Broadcast], None]
 RequestHandler = Callable[[u.ServiceRequest], None]
@@ -38,8 +43,12 @@ class Transport:
         self._service_transfer_ids: dict[tuple[int, int], int] = {}
         # broadcast transferId per (source, typeId) — only relevant when *we* broadcast
         self._broadcast_transfer_ids: dict[tuple[int, int], int] = {}
-        # outstanding requests: (source_of_response, type_id, transfer_id) -> Future
-        self._inflight: dict[tuple[int, int, int], Future] = {}
+        # outstanding requests: (source_of_response, type_id, transfer_id)
+        # -> (Future, deadline_ns). Upstream keeps the same table with a 5 s
+        # expiry and sweeps it from its heartbeat (`AbortExpiredRequestsTask`)
+        # so a lost response cannot pin a slot forever.
+        self._inflight: dict[tuple[int, int, int], tuple[Future, int]] = {}
+        self._sweeper: threading.Thread | None = None
         self._broadcast_handlers: list[BroadcastHandler] = []
         self._request_handlers: list[RequestHandler] = []
 
@@ -102,7 +111,8 @@ class Transport:
             if expect_response:
                 response_fut: Future = Future()
                 inflight_key = (dest_id, type_id, transfer_id)
-                self._inflight[inflight_key] = response_fut
+                self._inflight[inflight_key] = (
+                    response_fut, time.monotonic_ns() + int(timeout * 1e9))
         body = u.pack_message(transfer_id, message_id, payload)
         link_fut = self._link.submit(body, label=label, droppable=droppable)
 
@@ -119,15 +129,56 @@ class Transport:
                     response_fut.set_exception(exc)
         link_fut.add_done_callback(on_link_complete)
 
-        def expire() -> None:
-            time.sleep(timeout)
-            with self._lock:
-                still_pending = self._inflight.pop(inflight_key, None)
-            if still_pending is response_fut and not response_fut.done():
-                response_fut.set_exception(TimeoutError(
-                    f"no response for type_id={type_id} dest={dest_id} tid={transfer_id} after {timeout}s"))
-        threading.Thread(target=expire, daemon=True).start()
+        self._start_sweeper()
         return response_fut
+
+    def _start_sweeper(self) -> None:
+        """Start the expiry sweep once, on the first request that waits.
+
+        A thread per request (what this used to do) is one thread per control
+        operation for no benefit: upstream sweeps a single table from its
+        heartbeat, so this does the same. Started lazily so a transport that
+        only streams fire-and-forget frames never runs one at all.
+        """
+        if self._sweeper is not None:
+            return
+        with self._lock:
+            if self._sweeper is not None:
+                return
+            thread = threading.Thread(target=self._sweep_loop,
+                                      name="lumicube-expiry", daemon=True)
+            self._sweeper = thread
+            thread.start()
+
+    def _sweep_loop(self) -> None:
+        while True:
+            time.sleep(_EXPIRY_SWEEP_S)
+            try:
+                self.abort_expired()
+            except Exception:  # noqa: BLE001 — a sweep must never die
+                log.exception("expiry sweep failed")
+
+    def abort_expired(self, *, now_ns: int | None = None) -> int:
+        """Fail requests whose response never came, and free their slots.
+
+        Returns how many were aborted. Upstream's `AbortExpiredRequestsTask`
+        is the same idea: a lost response should not hold anything open, and
+        the caller should hear about it promptly rather than waiting out its
+        own timeout.
+        """
+        now = time.monotonic_ns() if now_ns is None else now_ns
+        expired: list[tuple[tuple[int, int, int], Future]] = []
+        with self._lock:
+            for key, (future, deadline) in list(self._inflight.items()):
+                if now >= deadline:
+                    self._inflight.pop(key, None)
+                    expired.append((key, future))
+        for (dest_id, type_id, transfer_id), future in expired:
+            if not future.done():
+                future.set_exception(TimeoutError(
+                    f"no response for type_id={type_id} dest={dest_id} "
+                    f"tid={transfer_id} (aborted as expired)"))
+        return len(expired)
 
     def send_response(self, dest_id: int, type_id: int, transfer_id: int,
                       payload: bytes, priority: int = DEFAULT_PRIORITY) -> Future:
@@ -156,7 +207,8 @@ class Transport:
         elif isinstance(transfer, u.ServiceResponse):
             key = (transfer.source_id, transfer.type_id, transfer.transfer_id)
             with self._lock:
-                fut = self._inflight.pop(key, None)
+                entry = self._inflight.pop(key, None)
+            fut = entry[0] if entry is not None else None
             if fut is not None and not fut.done():
                 fut.set_result(transfer.payload)
             else:
