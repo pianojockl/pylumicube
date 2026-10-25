@@ -21,19 +21,29 @@ Java `foundry-daemon`.
 - [x] **Module discovery** — `GET_PREFERRED_NAME` to pick the `cube` base board over the `button_and_light_sensor` board.
 - [x] **Schema discovery** — `ENUMERATE_FIELDS` walker (`utilities/snapshot_hardware.py`) that decodes in-line sub-dicts and resolves block floors via probing + binary search. See [`PROTOCOL.md`](./PROTOCOL.md) §4.5.1.
 - [x] **Telemetry** — `SUBSCRIBE_DEFAULT_FIELDS` with heartbeat renewal and `PUBLISHED_FIELDS` decoding into a per-node cache (`pylumicube.telemetry`), self-healing when the firmware answers a walk probe with the wrong block. Exposed as `LumiCube.light_sensor` / `.buttons` / `.modules`.
+- [x] **Bounded, class-ordered egress queue** — audio before control before display, dropping the oldest *droppable* frame instead of letting latency grow without limit (reliable frames are never dropped). Egress is paced to 750 bytes per 2.5 ms pass and ingress sheds above a 16 KiB backlog, both upstream's figures. Measured effect: an announcement that lost *every* chunk while a matrix scroll flooded the link now loses 5 of 1225.
+- [x] **Wedge recovery** — the firmware's receive sequence only advances when it *accepts* a frame, so one rejected frame used to block the window for good (only a daemon restart cleared it: measured `last_ack` frozen with 16 frames in flight and 75 queued behind them). The egress now re-handshakes if the window's head has not moved for a second.
+- [x] **The link is observable** — `stats` reports queue depth, window occupancy and its frame classes, drops, skipped bytes, ACK count and last ACK, re-handshakes, and latency overall and per class. A wedged or filling link raises no errors, so these numbers are the only way to see it. See [`PROTOCOL.md`](./PROTOCOL.md) §9.9.
 
 **Hardware modules**
 
 - [x] **LED matrix** — `SET_FIELDS` writes covering all 192 LEDs (3 frames). Exposed as the `lumicube-leds` CLI and `LumiCube.display`.
 - [x] **Sensor board** — `light_sensor` (ambient light, RGB, proximity, gestures) and `buttons` (presses + counters) read from telemetry, with the discovered schema grouped into modules the way the daemon's `Namespace.build` does (`pylumicube.modules`). `env_sensor` / `imu` work the same way when the add-on board is present.
 - [x] **Upstream-script compat shim** — `pylumicube.compat` recreates the foundry-daemon globals (`cube`, `display`, `hsv_colour`, `noise_*`, colour constants, etc.). `lumicube-run script.py` execs a community script in that namespace; display-only scripts (rainbow, rain, binary_clock, conways_game_of_life, autumn_scene, land_grab, lava_lamp, ripples, scrolling_clock — all under `scripts/original/`) run unchanged. Sensor scripts work too: `light_sensor` / `buttons` / `env_sensor` / `imu` are telemetry-backed and `pi` is implemented locally.
-- [ ] **Microphone input** — telemetry plumbing is in place; still missing the audio capture path (`microphone.start_recording`, voice recognition, `get_frequency_buckets`).
+- [x] **Microphone input** — 16 kHz s16le captured from the `microphone.data` block (`scripts/record_microphone.py`, `LumiCube.microphone`). Needs the cube board subscribed, which floods the link, so the daemon gates it behind `--allow-cube-telemetry`. Still missing: voice recognition and `get_frequency_buckets`.
 - [x] **Secondary LCD screen** — `LumiCube.screen`: `set_pixel`, `set_pixels`, `draw_rectangle`, `clear`, `write_text`, `draw_image` (Pillow, `[screen]` extra), plus `rotation` / `invert_colours` / `resolution_scaling`. Recipes transcribed from `ScreenSetHalfRowMethod` / `ScreenDrawRectangleMethod` / `ScreenWriteTextMethod`; verified on hardware.
 - [x] **Speaker** — `LumiCube.speaker`: `tone`, `play` (WAV), `say` (espeak-ng), `volume`, streaming 32 kHz mono PCM into `speaker.data` in the firmware's 112-sample chunks, pipelined and paced (no PulseAudio needed). Verified on hardware.
 
+**Daemon, clock and Home Assistant**
+
+- [x] **Daemon split** — `lumicube-daemon` owns the serial port and serves a control socket; the clock, the compat runner, ad-hoc scripts and Home Assistant are clients. A restart no longer takes the clock down with it, and a second daemon is refused by an `flock` before it can touch the port. See `deploy/`.
+- [x] **Ambient-light clock** — `scripts/ambient_clock.py` as a systemd user unit: dimming curve calibrated from the light log, its own 3x5 digits, hourly chime in twelve-hour words, button actions, CPU-temperature chart, and a language per `SPEAK_LANGUAGE`. It survives a daemon restart by reconnecting and re-applying its settings.
+- [x] **MQTT bridge** — the daemon publishes MQTT discovery, so Home Assistant creates the entities itself: sensors, volume and brightness, a text box that speaks, a **language picker**, and the cube's buttons as event entities. Commands live under `/set` so the bridge cannot hear its own state as a command (that loop made HA's volume slider cycle 0/5/10 at ~25 Hz).
+- [x] **Home Assistant control panel** — `lumicube_say` (sentence + optional language/volume), plus scroll, screen-text, tone and stop scripts, and a "LumiCube" dashboard of Mushroom cards. Reference copies in `deploy/home-assistant/`.
+
 **Tooling**
 
-- [ ] **FastAPI daemon** — replace the Java `foundry-daemon` with a Python REST API (Swagger-documented), shipped as a systemd unit.
+- [ ] **REST API** — the daemon speaks a line-JSON control protocol on a Unix socket; a REST/FastAPI face on top of it is not written.
 - [ ] **Web frontend** for the daemon.
 
 Protocol-side open questions are tracked in [`PROTOCOL.md`](./PROTOCOL.md) §7.
@@ -387,11 +397,15 @@ uv run pytest          # with uv
 pytest                 # with an activated venv
 ```
 
-The suite is fully offline — no hardware required. It covers COBS,
-CRC, framing, FlatDictionary, UAVCAN `messageId` encoding, an end-to-end
-handshake against a fake serial emulator, and the compat shim's
-coordinate mappings (pinned to the upstream daemon's formulae so the
-shim can't silently drift).
+**664 tests**, fully offline — no hardware required. Besides COBS, CRC,
+framing, FlatDictionary, UAVCAN `messageId` encoding, an end-to-end handshake
+against a fake serial emulator and the compat shim's coordinate mappings
+(pinned to the upstream daemon's formulae so the shim cannot silently drift),
+the suite covers the parts that only misbehave under load: the link's queue
+bounds and class ordering, its byte budget and ingress shedding, the
+window-stall recovery, request expiry, the audio's pacing and its counting of
+frames the link dropped, and the MQTT bridge's payload parsing, command-topic
+list and language handling.
 
 ## Project layout
 
@@ -411,20 +425,39 @@ src/pylumicube/
     modules.py           # module namespace (light_sensor, buttons, …)
     allocator.py         # 3-stage dynamic node-ID allocator
     node.py              # LumiCube top-level API
-    display.py           # Display module helpers
+    display.py           # LED matrix driver (own glyphs, delta writes, scroll)
+    screen.py            # secondary LCD driver
+    speaker.py           # 32 kHz PCM streaming, espeak-ng for say()
+    microphone.py        # 16 kHz capture from microphone.data
+    dimming.py           # ambient-light brightness curve
+    daemon.py            # lumicube-daemon: owns the port, serves the socket
+    control.py           # line-JSON control protocol (server + client)
+    client.py            # CubeClient / connect_or_open for scripts
+    client_cli.py        # lumicube-say / lumicube-do CLIs
+    mqtt.py              # MQTT bridge + Home Assistant discovery
     cli.py               # lumicube-leds CLI
     compat/
         runtime.py       # upstream-API shim: DisplayShim, stubs, build_globals, run_script
         font.py          # 5x7 ASCII bitmap font for scroll_text
         cli.py           # lumicube-run CLI
 
-tests/                   # offline pytest suite
+tests/                   # offline pytest suite (664 tests)
 scripts/
+    ambient_clock.py     # the clock: dimming, chime, buttons, temp chart
+    ambient_clock_config.py.example   # every setting it has
+    calibrate_dimming.py # measure a room and fit the curve
+    record_microphone.py # capture 16 kHz audio
     digital_clock.py     # native-API clock example
     plasma.py            # native-API 3D plasma effect
     original/            # the 17 upstream community scripts, run via lumicube-run
+deploy/                  # systemd units, service notes, HA reference configs
+    README.md            # install, daemon, clock, MQTT, calibration
+    home-assistant/      # the scripts, dashboard and helper (reference copies)
+ref_data/                # captures and probes from the reverse-engineering work
+    oracle/              # the original daemon's artefacts (class strings, jar list)
+    tools/               # probes: scroll, speech, audio stall, chime, light
 utilities/               # on-device debug + bring-up helpers
-PROTOCOL.md              # canonical protocol spec
+PROTOCOL.md              # canonical protocol spec, incl. §9 (vs the original daemon)
 CHANGELOG.md             # versioned change history
 LICENSE                  # GPL-3.0
 ```
@@ -488,10 +521,26 @@ daemon when one is running and open the port themselves when it is not — a
 fresh install needs no daemon.
 
 With a broker configured, the daemon bridges to MQTT, which is how Home
-Assistant drives the cube and reads it back: `lumicube/speaker/say` takes
-the sentence as its payload, and MQTT discovery creates entities for the
-light sensor, CPU temperature, speaker volume, display brightness, a text
-box that speaks and the cube's buttons. See `deploy/README.md` §4.
+Assistant drives the cube and reads it back. Discovery creates the entities
+itself: the light sensor, CPU temperature, speaker volume, display
+brightness, a text box that speaks, a **language picker** (its options are the
+languages espeak has on the cube) and the cube's buttons as event entities.
+
+Commands are plain payloads where that makes sense and JSON where they need
+options — `lumicube/speaker/say` takes `"hello"` or
+`{"text": ..., "language": "de", "volume": 60}`. The two *settable* values
+publish their state on the bare topic and take commands on `/set`
+(`speaker/volume/set`, `display/brightness/set`, `speaker/language/set`): a
+bridge that listened on both would hear its own state as a command, which is
+exactly the loop that had Home Assistant's volume slider cycling 0/5/10 at
+~25 Hz. `deploy/README.md` §4 has the topic table, and
+`deploy/home-assistant/` the scripts and dashboard that make a control panel
+out of it.
+
+`lumicube-do stats` reports the link's health alongside the audio counters —
+queue depth, window occupancy, drops, re-handshakes and latency per frame
+class. A lagging or wedged link raises no errors, so that block is the only way
+to see one; see [`PROTOCOL.md`](./PROTOCOL.md) §9.9.
 
 Getting the brightness right for a room is its own little job, so the clock
 logs what it saw and there is a tool to measure it:

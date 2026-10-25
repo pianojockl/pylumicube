@@ -150,6 +150,13 @@ stateless control.
 Source: [EgressThread.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/serial/EgressThread.java),
 [IngressThread.handleMessage](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/serial/IngressThread.java#L150)
 
+What this implementation does *around* that window — the bounded class-ordered
+queue, the egress byte budget, ingress shedding, retransmit timing, and the
+recovery from a window that stops advancing — is in [§9](#9-differences-from-the-original-daemon-and-why).
+The one protocol-level trap worth knowing here: because the receiver's `accept`
+only moves on a frame it **accepts**, a frame the firmware never accepts blocks
+the window for good (see §9.8).
+
 ### 2.4 Initialisation handshake
 
 The daemon side starts uninitialised. Until initialised, the daemon will not
@@ -402,6 +409,19 @@ batch of up to 32 fields per request and ships up to 10 requests per call
 (`MAX_KEYS / BATCH_CAPACITY = 320 / 32`).
 
 Response payload: empty (success/timeout signaled at the link/UAVCAN level).
+
+Two things measured on this hardware matter more than the layout:
+
+- **The response is not reliable.** A frame can be delivered — the link ACKs
+  it — while its ServiceResponse never arrives: 22 were lost in an hour on this
+  cube (`no response for type_id=216`). Waiting for it costs a full timeout for
+  a write that succeeded, so display writes wait for the *link* acknowledgement
+  instead (§9.4).
+- **The display node drops concurrent SET_FIELDS.** Pipelining its batches was
+  tried and reverted: a `fill` loop on a Pi hit it, and later batches never
+  applied (§9.5). The cube node is different — the speaker's `speaker.data`
+  runs pipeline many frames deep and are smooth — so the constraint is
+  per-node, not protocol-wide.
 
 Source: [SetFieldsMethod.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/server/method/node/SetFieldsMethod.java)
 
@@ -1019,7 +1039,13 @@ real photons on the panel).
    Pipelining works if you stop waiting: with several frames in flight the
    link sustains 300-600 frames/s (measured, §5.3). The Java daemon does the
    same — a `NullContinuation` for speaker audio, and "busy, retry later"
-   for screen commands. Open question: whether the response delay is
+   for screen commands — but it *tracked* each response and retried on a
+   timeout task, and pipelining without that tracking is the dangerous
+   half. Measured here since: the response itself is unreliable (22 lost in
+   an hour), so the display waits for the link ACK instead (§9.4); and the
+   **display node drops concurrent SET_FIELDS** (a `fill` loop proved it,
+   §9.5) while the cube node pipelines the speaker's runs fine. Remaining
+   question: whether the response delay is
    firmware compute or link contention (a 224-byte speaker frame costs the
    same ~57 ms as a tiny request, which suggests a fixed per-request
    processing delay rather than wire time).
@@ -1036,6 +1062,12 @@ real photons on the panel).
    (596 frames/s for tiny requests, 380/s for speaker chunks at 64 in
    flight), so latency, not bandwidth, is the constraint — which is why the
    screen and speaker drivers write without waiting.
+
+   Measured per class by the link's own `stats` (§9.9): **audio p50 ~32 ms,
+   display p50 ~35-40 ms, control p50 ~60-70 ms** — the wait is the firmware
+   servicing the request, and it differs by what the request is. That is why
+   the audio survives a 16-slot window at 286 frames/s while a control op
+   would not.
 9. **`PUBLISHED_FIELDS` field selection is opaque.** The sensor board
    publishes keys 0..13 + the 60000+ system blocks in ~30 frames/s, but
    *which* subset goes into a given frame is not documented and appears
@@ -1048,6 +1080,15 @@ real photons on the panel).
     possibly the firmware's UART/ingress sharing, possibly our ingress
     parsing.
 
+11. **Which frame wedges the link.** The window-stall recovery (§9.8) makes
+    a wedged link survivable, but the *trigger* is unknown: one frame is
+    rejected by the firmware and its receive sequence never moves past it
+    (`last_ack` frozen, 21920 ACKs answering "I still have 99").
+    Candidates: a key outside a module's span, a payload the service loop
+    cannot parse, or something about a frame sent immediately after a
+    flood. Settling it needs a capture of the frame at the stall — see the
+    capture path below.
+
 A realistic capture path: stop the Java daemon (`systemctl --user stop
 foundry-daemon.service`; if the user systemd manager isn't reachable in
 your shell, `export XDG_RUNTIME_DIR=/run/user/$(id -u)` first), then run
@@ -1059,6 +1100,12 @@ the link layer.
 ## 8. Reference: file pointers
 
 Canonical Java sources for each layer:
+
+The §9 comparison was made against a full checkout of the 2024 daemon (99 files,
+`src/main/java/com/abstractfoundry/daemon/`), kept at
+`/home/jockl/git/lumicube-daemon-2024` on the machine this was developed on.
+Its `python_daemon/` directory is the original Python implementation of the same
+layers, which is useful for the parts where the Java is terse.
 
 - Link layer:
   [SerialDriver.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/serial/SerialDriver.java),
@@ -1084,3 +1131,136 @@ Canonical Java sources for each layer:
   [QueryPreferredNamesTask.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/heartbeat/QueryPreferredNamesTask.java),
   [QueryMetadataTask.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/heartbeat/QueryMetadataTask.java),
   [SubscribeDefaultFieldsTask.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/heartbeat/SubscribeDefaultFieldsTask.java)
+  [AbortExpiredRequestsTask.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/heartbeat/AbortExpiredRequestsTask.java)
+- Concurrency and streaming (§9.2, §9.7):
+  [ServiceTable.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/uavcan/ServiceTable.java)
+  (32 concurrent transfer IDs per type and node, then `BackoffException`),
+  [SpeakerThread.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/audio/SpeakerThread.java),
+  [DisplaySetMethod.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/server/method/node/display/DisplaySetMethod.java),
+  [SetFieldsMethod.java](https://github.com/abstractfoundry/lumicube-daemon/blob/main/src/main/java/com/abstractfoundry/daemon/server/method/node/SetFieldsMethod.java)
+
+## 9. Differences from the original daemon, and why
+
+Cross-checked against the 2024 Java daemon's source (99 files under
+`src/main/java/com/abstractfoundry/daemon/`), which is the authority for
+everything upstream. Where this implementation differs, the reason is recorded
+here so the difference is a decision rather than an accident.
+
+### 9.1 Matched deliberately
+
+| Behaviour | Upstream | Here |
+| --- | --- | --- |
+| UART | 3 Mbaud, 8N1 | `BAUD = 3_000_000` |
+| Window | `WINDOW_SIZE = 16` | same |
+| Handshake drain | `FLUSH_COUNT = 256` PONGs | same |
+| COBS + CRC16 + 8-bit sequence | — | same |
+| Payload ceiling | 245 declared, firmware caps at 244 (§2.5) | 244 (`MAX_UAVCAN_PAYLOAD`) |
+| Wire priority | 20 for everything | 20 for everything (§9.3) |
+| Telemetry renewal | every `cadence`, asking for `cadence * 2` s, tolerating "too busy" | same |
+| Metadata walk | `(key0, key1)` absolute keys (§4.5.1) | same |
+| Audio format | 112-sample s16le runs at 32 kHz | same |
+| Display batching | by key count (`BATCH_CAPACITY`) | by encoded size (`MAX_UAVCAN_PAYLOAD`) |
+
+### 9.2 Queue discipline: bounded and class-ordered
+
+Upstream has no queue: `ServiceTable` allows **32 concurrent transfer IDs per
+(type, node)** and throws `BackoffException` beyond that, which the display
+treats as "busy, retry later" — the caller drops the frame. The equivalent here
+is a bounded local queue (`_MAX_PENDING = 64`) with two additions:
+
+- **frames are ordered by class** — audio, then control, then display — so a
+  speech frame is never stuck behind display frames. This is local only; the
+  wire priority stays 20 (§9.3).
+- **droppable frames are dropped oldest-first**; reliable frames never are,
+  they would rather wait.
+
+Why: the same intent — bounded latency, shed the expendable — with a queue
+instead of a service table, because the daemon here has no transfer-ID table to
+exhaust. Measured before this existed: with a matrix scroll flooding the link,
+an announcement lost **every** chunk; after it, 5 of 1225 (0.41%).
+
+### 9.3 The wire priority is left alone
+
+UAVCAN's `priority` is encoded into the message ID and the firmware presumably
+schedules on it, but upstream set it to 20 everywhere, so nothing here exercises
+it. Rather than change what the firmware sees on a hunch, the wire priority
+stays 20 and the queue order does the work. The same reasoning kept the speaker
+at 20: upstream's `SpeakerThread` used `requestPriority = 20` too, so audio is
+*not* privileged on the wire — it is privileged in our queue.
+
+### 9.4 Display writes wait for the link ACK, not the ServiceResponse
+
+Upstream blocked on the link acknowledgement (`SetFieldsMethod` ships with a
+continuation that the audio path sets to a `NullContinuation`). Here the display
+used to wait for the ServiceResponse — and it is **not reliable**: measured 22
+lost in an hour (`no response for type_id=216`), each costing a full 2 s
+timeout for a frame that had in fact arrived. Display writes are ACK-level now;
+the link retransmits until the firmware ACKs, so delivery is still guaranteed.
+
+### 9.5 Display batches are NOT pipelined (upstream's were)
+
+Upstream sends all batches of one call as a single request with a pooled
+countdown continuation. Doing that here was tried and reverted: **this firmware
+drops concurrent SET_FIELDS on the display node** — a `fill` loop on a Pi hit
+exactly that, and later batches simply never applied. Upstream could afford to
+pipeline because it *tracked* each response and retried on its timeout task;
+once display writes stopped waiting for responses (§9.4), a dropped batch would
+fail **silently**, which is worse than a slower write. Hence one batch at a
+time, waiting for each ACK. Worth re-testing one day as *pipeline + countdown*,
+not pipeline alone.
+
+The audio's runs are a different matter: they pipeline many frames deep on the
+cube node and are smooth (0-0.4% loss), so the constraint is specific to the
+display node.
+
+### 9.6 Egress pacing, ingress shedding, retransmit timing: ported
+
+- **Egress pacing** — `_MAX_BATCH_BYTES = 750` per pass, upstream's figure
+  (`ALLOWABLE_BANDWIDTH * ACTIVE_PERIOD_NANOSECONDS / 1e9` at 3 Mbit/s and a
+  2.5 ms active period). A pass never overshoots, and the head slot is exempt
+  so an oversized frame cannot wedge the link.
+- **Ingress shedding** — `_MAX_BACKLOG = 16384`, upstream's "maximum ingress
+  latency in bytes": beyond that the stale head of the backlog is dropped and
+  the frame stream resyncs on the next delimiter.
+- **Retransmit** — `_RETRANSMIT_AFTER_S = 0.0125`, matching upstream's
+  `CURSOR_RESET_DELAY_NANOSECONDS`. It was 50 ms, i.e. four times slower to
+  recover from any lost frame.
+- **Not ported: the cursor-reset holdoff.** Upstream waits
+  `CURSOR_RESET_HOLDOFF` cycles before wrapping its cursor; here each pass walks
+  the window within the byte budget, which already paces it.
+
+### 9.7 Expiry: one sweep instead of a heartbeat task
+
+Upstream's `AbortExpiredRequestsTask` sweeps a table with a 5 s expiry from its
+heartbeat. The equivalent here is one background thread
+(`_EXPIRY_SWEEP_S = 0.25`) that fails requests past their own deadline. It
+replaced **one thread per request**, which for a control-heavy client is one
+thread per operation; a transport that only streams fire-and-forget frames
+starts no thread at all.
+
+### 9.8 A wedge recovery upstream never needed
+
+The firmware's receive sequence advances only when it **accepts** a frame, so
+one frame it never accepts blocks the window permanently — everything behind it
+waits, and only a daemon restart cleared it. Measured after a display flood:
+`last_ack` frozen at 99 with 16 frames in the window and 75 queued behind them,
+while 21920 ACKs arrived (the firmware answering "I still have 99"). Upstream
+never meets this, because its frames are always acceptable.
+
+`_WINDOW_STALL_S = 1.0`: if the window's head has not moved for a second, the
+stuck frames are failed (they are already lost), the link re-initialises with
+`INITIALISE` on a clean sequence space, and the pending queue goes out again.
+Same flood afterwards: `submitted 1541 / completed 1423`, window 0, pending 0,
+drops down from 1274 to 94, two re-handshakes logged, the clock never stopped.
+
+**The trigger is still unknown** — which frame the firmware rejects, and why.
+A wire capture of the frame at the stall would settle it (§7).
+
+### 9.9 What the link reports now
+
+A wedged or filling link raises no errors, so `stats` carries the numbers that
+make it visible: `pending`, `window`, `window_labels`, `dropped`,
+`skipped_bytes`, `acks`, `last_ack`, `resets`, `by_label`, `latency_ms` and
+`latency_by_label`. At rest on this cube the round trip is p50 ~20 ms; a control
+request waits for the firmware to service it (p50 ~60-70 ms) while display
+frames answer faster (p50 ~35-40 ms) and audio frames faster still (p50 ~32 ms).
