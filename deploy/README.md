@@ -45,6 +45,7 @@ Every name is optional. The ones worth knowing about:
 | `ADAPT`, `LOW`, `HIGH` | auto-range the dimming curve, or pin the light range |
 | `BRIGHTNESS_MIN` | floor in a dark room — `0.02` is a barely-visible glow |
 | `SPEAKER_VOLUME` | 0..200; the firmware powers up at full blast |
+| `HOURLY_ORDER` | `speak-first` (default: the announcement, then the scroll), `scroll-first`, or `together` (both at :00 — scrolling while speaking starves the speech, `PROTOCOL.md` §9.10) |
 | `SCROLL_TIMES`, `SCROLL_SPEED` | how many times the time scrolls past at the top of the hour and on the top button (5 is ~19 s; the old script scrolled for a whole minute), and how fast |
 | `ALLOW_REBOOT` | whether the middle button reboots the Pi |
 | `TEMP_SAMPLE_SECONDS`, `TEMP_HISTORY` | CPU-temperature chart on the LCD |
@@ -207,7 +208,65 @@ automation:
 Without a broker (or with `--no-mqtt`) the daemon simply runs without the
 bridge; nothing else changes.
 
-## 5. Getting the brightness right
+## 5. Judging the speaker by ear (and by numbers)
+
+"Choppy" cannot be settled by reading code, so the audio pacing is a table of
+named profiles and there is a test that plays them. With the daemon running:
+
+One thing is settled, though, and it is not a pacing knob. The firmware drains
+its audio buffer at `speaker.frequency`, one 112-sample block every
+`112 / frequency` seconds, so 32 kHz asks for 286 blocks a second while this
+link serves about 258 — the buffer empties and the speaker holds and repeats
+blocks. The daemon therefore runs the speaker at **22050 Hz** (197 blocks a
+second, and espeak's native rate) and writes `speaker.frequency` itself at
+startup, so there is nothing to configure. The log line confirms it:
+
+```
+INFO pylumicube.daemon: speaker: 22050 Hz (the firmware drains its ring at this rate)
+```
+
+`--speaker-rate` / `PYLUMICUBE_SPEAKER_RATE` override it (16000 is the more
+conservative choice, 32000 the one to re-test after a firmware fix); the
+numbers are in `PROTOCOL.md` §9.10.
+
+```bash
+cd ~/git/pylumicube
+.venv/bin/python scripts/speaker_shootout.py --silent        # measure only
+.venv/bin/python scripts/speaker_shootout.py --volume 40     # listen: 9 variants
+.venv/bin/python scripts/speaker_shootout.py --variants 1,4,9
+.venv/bin/python scripts/speaker_shootout.py --speech        # then speech
+```
+
+Variant N is announced by N short blips and each one prints its timing:
+
+```
+1143 chunks / 4.00 s audio in  4.01 s wall, 0 dropped, tail 0.03 s
+gaps p95  10.7 max  29.1 ms (0 over 40 ms)  behind p95   0.0 max   0.8 ms
+link p50  49.8 p90  75.7 max  87.5 ms  retransmit 12.5 ms  ingress inline
+```
+
+`gaps` is the interval between chunk sends (wider than the firmware's buffer is
+a hole in the sound), `behind` is how late each chunk left against its
+real-time schedule, `tail` is the wait for the last frames. `--silent` sends
+the identical PCM at amplitude 0, so the numbers can be collected without
+making a sound. Every knob is restored afterwards, and two runs cannot overlap.
+
+The chosen variant becomes the default in `pylumicube.speaker.PROFILES`
+(`default` is `PacingProfile(ahead=8)`: keep eight blocks outstanding and let
+that, not a clock, set the pace), or a daemon setting:
+
+```bash
+# in ~/.config/systemd/user/pylumicube-daemon.service, [Service]:
+Environment=PYLUMICUBE_INGRESS=deferred
+Environment=PYLUMICUBE_RETRANSMIT_MS=50
+Environment=PYLUMICUBE_SPEAKER_RATE=22050
+# ...or per daemon run: --ingress deferred --retransmit-ms 50 --speaker-rate 22050
+```
+
+`lumicube-do config` shows the live values, and the same three knobs can be
+changed at runtime without a restart.
+
+## 6. Getting the brightness right
 
 The dimming curve has two knobs, and only one of them works at a time:
 
@@ -247,7 +306,7 @@ hour     n  ambient min     avg     max   brightness avg
   23    30           24      28      31             0.50
 ```
 
-## 6. Rolling back to the Java daemon
+## 7. Rolling back to the Java daemon
 
 ```bash
 systemctl --user disable --now pylumicube-clock

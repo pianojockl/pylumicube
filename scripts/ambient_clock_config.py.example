@@ -44,6 +44,12 @@ JITTER = 1.0             # per-pixel hue shimmer; 0 = steady colour
 ALLOW_REBOOT = True      # middle button reboots the Pi
 HOURLY_SCROLL = True     # scroll the time at the top of each hour
 HOURLY_SPEAK = True      # ...and speak it (needs the speaker module)
+HOURLY_ORDER = "speak-first"  # which comes first at :00 — "speak-first"
+                         # announces and then scrolls (the scroll is ~13 s, so
+                         # an "o'clock" after it would be late). "scroll-first"
+                         # is what the clock used to do; "together" starts both
+                         # at once, but scrolling while speaking starves the
+                         # speech (6.8 s of audio took 31 s, audibly chopped)
 SPEAK_LANGUAGE = "en"    # language of the chime and of spoken messages from
                          # Home Assistant: an espeak language or voice ("de",
                          # "en-gb", "de+f3"; ISO-639-3 like "deu" works too).

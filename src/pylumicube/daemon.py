@@ -23,7 +23,7 @@ from typing import Any
 from .constants import SERIAL_DEVICE
 from .control import ControlServer, resolve_socket_path
 from .node import LumiCube
-from .speaker import set_speak_language
+from .speaker import SPEAKER_RATE, set_speak_language
 from .telemetry import DEFAULT_CADENCE
 
 log = logging.getLogger(__name__)
@@ -77,10 +77,16 @@ class Daemon:
                  telemetry_cadence: float = DEFAULT_CADENCE,
                  mqtt: Any = None, temperature_interval: float = TEMPERATURE_INTERVAL,
                  clear_on_stop: bool = False,
-                 allow_cube_telemetry: bool = False) -> None:
+                 allow_cube_telemetry: bool = False,
+                 ingress_mode: str | None = None,
+                 retransmit_ms: float | None = None,
+                 speaker_rate: int | None = SPEAKER_RATE) -> None:
         self.port = port
         self.socket_path = resolve_socket_path(socket_path)
         self.mqtt_config = mqtt
+        self.ingress_mode = ingress_mode
+        self.retransmit_ms = retransmit_ms
+        self.speaker_rate = speaker_rate
         self.temperature_interval = temperature_interval
         self.clear_on_stop = clear_on_stop
         self.allow_cube_telemetry = bool(allow_cube_telemetry)
@@ -107,6 +113,8 @@ class Daemon:
         # the serial port the running daemon is using.
         self._lock_fd = acquire_instance_lock(self.socket_path)
         self.cube.start()
+        self._apply_tuning()
+        self._apply_speaker_rate()
         counts = self.cube.walk_all_schemas()
         log.info("schemas: %s", ", ".join(
             f"node {node}: {count}" for node, count in sorted(counts.items())))
@@ -123,6 +131,48 @@ class Daemon:
         thread = threading.Thread(target=target, name=name, daemon=True)
         thread.start()
         self._threads.append(thread)
+
+    def _apply_tuning(self) -> None:
+        """Apply the daemon's own link defaults (see `ControlServer`'s `config`).
+
+        These are the knobs the smoothness shootout varies; once a variant
+        wins they belong here (or in the systemd unit) so they are in force
+        from the first frame, not only after someone pokes the socket.
+        """
+        try:
+            link = self.cube.link
+        except Exception:  # noqa: BLE001 — tuning is optional
+            log.debug("no link to tune", exc_info=True)
+            return
+        if self.ingress_mode:
+            link.set_ingress_mode(self.ingress_mode)
+            log.info("ingress decode is %s", link.ingress_mode)
+        if self.retransmit_ms is not None:
+            seconds = link.set_retransmit(float(self.retransmit_ms) / 1000.0)
+            log.info("retransmit after %.1f ms", seconds * 1000.0)
+
+    def _apply_speaker_rate(self) -> None:
+        """Tell the firmware what rate to drain its audio ring at.
+
+        `speaker.frequency` is a settable field, and running it at the declared
+        32 kHz starves the ring: the firmware services about 258 frames/s while
+        32 kHz mono needs 286. At the default 22050 Hz only 197 frames/s are
+        needed, and speech from espeak needs no resampling at all. The value
+        lives in the firmware, so it is written once here (and again whenever
+        the cube is power-cycled, which restarts this daemon).
+        """
+        if self.speaker_rate is None:
+            return
+        rate = int(self.speaker_rate)
+        try:
+            speaker = self.cube.speaker
+            speaker.sample_rate = rate
+            self.cube.write_named("speaker", {"frequency": rate})
+        except Exception:  # noqa: BLE001 — audio is never worth failing over
+            log.warning("could not set the speaker rate to %d Hz", rate,
+                        exc_info=True)
+            return
+        log.info("speaker: %d Hz (the firmware drains its ring at this rate)", rate)
 
     def stop(self) -> None:
         self._stop.set()
@@ -247,6 +297,25 @@ def build_parser() -> "argparse.ArgumentParser":
                         help="default espeak language or voice for spoken "
                              "messages (de, en-gb, deu, german); a client "
                              "can override it per call")
+    parser.add_argument("--speaker-rate", type=int,
+                        default=int(os.environ.get("PYLUMICUBE_SPEAKER_RATE",
+                                                   SPEAKER_RATE)),
+                        help="rate to run the speaker at (default %d). The "
+                             "firmware services ~258 frames/s and 32 kHz needs "
+                             "286, so 32 kHz starves its ring; 22050 needs 197 "
+                             "and is espeak's native rate" % SPEAKER_RATE)
+    parser.add_argument("--ingress",
+                        choices=("inline", "deferred"),
+                        default=os.environ.get("PYLUMICUBE_INGRESS"),
+                        help="where received frames are decoded: inline in the "
+                             "serial worker (default) or on their own thread "
+                             "(upstream's Inbox Disruptor equivalent)")
+    parser.add_argument("--retransmit-ms", type=float,
+                        default=(float(os.environ["PYLUMICUBE_RETRANSMIT_MS"])
+                                 if os.environ.get("PYLUMICUBE_RETRANSMIT_MS")
+                                 else None),
+                        help="re-send a frame after this many ms without its "
+                             "ACK (default 12.5, upstream's figure)")
     parser.add_argument("--mqtt-host", default=os.environ.get("PYLUMICUBE_MQTT_HOST"),
                         help="MQTT broker for the Home Assistant bridge")
     parser.add_argument("--mqtt-port", type=int,
@@ -305,7 +374,10 @@ def main(argv: list[str] | None = None) -> int:
 
     daemon = Daemon(args.port, socket_path=args.socket, log_ops=args.log_ops,
                     mqtt=mqtt, clear_on_stop=args.clear_on_stop,
-                    allow_cube_telemetry=args.allow_cube_telemetry)
+                    allow_cube_telemetry=args.allow_cube_telemetry,
+                    ingress_mode=args.ingress,
+                    retransmit_ms=args.retransmit_ms,
+                    speaker_rate=args.speaker_rate)
 
     def _stop(_signum: int, _frame: Any) -> None:
         log.info("stopping")

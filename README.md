@@ -32,7 +32,7 @@ Java `foundry-daemon`.
 - [x] **Upstream-script compat shim** — `pylumicube.compat` recreates the foundry-daemon globals (`cube`, `display`, `hsv_colour`, `noise_*`, colour constants, etc.). `lumicube-run script.py` execs a community script in that namespace; display-only scripts (rainbow, rain, binary_clock, conways_game_of_life, autumn_scene, land_grab, lava_lamp, ripples, scrolling_clock — all under `scripts/original/`) run unchanged. Sensor scripts work too: `light_sensor` / `buttons` / `env_sensor` / `imu` are telemetry-backed and `pi` is implemented locally.
 - [x] **Microphone input** — 16 kHz s16le captured from the `microphone.data` block (`scripts/record_microphone.py`, `LumiCube.microphone`). Needs the cube board subscribed, which floods the link, so the daemon gates it behind `--allow-cube-telemetry`. Still missing: voice recognition and `get_frequency_buckets`.
 - [x] **Secondary LCD screen** — `LumiCube.screen`: `set_pixel`, `set_pixels`, `draw_rectangle`, `clear`, `write_text`, `draw_image` (Pillow, `[screen]` extra), plus `rotation` / `invert_colours` / `resolution_scaling`. Recipes transcribed from `ScreenSetHalfRowMethod` / `ScreenDrawRectangleMethod` / `ScreenWriteTextMethod`; verified on hardware.
-- [x] **Speaker** — `LumiCube.speaker`: `tone`, `play` (WAV), `say` (espeak-ng), `volume`, streaming 32 kHz mono PCM into `speaker.data` in the firmware's 112-sample chunks, pipelined and paced (no PulseAudio needed). Verified on hardware.
+- [x] **Speaker** — `LumiCube.speaker`: `tone`, `play` (WAV), `say` (espeak-ng), `volume`, streaming mono PCM into `speaker.data` in the firmware's 112-sample chunks, pipelined and paced (no PulseAudio needed). The sample rate matters more than it looks: the firmware drains one 112-sample block per `112 / speaker.frequency` seconds, so 32 kHz asks for 286 requests a second and this link serves about 258 — the ring empties and the speaker holds and repeats blocks (measured: 4 s of audio took 5.9 s, submit-to-ACK p50 510 ms). At **22050 Hz** only 197 are needed, espeak-ng's native rate, so speech is not resampled either; see `PROTOCOL.md` §9.10. Every stream reports its own timing (`StreamReport`: send gaps, how late it ran, the tail wait) in `stats`, and the pacing itself is a named `profile` — see `scripts/speaker_shootout.py`, which plays one tone through nine variants so the ear picks the smoothest. Verified on hardware.
 
 **Daemon, clock and Home Assistant**
 
@@ -230,6 +230,50 @@ telemetry switched off — it competes for the link (308 vs 56 chunks/s),
 which is why the example subscribes to the sensor board only and walks the
 cube board's schema separately.
 
+### Judging the speaker by ear (and by numbers)
+
+"Choppy" is not something to fix by reasoning about jitter, so the pacing is
+a table of named profiles and there is a test that plays them. Before any of
+that, though, the rate has to be one the link can feed: at 32 kHz the firmware
+wants 286 blocks a second and gets ~258, so no pacing can save it — the
+daemon runs the speaker at 22050 Hz (197 blocks a second, and espeak's native
+rate), `--speaker-rate 32000` to re-test after a firmware fix. The full story
+is `PROTOCOL.md` §9.10.
+
+```bash
+lumicube-daemon &                                    # it owns the audio path
+python scripts/speaker_shootout.py --silent          # measure, no sound
+python scripts/speaker_shootout.py --volume 40       # 9 variants, 4 s each
+python scripts/speaker_shootout.py --variants 1,4,9  # just the finalists
+python scripts/speaker_shootout.py --speech          # the same, with speech
+```
+
+Variant N is announced by N short blips, so the number is unambiguous even if
+the screen is out of view, and each one prints what it did:
+
+```
+1143 chunks / 4.00 s audio in  4.01 s wall, 0 dropped, tail 0.03 s
+gaps p95  10.7 max  29.1 ms (0 over 40 ms)  behind p95   0.0 max   0.8 ms
+```
+
+`gaps` is the interval between chunk sends — wider than ~40 ms is a hole the
+firmware's buffer cannot cover; `behind` is how late each chunk left against
+the real-time schedule; `tail` is the trailing wait for the last frames, so a
+big one means the link ended the stream rather than the pacer. Every knob is
+restored afterwards, `--silent` sends the identical PCM at amplitude 0 (same
+frames, no sound), and two runs cannot overlap.
+
+The profiles are `pylumicube.speaker.PROFILES` (`default`, `fine`, `deep`,
+`buffered`, `flood`, `soft-volume`, plus the `rate`/`pump`/`trickle`/`jittered`
+variants the rounds above used) and a single stream can use one without
+changing anything else: `cube.speaker.say("hi", profile="deep")`,
+`lumicube-do tone frequency=1000 duration=4 profile=deep`. The shipping
+`default` keeps **8 blocks outstanding** rather than pacing against a clock —
+a clock pacer can only be late, and being late is what empties the ring. The
+daemon's `config` op tunes the three things outside the stream itself —
+`retransmit_ms`, `ingress` (`inline`/`deferred`) and `switch_interval` — and
+`--ingress`/`--retransmit-ms`/`--speaker-rate` make a choice permanent.
+
 Both are run as plain Python scripts:
 
 ```bash
@@ -397,15 +441,16 @@ uv run pytest          # with uv
 pytest                 # with an activated venv
 ```
 
-**664 tests**, fully offline — no hardware required. Besides COBS, CRC,
+**718 tests**, fully offline — no hardware required. Besides COBS, CRC,
 framing, FlatDictionary, UAVCAN `messageId` encoding, an end-to-end handshake
 against a fake serial emulator and the compat shim's coordinate mappings
 (pinned to the upstream daemon's formulae so the shim cannot silently drift),
 the suite covers the parts that only misbehave under load: the link's queue
 bounds and class ordering, its byte budget and ingress shedding, the
-window-stall recovery, request expiry, the audio's pacing and its counting of
-frames the link dropped, and the MQTT bridge's payload parsing, command-topic
-list and language handling.
+window-stall recovery, request expiry, the audio's pacing, its per-stream
+report and its counting of frames the link dropped, deferred ingress (order,
+draining and a raising handler), the clock's chime ordering, and the MQTT
+bridge's payload parsing, command-topic list and language handling.
 
 ## Project layout
 
@@ -427,7 +472,7 @@ src/pylumicube/
     node.py              # LumiCube top-level API
     display.py           # LED matrix driver (own glyphs, delta writes, scroll)
     screen.py            # secondary LCD driver
-    speaker.py           # 32 kHz PCM streaming, espeak-ng for say()
+    speaker.py           # 22 kHz PCM streaming, espeak-ng for say()
     microphone.py        # 16 kHz capture from microphone.data
     dimming.py           # ambient-light brightness curve
     daemon.py            # lumicube-daemon: owns the port, serves the socket
@@ -441,10 +486,11 @@ src/pylumicube/
         font.py          # 5x7 ASCII bitmap font for scroll_text
         cli.py           # lumicube-run CLI
 
-tests/                   # offline pytest suite (664 tests)
+tests/                   # offline pytest suite (718 tests)
 scripts/
     ambient_clock.py     # the clock: dimming, chime, buttons, temp chart
     ambient_clock_config.py.example   # every setting it has
+    speaker_shootout.py  # play one tone through each audio pacing variant
     calibrate_dimming.py # measure a room and fit the curve
     record_microphone.py # capture 16 kHz audio
     digital_clock.py     # native-API clock example
@@ -485,10 +531,17 @@ panel, minutes on the right, with the brightness following
 (`pylumicube.dimming`), so it dims in a dark room. Buttons scroll the
 time (top), reboot (middle, `ALLOW_REBOOT`) and draw a CPU-temperature
 chart on the secondary LCD (bottom — press again, or any other button, to
-blank it). The speaker volume is pinned on startup (`SPEAKER_VOLUME`),
-because the firmware powers up at full blast. Configuration goes in
-`scripts/ambient_clock_config.py` (copy the `.example`) or in any file
-passed as `--config`; run it with
+blank it). At the top of the hour it speaks the time *and* scrolls it;
+`HOURLY_ORDER` decides how the two share the moment — `speak-first` (default:
+the announcement first, then the ~13 s scroll), `scroll-first` (the old
+behaviour, where the "o'clock" arrived 13 s late), or `together`, which starts
+both at :00 over two connections. `together` sounds worse than it reads: a
+second client redrawing the matrix while the daemon streams audio starves the
+speech (measured: 6.84 s of speech took **31 s** with 154 inter-chunk gaps,
+against 6.89 s alone), because both are Python threads in one process and the
+display's byte-building holds the interpreter. The speaker volume is pinned on
+startup (`SPEAKER_VOLUME`), because the firmware powers up at full blast. Configuration goes in `scripts/ambient_clock_config.py`
+(copy the `.example`) or in any file passed as `--config`; run it with
 
 ```bash
 python scripts/ambient_clock.py            # forever
@@ -547,9 +600,12 @@ minute unless the value really moves (`PYLUMICUBE_MQTT_SENSOR_INTERVAL`,
 reads the sensor locally, not through MQTT.
 
 `lumicube-do stats` reports the link's health alongside the audio counters —
-queue depth, window occupancy, drops, re-handshakes and latency per frame
-class. A lagging or wedged link raises no errors, so that block is the only way
-to see one; see [`PROTOCOL.md`](./PROTOCOL.md) §9.9.
+queue depth, window occupancy, drops, re-handshakes, latency per frame class,
+the link's own tuning (`retransmit_ms`, ingress mode) and `audio.last_stream`,
+the send-gap/behind/tail timing of the most recent utterance. A lagging or
+wedged link raises no errors, so that block is the only way to see one; see
+[`PROTOCOL.md`](./PROTOCOL.md) §9.9. `lumicube-do config` reads the live
+tuning and `lumicube-do config set='{"ingress": "deferred"}'` changes it.
 
 Getting the brightness right for a room is its own little job, so the clock
 logs what it saw and there is a tool to measure it:

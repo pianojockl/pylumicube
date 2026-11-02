@@ -28,6 +28,7 @@ import logging
 import os
 import queue
 import socket
+import sys
 import threading
 import time
 from collections.abc import Mapping
@@ -147,6 +148,12 @@ def _audio_stats(cube: Any) -> dict[str, Any]:
     that made speech smooth was found by measuring exactly these, so they
     belong in `stats` where the next change can be checked the same way
     instead of by ear.
+
+    `last_stream` is the timing of the most recent utterance: the inter-chunk
+    send gaps (anything above ~40 ms is a gap the firmware's buffer cannot
+    cover), how late each chunk was against the schedule, and how long the
+    trailing wait took. A stutter is a delay, not a loss, so these are the
+    numbers that show it.
     """
     speaker = getattr(cube, "speaker", None)
     written = getattr(speaker, "written_chunks", None)
@@ -154,8 +161,22 @@ def _audio_stats(cube: Any) -> dict[str, Any]:
     if written is None or dropped is None:
         return {}
     total = written + dropped
-    return {"written_chunks": written, "dropped_chunks": dropped,
-            "loss_percent": round(100.0 * dropped / total, 2) if total else 0.0}
+    payload: dict[str, Any] = {
+        "written_chunks": written, "dropped_chunks": dropped,
+        "loss_percent": round(100.0 * dropped / total, 2) if total else 0.0}
+    report = getattr(speaker, "last_stream", None)
+    if report is not None:
+        payload["last_stream"] = report.as_dict()
+    payload["streams"] = getattr(speaker, "stream_count", 0)
+    return payload
+
+
+def _cube_link(cube: Any) -> Any:
+    """The daemon's `SerialLink`, or None (a property that may raise)."""
+    try:
+        return getattr(cube, "link", None)
+    except Exception:                     # noqa: BLE001 — the link is optional
+        return None
 
 
 class _Connection:
@@ -572,38 +593,42 @@ class ControlServer:
             if not text:
                 raise ControlError("text is required", code="bad_request")
             self._audio_stopped.clear()
-            speaker = cube.speaker
-            written, dropped = (getattr(speaker, "written_chunks", 0),
-                                getattr(speaker, "dropped_chunks", 0))
-            with self.audio_lock:
-                cube.say(text, voice=request.get("voice"),
-                         speed=request.get("speed"),
-                         volume=request.get("volume"))
-            log.info("said %r (%d chunks, %d dropped, %d%% loss)", text,
-                     getattr(speaker, "written_chunks", 0) - written,
-                     getattr(speaker, "dropped_chunks", 0) - dropped,
-                     round(100 * (getattr(speaker, "dropped_chunks", 0) - dropped)
-                           / max(1, getattr(speaker, "written_chunks", 0) - written)))
-            return {"ok": True,
-                    "dropped": getattr(speaker, "dropped_chunks", 0) - dropped}
+            profile = request.get("profile")
+            report = self._run_audio(
+                lambda: cube.say(text, voice=request.get("voice"),
+                                 speed=request.get("speed"),
+                                 volume=request.get("volume"),
+                                 profile=profile))
+            log.info("said %r (%d chunks, %d dropped, %d%% loss, profile %s)", text,
+                     report.get("chunks", 0), report.get("dropped", 0),
+                     round(100 * report.get("dropped", 0)
+                           / max(1, report.get("chunks", 0))),
+                     report.get("profile", "default"))
+            return {"ok": True, "dropped": report.get("dropped", 0),
+                    "stream": report}
 
         if op == "tone":
             self._audio_stopped.clear()
-            with self.audio_lock:
-                cube.speaker.tone(float(request.get("frequency", 440.0)),
-                                  float(request.get("duration", 0.5)),
-                                  amplitude=float(request.get("amplitude", 0.25)),
-                                  function=str(request.get("function", "sine")))
-            return {"ok": True}
+            profile = request.get("profile")
+            report = self._run_audio(
+                lambda: cube.speaker.tone(
+                    float(request.get("frequency", 440.0)),
+                    float(request.get("duration", 0.5)),
+                    amplitude=float(request.get("amplitude", 0.25)),
+                    function=str(request.get("function", "sine")),
+                    profile=profile))
+            return {"ok": True, "dropped": report.get("dropped", 0),
+                    "stream": report}
 
         if op == "play":
             path = str(request.get("path", ""))
             if not path:
                 raise ControlError("path is required", code="bad_request")
             self._audio_stopped.clear()
-            with self.audio_lock:
-                cube.speaker.play(path)
-            return {"ok": True}
+            report = self._run_audio(
+                lambda: cube.speaker.play(path, profile=request.get("profile")))
+            return {"ok": True, "dropped": report.get("dropped", 0),
+                    "stream": report}
 
         if op == "stop_audio":
             self._audio_stopped.set()
@@ -625,7 +650,89 @@ class ControlServer:
                                if hasattr(cube, "link_stats") else {})
             return payload
 
+        if op == "config":
+            return self._config(request)
+
         raise ControlError(f"unknown op {op!r}", code="no_op")
+
+    # ---------------- audio + tuning helpers ----------------
+
+    def _run_audio(self, function: Any) -> dict[str, Any]:
+        """Run one audio op under the speaker lock; return its stream report.
+
+        Everything that talks to the speaker goes through here, so a caller
+        gets the timing of *its own* stream back (and never another client's):
+        the speaker keeps the last report, and this delta-checks the counters
+        around it.
+        """
+        speaker = getattr(self.cube, "speaker", None)
+        dropped_before = getattr(speaker, "dropped_chunks", 0)
+        streams_before = getattr(speaker, "stream_count", 0)
+        with self.audio_lock:
+            function()
+        report = getattr(speaker, "last_stream", None)
+        payload = report.as_dict() if report is not None else {}
+        if getattr(speaker, "stream_count", 0) != streams_before:
+            payload["dropped"] = getattr(speaker, "dropped_chunks", 0) - dropped_before
+        return payload
+
+    def _config_view(self) -> dict[str, Any]:
+        """Current values of the live-tunable knobs (see ``op == "config"``)."""
+        view: dict[str, Any] = {"switch_interval": sys.getswitchinterval()}
+        link = _cube_link(self.cube)
+        if link is not None:
+            view["retransmit_ms"] = round(link.retransmit_after * 1000.0, 2)
+            view["ingress"] = link.ingress_mode
+        return view
+
+    def _config(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Read or change live tuning — the knobs a smoothness test varies.
+
+        Deliberately small: these are the three things outside the audio
+        stream itself that change how *steadily* its frames reach the
+        firmware. `scripts/speaker_shootout.py` drives them, and so can a
+        person: `lumicube-do config set='{"ingress": "deferred"}'`.
+
+        * ``retransmit_ms`` — how long a frame waits for its ACK before being
+          re-sent. Upstream's 12.5 ms is shorter than this link's round trip,
+          so frames that were merely queued get duplicated, which is more
+          traffic in a loop that is already tight.
+        * ``ingress`` — ``inline`` (decode telemetry in the serial worker) or
+          ``deferred`` (decode it on its own thread, as upstream's Inbox
+          Disruptor did).
+        * ``switch_interval`` — CPython's GIL hand-off interval. The default
+          5 ms is longer than the firmware's whole 3.5 ms chunk period.
+        """
+        set_values = request.get("set") or {}
+        if not isinstance(set_values, Mapping):
+            raise ControlError("set must be an object", code="bad_request")
+        link = _cube_link(self.cube)
+        applied: dict[str, Any] = {}
+        for key, value in set_values.items():
+            if key == "retransmit_ms":
+                if link is None:
+                    raise ControlError("no link to tune", code="unavailable")
+                applied[key] = round(link.set_retransmit(float(value) / 1000.0)
+                                     * 1000.0, 2)
+            elif key == "ingress":
+                if link is None:
+                    raise ControlError("no link to tune", code="unavailable")
+                try:
+                    applied[key] = link.set_ingress_mode(str(value))
+                except ValueError as exc:
+                    raise ControlError(str(exc), code="bad_config") from None
+            elif key == "switch_interval":
+                interval = float(value)
+                if not 0.0001 <= interval <= 0.1:
+                    raise ControlError("switch_interval must be 0.0001..0.1 s",
+                                       code="bad_config")
+                sys.setswitchinterval(interval)
+                applied[key] = sys.getswitchinterval()
+            else:
+                raise ControlError(f"unknown config key {key!r} "
+                                   f"(known: retransmit_ms, ingress, "
+                                   f"switch_interval)", code="bad_config")
+        return {"ok": True, "set": applied, "config": self._config_view()}
 
     def _module(self, request: Mapping[str, Any]):
         name = str(request.get("module", ""))

@@ -511,18 +511,21 @@ class LumiCube:
         return self._speaker
 
     def say(self, text: str, *, voice: str | None = None, speed: int | None = None,
-            volume: int | None = None) -> None:
+            volume: int | None = None,
+            profile: str | None = None) -> None:
         """Speak `text` out of the cube's speaker.
 
         Needs `espeak-ng` (or `espeak`) on PATH. `volume` is 0..200 and is
         written first, so a caller can pin the level per announcement.
+        `profile` picks a `pylumicube.speaker.PROFILES` entry for this
+        utterance (the smoothness shootout's knob).
         """
         if volume is not None:
             self.speaker.volume = volume
         if speed is None:
-            self.speaker.say(text, voice=voice)
+            self.speaker.say(text, voice=voice, profile=profile)
         else:
-            self.speaker.say(text, voice=voice, speed=speed)
+            self.speaker.say(text, voice=voice, speed=speed, profile=profile)
 
     @property
     def microphone(self):

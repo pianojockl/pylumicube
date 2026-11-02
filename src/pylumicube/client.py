@@ -263,6 +263,11 @@ class CubeClient:
 
     def _on_event(self, message: Mapping[str, Any]) -> None:
         if message.get("event") == "values":
+            if not hasattr(self, "_telemetry"):
+                # `ControlClient.connect()` runs inside its constructor, which
+                # happens before this object has its telemetry view — an event
+                # arriving in that window used to raise from the reader thread.
+                return
             node = message.get("node")
             values = message.get("values") or {}
             if node is None:
@@ -440,12 +445,13 @@ class CubeClient:
     # ---------------- audio (atomic on the daemon) ----------------
 
     def say(self, text: str, *, voice: str | None = None, speed: int | None = None,
-            volume: int | None = None) -> None:
+            volume: int | None = None, profile: str | None = None) -> dict[str, Any]:
         """Ask the daemon to speak, holding the speaker for the utterance.
 
         Going through the daemon (rather than streaming chunks from here)
         is what stops an announcement from Home Assistant talking over the
-        clock's hourly chime.
+        clock's hourly chime. Returns the reply, whose `stream` is this
+        utterance's timing (see `pylumicube.speaker.StreamReport`).
         """
         fields: dict[str, Any] = {"text": text}
         if voice is not None:
@@ -454,16 +460,35 @@ class CubeClient:
             fields["speed"] = speed
         if volume is not None:
             fields["volume"] = volume
-        self.control.request("say", timeout=120.0, **fields)
+        if profile is not None:
+            fields["profile"] = profile
+        return self.control.request("say", timeout=120.0, **fields)
 
     def tone(self, frequency: float = 440.0, duration: float = 0.5, *,
-             amplitude: float = 0.25, function: str = "sine") -> None:
-        self.control.request("tone", timeout=duration + 10.0,
-                             frequency=frequency, duration=duration,
-                             amplitude=amplitude, function=function)
+             amplitude: float = 0.25, function: str = "sine",
+             profile: str | None = None) -> dict[str, Any]:
+        fields: dict[str, Any] = {"frequency": frequency, "duration": duration,
+                                  "amplitude": amplitude, "function": function}
+        if profile is not None:
+            fields["profile"] = profile
+        return self.control.request("tone", timeout=duration + 30.0, **fields)
 
-    def play(self, path: str) -> None:
-        self.control.request("play", path=path, timeout=600.0)
+    def play(self, path: str, *, profile: str | None = None) -> dict[str, Any]:
+        fields: dict[str, Any] = {"path": path}
+        if profile is not None:
+            fields["profile"] = profile
+        return self.control.request("play", timeout=600.0, **fields)
+
+    def configure(self, **values: Any) -> dict[str, Any]:
+        """Read or change the daemon's live tuning (see `op == "config"`).
+
+        `client.configure()` reads; `client.configure(ingress="deferred")`
+        sets. The knobs are `retransmit_ms`, `ingress` and
+        `switch_interval` — what the smoothness shootout varies.
+        """
+        if not values:
+            return self.control.request("config")
+        return self.control.request("config", set=dict(values))
 
     def stop_audio(self) -> None:
         """Stop whatever is being said (including another client's stream)."""

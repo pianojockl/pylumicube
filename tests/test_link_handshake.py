@@ -209,6 +209,49 @@ def test_handshake_and_message(fake_link, monkeypatch):
         cube.stop()
 
 
+# ----- threading model -----------------------------------------------------
+
+
+def test_ingress_and_egress_run_in_separate_threads(fake_link) -> None:   # noqa: F811
+    """Upstream's split, and the reason for it: one thread doing both couples
+    a slow read (or a telemetry burst) to the audio's send schedule."""
+    fake = fake_link
+    cube = CubeEmulator(fake)
+    try:
+        link = link_module.SerialLink("dummy")
+        link.start(handshake_timeout=10.0)
+        try:
+            names = {thread.name for thread in threading.enumerate()}
+            assert "lumicube-ingress-serial" in names
+            assert "lumicube-egress" in names
+        finally:
+            link.stop()
+    finally:
+        cube.stop()
+
+
+def test_a_lone_frame_does_not_wait_out_the_idle_poll(fake_link) -> None:  # noqa: F811
+    """Submitting wakes the egress thread; before it did, one frame took
+    54-88 ms because the worker was parked for 50 ms."""
+    fake = fake_link
+    cube = CubeEmulator(fake)
+    try:
+        link = link_module.SerialLink("dummy")
+        link.start(handshake_timeout=10.0)
+        try:
+            best = []
+            for _ in range(5):
+                time.sleep(0.2)                     # let the link go idle
+                began = time.monotonic()
+                link.submit(b"\x00\x01\x02\x03\x04").result(timeout=2.0)
+                best.append(time.monotonic() - began)
+            assert min(best) < 0.020, f"lone frame took {min(best) * 1000:.0f} ms"
+        finally:
+            link.stop()
+    finally:
+        cube.stop()
+
+
 # ----- metrics -------------------------------------------------------------
 
 

@@ -60,15 +60,22 @@ class FakeSpeaker:
     def __init__(self) -> None:
         self.volume = 100
         self.tones: list[tuple] = []
-        self.played: list[str] = []
+        self.played: list[tuple[str, str | None]] = []
+        self.profiles: list[str | None] = []
         self.stops = 0
+        # What the daemon reads off the real driver for its `stats`.
+        self.written_chunks = 0
+        self.dropped_chunks = 0
+        self.stream_count = 0
+        self.last_stream = None
 
     def tone(self, frequency: float, duration: float, amplitude: float = 0.25,
-             function: str = "sine") -> None:
+             function: str = "sine", profile: str | None = None) -> None:
         self.tones.append((frequency, duration, amplitude, function))
+        self.profiles.append(profile)
 
-    def play(self, path: str) -> None:
-        self.played.append(path)
+    def play(self, path: str, profile: str | None = None) -> None:
+        self.played.append((path, profile))
 
     def stop(self) -> None:
         self.stops += 1
@@ -113,10 +120,13 @@ class FakeCube:
         }
 
     # LumiCube surface the ops use
-    def say(self, text: str, *, voice=None, speed=None, volume=None) -> None:
+    def say(self, text: str, *, voice=None, speed=None, volume=None,
+            profile=None) -> None:
         if self.say_delay:
             time.sleep(self.say_delay)
         self.said.append(text)
+        if profile is not None:
+            self.speaker.profiles.append(profile)
 
     @property
     def node_names(self) -> dict[int, str]:
@@ -252,7 +262,8 @@ def test_link_stats_is_a_method_not_a_property() -> None:
 
 
 def test_stats_omit_audio_when_there_is_no_speaker(server) -> None:
-    control, _cube = server
+    control, cube = server
+    cube.speaker = None
     with ControlClient(control.path) as client:
         assert client.request("stats")["audio"] == {}
 
@@ -373,8 +384,110 @@ def test_say_tone_play_and_stop(server) -> None:
         client.stop_audio()
     assert cube.said == ["hello"]
     assert cube.speaker.tones == [(880.0, 0.2, 0.25, "sine")]
-    assert cube.speaker.played == ["/tmp/clip.wav"]
+    assert cube.speaker.played == [("/tmp/clip.wav", None)]
     assert cube.speaker.stops == 1
+
+
+def test_a_pacing_profile_reaches_the_driver(server) -> None:
+    """The shootout's knob: the daemon must not swallow `profile`."""
+    control, cube = server
+    with CubeClient(control.path) as client:
+        client.tone(1000, 0.1, profile="deep")
+        client.say("hi", profile="fine")
+        client.play("/tmp/clip.wav", profile="soft-volume")
+    assert cube.speaker.profiles == ["deep", "fine"]
+    assert cube.speaker.played == [("/tmp/clip.wav", "soft-volume")]
+
+
+def test_the_reply_carries_the_stream_report(server) -> None:
+    control, cube = server
+    cube.speaker.last_stream = None
+    with CubeClient(control.path) as client:
+        reply = client.tone(1000, 0.1)
+    assert reply["ok"] is True
+    assert "stream" in reply and isinstance(reply["stream"], dict)
+
+
+def test_audio_replies_report_dropped_chunks(server) -> None:
+    control, cube = server
+    cube.speaker.dropped_chunks = 0
+    cube.speaker.stream_count = 0
+
+    def dropping_tone(*_args, **_kwargs) -> None:
+        cube.speaker.dropped_chunks = 3
+        cube.speaker.stream_count = 1
+
+    cube.speaker.tone = dropping_tone
+    with CubeClient(control.path) as client:
+        reply = client.tone(1000, 0.1)
+    assert reply["dropped"] == 3
+
+
+# ----- live tuning ---------------------------------------------------------
+
+
+class FakeLink:
+    """Records what the `config` op did to the link."""
+
+    def __init__(self) -> None:
+        self.ingress_mode = "inline"
+        self.retransmit_after = 0.0125
+
+    def set_ingress_mode(self, mode: str) -> str:
+        if mode not in ("inline", "deferred"):
+            raise ValueError(f"bad ingress mode {mode!r}")
+        self.ingress_mode = mode
+        return mode
+
+    def set_retransmit(self, seconds: float) -> float:
+        self.retransmit_after = max(0.001, min(5.0, float(seconds)))
+        return self.retransmit_after
+
+
+def test_config_reads_the_defaults(server) -> None:
+    control, cube = server
+    cube.link = FakeLink()
+    with CubeClient(control.path) as client:
+        reply = client.configure()
+    config = reply["config"]
+    assert config["ingress"] == "inline"
+    assert config["retransmit_ms"] == 12.5
+    assert "switch_interval" in config
+
+
+def test_config_sets_ingress_and_retransmit(server) -> None:
+    control, cube = server
+    cube.link = FakeLink()
+    with CubeClient(control.path) as client:
+        reply = client.configure(ingress="deferred", retransmit_ms=50)
+        assert reply["set"] == {"ingress": "deferred", "retransmit_ms": 50.0}
+        assert client.configure()["config"]["ingress"] == "deferred"
+    assert cube.link.ingress_mode == "deferred"
+    assert cube.link.retransmit_after == 0.05
+
+
+def test_config_rejects_an_unknown_key(server) -> None:
+    control, cube = server
+    cube.link = FakeLink()
+    with CubeClient(control.path) as client:
+        with pytest.raises(ControlError) as caught:
+            client.configure(tone_frequency=3)
+    assert caught.value.code == "bad_config"
+
+
+def test_stats_reports_the_last_stream(server) -> None:
+    control, cube = server
+
+    class Report:
+        def as_dict(self) -> dict:
+            return {"profile": "deep", "chunks": 42, "gaps_ms": {"p95": 3.5}}
+
+    cube.speaker.last_stream = Report()
+    cube.speaker.stream_count = 7
+    with CubeClient(control.path) as client:
+        stats = client.stats()
+    assert stats["audio"]["last_stream"]["profile"] == "deep"
+    assert stats["audio"]["streams"] == 7
 
 
 def test_audio_ops_serialise_but_display_writes_do_not_wait(server) -> None:

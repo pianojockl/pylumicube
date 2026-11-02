@@ -923,6 +923,11 @@ PulseAudio default sink's `.monitor` with `pamon --format=s16le --channels=1
   `FlatDictionary` with 112 consecutive keys from the `speaker.data` floor
   and 2-byte signed little-endian samples, sent as one request carrying 3
   buffers;
+- `speaker.frequency` says how fast the buffer drains, and it is the number
+  that decides whether audio works at all: one 112-sample block every
+  `112 / frequency` seconds, so 32 kHz asks for 286 requests a second and this
+  link serves about 258 (§9.10). The daemon therefore writes 22050 — 197 a
+  second — at startup;
 - `speaker.volume` (0..200) scales playback; the firmware also exposes
   `free_space_in_bytes` and `autoReloadPeriod` for flow control;
 - samples are skipped (never queued) when the link reports backpressure.
@@ -945,9 +950,12 @@ pylumicube implements all of the above natively (`pylumicube.screen`,
 | Service request round trip (any payload) | ~50-105 ms |
 | Pipelined throughput, tiny requests | ~600 frames/s |
 | Pipelined throughput, 112-sample speaker chunks | ~380 frames/s |
-| Real-time audio requirement | 286 chunks/s (32 kHz ÷ 112) |
+| Real-time audio requirement | 197 chunks/s at the shipped 22050 Hz ÷ 112 (286 at 32 kHz, which starves — §9.10) |
 | Same, with the cube board's telemetry subscribed | ~56 chunks/s (audio unusable) |
 | Audio with only the sensor board subscribed | ~308 chunks/s (works) |
+| Audio frames actually serviced, sustained | ~258 chunks/s (p50 510 ms RTT, 445 resends, 4 s of audio in 5.9 s — §9.10) |
+| Audio **unpaced** (2026-11-01): 4 s of audio accepted | 0.95-1.4 s (~900-1200 chunks/s) |
+| Submit-to-ACK, audio frames | p50 ~40-50 ms, p90 60-80 ms, max ~100 ms |
 
 Two consequences:
 
@@ -958,6 +966,12 @@ Two consequences:
 - **Audio needs the cube board's telemetry switched off.** Subscribing to it
   cuts throughput ~4x. Walk its schema separately
   (`LumiCube.walk_all_schemas()`) so the speaker still knows its keys.
+
+The unpaced figure is newer than the rest and matters: the firmware accepts
+audio three to four times faster than it plays it, so its ring buffer is
+deeper than the ~47 ms this document used to assume. That turns "how far
+ahead may I send?" from a narrow window into a real design choice, which is
+what `scripts/speaker_shootout.py` measures (§9.10).
 
 `scripts/screen_speaker_demo.py` exercises both peripherals end to end.
 
@@ -1158,7 +1172,9 @@ here so the difference is a decision rather than an accident.
 | Wire priority | 20 for everything | 20 for everything (§9.3) |
 | Telemetry renewal | every `cadence`, asking for `cadence * 2` s, tolerating "too busy" | same |
 | Metadata walk | `(key0, key1)` absolute keys (§4.5.1) | same |
-| Audio format | 112-sample s16le runs at 32 kHz | same |
+| Audio format | 112-sample s16le runs at `speaker.frequency` | same, but the 
+daemon sets that to 22050 Hz: 32 kHz needs 286 frames/s and the link 
+manages ~258 (§9.10) |
 | Display batching | by key count (`BATCH_CAPACITY`) | by encoded size (`MAX_UAVCAN_PAYLOAD`) |
 
 ### 9.2 Queue discipline: bounded and class-ordered
@@ -1260,7 +1276,128 @@ A wire capture of the frame at the stall would settle it (§7).
 
 A wedged or filling link raises no errors, so `stats` carries the numbers that
 make it visible: `pending`, `window`, `window_labels`, `dropped`,
-`skipped_bytes`, `acks`, `last_ack`, `resets`, `by_label`, `latency_ms` and
-`latency_by_label`. At rest on this cube the round trip is p50 ~20 ms; a control
+`skipped_bytes`, `acks`, `last_ack`, `resets`, `by_label`, `latency_ms`,
+`latency_by_label`, `retransmit_ms` and `ingress` (mode, backlog, dropped,
+decode latency). At rest on this cube the round trip is p50 ~20 ms; a control
 request waits for the firmware to service it (p50 ~60-70 ms) while display
 frames answer faster (p50 ~35-40 ms) and audio frames faster still (p50 ~32 ms).
+
+`audio.last_stream` is the other half: one `StreamReport` per utterance —
+`chunks`, `audio_seconds`, `wall_seconds`, `gaps_ms` (inter-chunk send gaps),
+`behind_ms` (how late each chunk left against its schedule) and
+`tail_wait_seconds` (the wait for the last frames). Sound that arrives complete
+but late leaves no trace in the drop counters; these do.
+
+### 9.10 The audio was starving, and the sample rate was the reason
+
+The firmware's audio buffer is fed by `speaker.data` frames of 112 samples
+and it drains them at `speaker.frequency` — one frame every
+`112 / frequency` seconds. At the declared 32 kHz that is a frame every
+3.5 ms, **286 frames/s**, and that is where the trouble starts: the link,
+with every other request in the system competing for the same ACK, cannot
+sustain 286 audio frames/s. What it can sustain turned out to be about
+**258 frames/s** (measured: 4 s of audio took 5.9 s of wall time, with the
+submit-to-ACK latency at p50 510 ms and 445 resends).
+
+A 10 % structural deficit is not a pacing problem. Whatever the pacer does,
+the firmware's 63 ms ring (§5.3) empties a little more each second, and when
+it empties the firmware holds the last block and repeats it — the choppy,
+warbling, hold-and-repeat sound, with ±95 Hz sidebands at -32 dB in a phone
+recording of a 1 kHz tone (the Java daemon's was clean at -45 dB).
+
+`speaker.frequency` is a *settable field*, so the fix is to ask for a rate the
+link can feed:
+
+| `speaker.frequency` | Frames needed | Wall time for 4 s of audio | Link p50 / max | Verdict |
+|---|---|---|---|---|
+| 32000 | 286/s | 5.90 s | 510 / 1926 ms | starves; audible |
+| 22050 | 197/s | 3.99 s | 6.7 / 14.4 ms | clean; **shipped** |
+| 16000 | 143/s | 3.98 s | 8.7 / 17.2 ms | clean |
+
+Two things fall out of that table. First, the deficit is gone: at 22050 the
+link is idle (p50 6.7 ms against a 40-60 ms budget) because only 197 frames/s
+are asked for. Second, 32 kHz bought nothing to begin with — the firmware
+resamples nothing and the speaker is a small mono driver, so 11 kHz of audio
+band is already beyond it. 22050 is also espeak-ng's native rate, so `say()`
+resamples **nothing at all**, and it is the daemon's default
+(`pylumicube.speaker.SPEAKER_RATE`, `--speaker-rate`,
+`PYLUMICUBE_SPEAKER_RATE`). 16000 is the more conservative choice if 22050
+ever proves marginal; it was measured clean but sounds duller.
+
+The daemon writes the field at startup, because the value lives in the
+firmware and a power cycle loses it.
+
+#### The pacer follows the link, not the clock
+
+With the rate fixed the pacer only has to avoid *over*filling. A wall-clock
+pacer schedules each frame against a start time, so it can only ever be late —
+and it is late exactly when the previous frame's ACK came back slowly, which
+puts the ring at empty again. The shipping profile instead keeps **8 frames
+outstanding** (`PacingProfile(ahead=8)`, about 40 ms of audio in flight):
+submit, then wait until fewer than 8 are unacknowledged. It is self-clocking,
+needs no clock and no knowledge of the ring's level, and it never lets the
+link's queue grow — 16 outstanding, by contrast, put 8.5 s on the wire for
+4 s of audio.
+
+Fast retransmit backs that up. Resending only on a timer (`_RETRANSMIT_AFTER_S`)
+means a lost frame stalls the pipeline for that whole period, which the
+outstanding-frame pacer feels directly. A duplicate ACK for a frame still at
+the head is proof it was lost, so the head is re-sent at once, guarded to
+2 ms to stay clear of ordinary reordering; the timer stays as a backstop.
+Ingress and egress live on separate threads for the same reason — decoding the
+sensor board's ~30 frames/s on the serial worker delays the sends that matter.
+
+The room for all of this is `pylumicube.speaker.PROFILES`, a table of named
+`PacingProfile`s (`ahead`, a wall-clock `lead`, a `rate` to run the speaker at,
+chunks per wakeup), applied per stream — `tone`/`say`/`play` take `profile=`,
+so nothing global changes while you listen. `scripts/speaker_shootout.py`
+plays one continuous tone through each, N marker blips before variant N
+(the blips announce themselves at the profile's *own* rate, or they are the
+noisiest thing in the test), and prints what each did from `StreamReport`
+(`stats` → `audio.last_stream`: send gaps, how far behind real time each
+chunk went, the tail wait, long gaps, slow sends).
+
+The measurements behind the table above, and the round that found it:
+
+| Round | Variants | What it established |
+|---|---|---|
+| 1-3 | lead 21/12/45 ms, unpaced, deferred ingress, software volume, slow retransmit, governor, 250 ms lead | all delivered 4 s of audio with no drop and no gap over 40 ms; unpaced put 4 s on the wire in 1.4 s. Numbers equal, sound *not* equal: the ear kept preferring deeper leads |
+| 4-8 | 12-32 frames outstanding, 16/22 kHz, transport rebuilt | outstanding-frame pacing at 22 kHz is the first thing that measured *and* sounded right; the distance to 32 kHz was a cliff, not a slope |
+| 9 | 32 kHz shipped vs 16/22 kHz at 8 and 16 outstanding | the table above: the deficit is the rate, and the winner is 22050 with 8 outstanding |
+
+The recording that settled it: a 1 kHz tone at 32 kHz showed **repeat
+correlation +0.59 at the 3.5 ms chunk lag** (the waveform matching itself one
+chunk later — the firmware replaying held blocks) and 26 % dropouts; at
+22050 the same measurement gives **-0.01** and 14 %, i.e. no replayed audio
+at all. Same phone, same room, same tone.
+
+What is *not* claimed: that 22050 is optimal for the hardware, only that it is
+the highest rate this link demonstrably feeds. If the firmware's frame service
+is ever fixed, 32000 becomes worth re-testing — `--speaker-rate 32000` is the
+whole experiment.
+
+#### What competes with the audio
+
+The queue orders frames audio → control → display (§9.2), so a display frame
+never jumps ahead of an audio frame. That is not enough, because the frames are
+*built* by Python threads in one process: a client redrawing the 192-LED matrix
+spends its time assembling dictionaries, and the interpreter hands the audio
+thread the GIL far less often while it does. Measured with a second connection
+filling the matrix at ~12 fps (a scroll) while the daemon spoke one sentence:
+
+| Second connection | 6.84 s of speech took | Inter-chunk gaps over 63 ms |
+|---|---|---|
+| idle | 6.89 s | 0 |
+| scrolling (~12 matrix writes/s) | **30.99 s** | **154** |
+
+The sound follows: 154 holes the firmware's buffer cannot cover is the audible
+stutter. So the clock's hourly chime speaks *first* and scrolls afterwards
+(`HOURLY_ORDER = "speak-first"`); its `together` mode does both at :00 and is
+the one to avoid. A general fix would be to make display writes cheaper
+(build the flat dictionary once and reuse it) or to defer them while a stream
+is active — neither is done.
+
+Two related rough edges, for the record: a client that is killed mid-utterance
+leaves the daemon streaming to completion, so the next announcement waits for
+it (up to tens of seconds) and, if it overlaps, both sound bad; `stop_audio`
+clears it.

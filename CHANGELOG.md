@@ -8,6 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **A smoothness shootout, and the measurements to explain its verdict.**
+  Which pacing strategy sounds smoothest turned out to be answerable only by
+  ear, so `scripts/speaker_shootout.py` plays one continuous tone through nine
+  variants — the shipping behaviour, finer pacing, a deeper lead, an unpaced
+  flood, deferred ingress, software volume, a slower retransmit timer, the
+  `performance` governor, and a quarter-second lead — with N marker blips
+  before variant N, and prints what each one did. Every knob is a named
+  `PacingProfile` in `pylumicube.speaker.PROFILES`, applied per stream
+  (`tone`/`say`/`play` grew a `profile=` field), so nothing global changes
+  while you listen and everything is restored afterwards.
+
+  The report per stream (`StreamReport`, in `stats` as `audio.last_stream`)
+  is what turns "choppy" into numbers: inter-chunk **send gaps** (a gap over
+  ~40 ms is one the firmware's ≈47 ms buffer cannot cover), how far **behind**
+  the real-time schedule each chunk went out, and how long the **tail wait**
+  took — if the link, not the pacer, decides when a stream ends, that is the
+  number that says so. Measured silently (`--silent`, amplitude 0: the same
+  PCM and the same link traffic, no sound) on the cube: all nine variants
+  deliver 4.00 s of audio with no drops and no gap over 40 ms, while
+  `--silent --variants 4` shows the firmware accepting 4 s of audio in
+  ~1.4 s — it has a real buffer, which is why a lead may be worth having.
+- **Live tuning for the link** (`config` op, `lumicube-do config`,
+  `CubeClient.configure`): `ingress` (`inline`/`deferred`), `retransmit_ms`
+  and `switch_interval`. `deferred` moves received-frame decoding off the
+  serial worker thread onto its own, which is what upstream's Inbox Disruptor
+  did — with the sensor board publishing ~30 frames/s, decoding them inline
+  adds their decode time to the audio's send schedule. The daemon can also
+  start that way (`--ingress deferred`, `--retransmit-ms 50`, or
+  `PYLUMICUBE_INGRESS` / `PYLUMICUBE_RETRANSMIT_MS`) once a variant wins.
+- **The hour chime announces first now, not last.** `HOURLY_ORDER` picks
+  `speak-first` (default: the announcement, then the scroll), `scroll-first`
+  (what it did before) or `together` (both at :00, the scroll on its own
+  control connection — see the Fixed entry below for why that is not the
+  default). The scroll takes ~13 s
+  at the defaults, so announcing after it put "it's four o'clock" 13 s past
+  the hour. A second connection is what makes the overlap real: the daemon
+  serves one client's requests in order, so a scroll issued on the clock's own
+  connection would simply queue behind the utterance. Where no second
+  connection is possible the scroll is skipped and the announcement wins.
 - **How a scroll runs is a setting now, not a hardcoded guess.** `times` says
   how many times a message travels past and `speed` how fast, both settable
   over MQTT (`display/scroll/times/set`, `display/scroll/speed/set` — published
@@ -77,6 +116,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not even restart.
 
 ### Fixed
+- **The chime speaks first now, because scrolling starves the speech.** The
+  frame queue already puts audio ahead of display traffic, but the frames are
+  built by Python threads in one process: a second connection redrawing the
+  192-LED matrix holds the interpreter, and the audio thread stops getting
+  scheduled. Measured while the daemon spoke one 6.84 s sentence: **6.89 s of
+  wall time and 0 gaps alone against 30.99 s and 154 gaps** — over the 63 ms
+  the firmware's buffer can cover — with a second client filling the matrix at
+  ~12 fps (a scroll). `HOURLY_ORDER` therefore defaults to `speak-first` (the
+  announcement, then the ~13 s scroll); `together` remains available and is the
+  one to avoid. Found because the same effect explains a first utterance after
+  a restart sounding rough: the clock redraws its screen then.
+- **The speaker's sample rate is now the daemon's to set**, and a client that
+  is killed mid-utterance no longer poisons the next one silently: the daemon
+  streams the abandoned buffer to completion (so the next `say` waits for it, up
+  to tens of seconds) and two overlapping streams sound bad. `stop_audio`
+  clears it; rough edge, documented in `PROTOCOL.md` §9.10.
+- **The speaker was starving, and the sample rate was why** — the real cause
+  of the choppy, hold-and-repeat audio. The firmware drains one 112-sample
+  block per `112 / speaker.frequency` seconds, so 32 kHz asks for **286
+  requests a second** and this link sustains about **258**: a structural 10 %
+  deficit that no pacing can paper over, and the reason every pacer change so
+  far moved the numbers without fixing the sound. `speaker.frequency` is a
+  settable field, so the daemon now writes **22050 Hz** at startup (197 blocks
+  a second, and espeak-ng's native rate, so speech is not resampled either):
+  4 s of audio went from 5.90 s of wall time at p50 510 ms latency to **3.99 s
+  at p50 6.7 ms**. The same 1 kHz tone recorded on the same phone showed
+  repeat-correlation **+0.59 at the 3.5 ms block lag** (the firmware replaying
+  held blocks) at 32 kHz against **-0.01** at 22050 — the replayed audio is
+  simply gone. `--speaker-rate` / `PYLUMICUBE_SPEAKER_RATE` override it
+  (`32000` is the whole experiment if the firmware is ever fixed), and
+  `PROTOCOL.md` §9.10 has the table.
+- **The shipper paces on what the link has taken, not on the clock.**
+  `PacingProfile(ahead=8)` keeps eight blocks (~40 ms of audio) outstanding:
+  submit, then wait until fewer than eight are unacknowledged. A wall-clock
+  pacer can only ever be late — and it is late exactly when the previous
+  ACK was slow, which empties the ring again. 16 outstanding, by contrast, put
+  8.5 s on the wire for 4 s of audio.
+- **Retransmits no longer stall the pipeline.** A duplicate ACK for a block
+  still at the head is proof it was lost, so the head is re-sent at once
+  (guarded to 2 ms so ordinary reordering does not trigger it); the timer
+  (`_RETRANSMIT_AFTER_S`) stays as a backstop. This is what makes the
+  outstanding-block pacer work: without it a lost block costs a whole timer
+  period of sends.
+- **Ingress and egress are separate threads.** Decoding the sensor board's
+  ~30 frames/s on the serial worker thread added their decode time to the
+  audio's send schedule — the same split upstream's Inbox Disruptor made.
+  Writes are batched per wakeup behind `_window_lock` and the egress thread is
+  woken on submit rather than polling.
+- **A stalled ACK loop no longer wedges the daemon.** The paced sender gives up
+  after two seconds without progress and reports it in `StreamReport.error`
+  instead of blocking forever (it held the control connection, so the clock
+  could not get a command in edgewise).
 - **The bridge's `speaker/language/set` handler had no subscription**, so the
   language command was silently ignored — found by the user, who typed what
   they heard: a German sentence spoken in an English voice. A test now
@@ -547,7 +638,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-frame Python CPU dramatically on the Pi.
 
 ### Wire-protocol findings (vs. the Java daemon)
-- The cube firmware does **not** service concurrent SET_FIELDS service
+- **The firmware buffers audio, and it takes it far faster than real time.**
+  Played unpaced, 4 s of audio (1143 chunks) is accepted and ACKed in 0.95-1.4 s
+  — around 900-1200 chunks/s, three to four times what playback needs. So the
+  earlier assumption that the audio buffer is ~47 ms and that "sending ahead"
+  is a narrow window was too pessimistic: there is room to keep the buffer
+  stocked rather than merely non-empty, which is what a jittery link needs.
+- **The choppiness is not lost chunks.** Across nine silent 4 s streams
+  (variant by variant, ~10 000 chunks) nothing was dropped and no inter-chunk
+  send gap exceeded 40 ms; the gaps sit at p95 ≈ 10 ms and peak around 30 ms,
+  and every chunk left on schedule (`behind` p95 0.0 ms). What is left is
+  delivery *jitter* against a buffer whose real depth we no longer assume, plus
+  the ways the daemon's own threads contend for the send schedule.
+- **Round-trip latency is 40-110 ms and the retransmit timer fires inside it.**
+  Upstream re-sends a frame after 12.5 ms (`CURSOR_RESET_DELAY_NANOSECONDS`),
+  but this link's submit-to-ACK for audio measures p50 ≈ 40-50 ms and p90
+  60-80 ms, so most frames are re-sent at least once. That is more traffic in a
+  loop that is already the bottleneck, and it is testable: `config
+  retransmit_ms` (variant 7 of the shootout).
+- **Decoding telemetry in the serial worker thread costs the audio schedule.**
+  Upstream hands every decoded frame to an Inbox Disruptor thread; this
+  implementation decodes inline, i.e. between two egress passes, so the sensor
+  board's ~30 frames/s are inserted into the audio's send path. `config
+  ingress=deferred` moves the decode to its own thread and preserves order and
+  the ACK-before-decode rule.
+
   requests — submitting two or three in flight at once causes all but
   the first to be dropped (no ServiceResponse, so the caller times out).
   An attempted pipelining of `_send_set_fields` was reverted; the Java

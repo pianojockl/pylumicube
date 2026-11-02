@@ -11,8 +11,10 @@ import array
 import io
 import math
 import shutil
+import threading
 import time
 import wave
+from concurrent.futures import Future
 
 import pytest
 
@@ -21,6 +23,7 @@ from pylumicube.speaker import (
     CHUNK_SAMPLES,
     MAX_VOLUME,
     SAMPLE_RATE,
+    SPEAKER_RATE,
     SINE,
     SQUARE,
     NOISE,
@@ -31,7 +34,6 @@ from pylumicube.speaker import (
     resample,
     wav_to_pcm,
 )
-
 
 class RecordingWriter:
     def __init__(self, delay: float = 0.0) -> None:
@@ -125,6 +127,162 @@ def test_wav_to_pcm_rejects_8_bit() -> None:
         wav_to_pcm(buffer.getvalue())
 
 
+# ----- pacing profiles ----------------------------------------------------
+
+
+def test_every_profile_is_named_and_resolvable() -> None:
+    from pylumicube.speaker import PROFILES, profile_name, resolve_profile
+
+    assert set(PROFILES) >= {"default", "fine", "deep", "flood", "soft-volume"}
+    for name, profile in PROFILES.items():
+        assert profile_name(profile) == name
+        assert resolve_profile(name) is profile
+    assert resolve_profile(None) is PROFILES["default"]
+
+
+def test_an_unknown_profile_is_a_clear_error() -> None:
+    from pylumicube.speaker import resolve_profile
+
+    with pytest.raises(ValueError) as caught:
+        resolve_profile("nonsense")
+    assert "deep" in str(caught.value)
+
+
+def test_a_stream_records_its_timing() -> None:
+    """The report is what the shootout prints and `stats` exposes."""
+    speaker, _writer = _speaker()
+    speaker.write_pcm(pcm16([0.1] * (CHUNK_SAMPLES * 4)), profile="deep")
+    report = speaker.last_stream
+    assert report is not None
+    assert report.profile == "deep"
+    assert report.chunks == 4
+    assert speaker.stream_count == 1
+    payload = report.as_dict()
+    assert payload["chunks"] == 4
+    assert set(payload["gaps_ms"]) == {"p50", "p95", "p99", "max"}
+    assert payload["audio_seconds"] == pytest.approx(
+        4 * CHUNK_SAMPLES / SPEAKER_RATE, abs=0.001)
+    assert payload["long_gaps"] == 0
+
+
+def test_the_default_profile_is_the_shipping_behaviour() -> None:
+    from pylumicube.speaker import PROFILES
+
+    shipping = PROFILES["default"]
+    assert shipping.lead is None and shipping.pace_group is None
+    assert shipping.realtime is None and shipping.volume_mode == "firmware"
+    #: It paces on what the link has *taken*, not on the clock: a clock pacer
+    #: can only ever be late, and lateness is what empties the buffer.
+    assert shipping.ahead == 8
+    assert shipping.rate is None              # the daemon's rate, not the profile's
+
+
+def test_speech_is_resampled_to_the_rates_the_profile_will_pace() -> None:
+    """`say`/`play` must resample to the profile's rate, not the driver's.
+
+    The two would otherwise disagree: a `rate16000` profile pacing a stream
+    generated at 22050 Hz plays back slow.
+    """
+    from pylumicube.speaker import PROFILES
+
+    assert PROFILES["default"].effective_rate(SPEAKER_RATE) == SPEAKER_RATE
+    for name, profile in PROFILES.items():
+        if profile.rate is not None:
+            assert profile.effective_rate(SPEAKER_RATE) == profile.rate
+
+
+def test_software_volume_scales_the_pcm_and_pins_the_firmware() -> None:
+    """The A/B for the firmware's own 20/200 scaling.
+
+    `soft-volume` hands the firmware full scale and pre-scales the samples
+    (a tenth here, volume 20 of 200), so the loudness is identical but the
+    firmware's integer scaling is out of the path.
+    """
+    speaker, writer = _speaker(volume=20)
+    speaker.write_pcm(pcm16([0.5] * CHUNK_SAMPLES), profile="soft-volume")
+    volumes = [values["volume"] for module, values, _t in writer.writes
+               if module == "speaker" and "volume" in values]
+    assert volumes == [200, 20]                 # pinned, then restored
+    data = [values for _m, values, _t in writer.writes if "data+0" in values]
+    assert data, "the stream wrote no samples"
+    first = int(data[0]["data+0"])
+    # 0.5 full-scale scaled by 20/200 -> ~1638, not ~16383.
+    assert 1400 < first < 1900
+
+
+def test_scale_pcm_halves_and_clips() -> None:
+    from pylumicube.speaker import scale_pcm
+
+    samples = array.array("h", [1000, -1000, 32767, -32768])
+    out = array.array("h")
+    out.frombytes(scale_pcm(samples.tobytes(), 0.5))
+    assert list(out) == [500, -500, 16383, -16384]
+
+
+# ----- ACK-paced streaming ("ahead" profiles) -----------------------------
+
+
+class AckPacedWriter:
+    """Resolves each write after `delay` seconds, so `ahead` has something to
+    wait for. Tracks how many writes were outstanding at any moment."""
+
+    def __init__(self, delay: float = 0.004) -> None:
+        self.delay = delay
+        self.outstanding = 0
+        self.max_outstanding = 0
+        self.writes = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, samples, timeout: float | None = None,
+                 await_response: bool = True, wait: bool = True,
+                 label: str = "audio", droppable: bool = True):
+        future: Future = Future()
+        with self._lock:
+            self.outstanding += 1
+            self.writes += 1
+            self.max_outstanding = max(self.max_outstanding, self.outstanding)
+
+        def finish() -> None:
+            with self._lock:
+                self.outstanding -= 1
+            if not future.done():
+                future.set_result(None)
+
+        timer = threading.Timer(self.delay, finish)
+        timer.daemon = True
+        timer.start()
+        return future
+
+
+def test_ahead_pacing_never_exceeds_the_outstanding_bound() -> None:
+    """The pump keeps N chunks in the link, so the firmware's ring stays fed.
+
+    Wall-clock pacing can only ever be late (there is no mechanism to send
+    early), which is why the ring hovers at empty; pacing on what the link has
+    *taken* keeps a reserve in flight instead.
+    """
+    writer = AckPacedWriter(delay=0.004)
+    speaker = Speaker(write=None, run=writer, read=lambda *a, **k: None,
+                      pace=False)
+    from pylumicube.speaker import PacingProfile
+    speaker.write_pcm(pcm16([0.2] * (CHUNK_SAMPLES * 20)),
+                      profile=PacingProfile(ahead=4))
+    assert writer.writes >= 20
+    assert writer.max_outstanding <= 4, writer.max_outstanding
+    report = speaker.last_stream
+    assert report is not None and report.chunks == 20
+    assert report.dropped == 0
+
+
+def test_wall_clock_pacing_does_not_bound_outstanding_writes() -> None:
+    """The control: without `ahead`, the pacer submits on schedule instead."""
+    writer = AckPacedWriter(delay=0.004)
+    speaker = Speaker(write=None, run=writer, read=lambda *a, **k: None,
+                      pace=False)
+    speaker.write_pcm(pcm16([0.2] * (CHUNK_SAMPLES * 20)))
+    assert writer.max_outstanding > 4
+
+
 # ----- streaming ----------------------------------------------------------
 
 
@@ -165,17 +323,24 @@ def test_realtime_pacing_spreads_the_chunks() -> None:
     """One second of audio should take roughly a second to stream."""
     speaker, _writer = _speaker(pace=True)
     started = time.monotonic()
-    speaker.write_pcm(pcm16([0.0] * SAMPLE_RATE))
+    speaker.write_pcm(pcm16([0.0] * SPEAKER_RATE))
     elapsed = time.monotonic() - started
     assert 0.5 < elapsed < 2.5
 
 
 def test_slow_writes_are_dropped_not_queued() -> None:
-    """A writer slower than real-time must not build an ever-growing lag."""
-    writer = RecordingWriter(delay=0.02)         # 20ms per chunk > 3.5ms of audio
+    """A *clock*-paced writer must not build an ever-growing lag.
+
+    The shipping profile paces on what the link has taken (and waits instead of
+    dropping), so this spells out the wall-clock profile it is about.
+    """
+    from pylumicube.speaker import PacingProfile
+
+    writer = RecordingWriter(delay=0.02)         # 20ms per chunk > 5ms of audio
     speaker = Speaker(writer, pace=True, timeout=0.5)
     started = time.monotonic()
-    speaker.write_pcm(pcm16([0.0] * SAMPLE_RATE))     # one second of audio
+    speaker.write_pcm(pcm16([0.0] * SPEAKER_RATE),      # one second of audio
+                      profile=PacingProfile())
     elapsed = time.monotonic() - started
     assert speaker.dropped_chunks > 0
     assert elapsed < 3.0                              # it gave up on late chunks
@@ -249,7 +414,7 @@ def test_tone_generates_the_right_duration_and_amplitude() -> None:
     speaker, writer = _speaker()
     speaker.tone(frequency=1000, duration=0.1, amplitude=0.5)
     samples = [sample for chunk in writer.chunks() for sample in chunk]
-    assert len(samples) == pytest.approx(SAMPLE_RATE * 0.1, abs=CHUNK_SAMPLES)
+    assert len(samples) == pytest.approx(SPEAKER_RATE * 0.1, abs=CHUNK_SAMPLES)
     assert max(abs(sample) for sample in samples) <= 32767 * 0.5 + 1
     assert max(abs(sample) for sample in samples) > 32767 * 0.4
 
@@ -286,7 +451,7 @@ def test_sine_wave_shape_is_roughly_sinusoidal() -> None:
     speaker, writer = _speaker()
     speaker.tone(frequency=100, duration=0.02, amplitude=1.0, fade=0.0)
     samples = [sample for chunk in writer.chunks() for sample in chunk][:320]
-    expected = [math.sin(2 * math.pi * 100 * i / SAMPLE_RATE) * 32767
+    expected = [math.sin(2 * math.pi * 100 * i / SPEAKER_RATE) * 32767
                 for i in range(len(samples))]
     error = max(abs(a - b) for a, b in zip(samples, expected))
     assert error < 50
@@ -319,7 +484,7 @@ def test_say_streams_the_synthesised_wav(monkeypatch) -> None:
     speaker, writer = _speaker()
     speaker.say("hello")
     total = sum(len(chunk) for chunk in writer.chunks())
-    assert total == pytest.approx(SAMPLE_RATE, rel=0.01)     # ~1s at 32 kHz
+    assert total == pytest.approx(SPEAKER_RATE, rel=0.01)    # ~1s of speech
 
 
 def test_play_reads_a_wav_file(tmp_path) -> None:
@@ -333,7 +498,7 @@ def test_play_reads_a_wav_file(tmp_path) -> None:
     speaker.play(str(path))
     total = sum(len(chunk) for chunk in writer.chunks())
     # The final chunk is zero-padded up to the firmware's chunk size.
-    assert SAMPLE_RATE <= total < SAMPLE_RATE + CHUNK_SAMPLES
+    assert SPEAKER_RATE <= total < SPEAKER_RATE + CHUNK_SAMPLES
 
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import importlib.util
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -612,6 +613,102 @@ def test_hourly_chime_ignores_other_minutes() -> None:
     instance, cube, _curve = _clock()
     instance.hourly_chime(datetime.datetime(2026, 10, 23, 14, 30, 0))
     assert cube.display.scrolls == []
+
+
+def test_together_starts_the_scroll_while_the_announcement_plays(monkeypatch) -> None:
+    """The default: the scroll must not delay the "o'clock" by ~13 s.
+
+    The scroll runs on its own thread, so the announcement can start at :00
+    and the scroll alongside it. The fake `say` waits for the scroll to have
+    started — a sequential chime would time out here.
+    """
+    monkeypatch.setattr(clock, "HOURLY_ORDER", "together")
+    monkeypatch.setattr(clock, "HOURLY_SPEAK", True)
+    monkeypatch.setattr(clock, "HOURLY_SCROLL", True)
+    scroll_started = threading.Event()
+    order: list[str] = []
+
+    class OverlapDisplay(FakeDisplay):
+        def scroll_pixels(self, rows, *, speed=1.0, **kwargs):
+            scroll_started.set()
+            order.append("scroll")
+            super().scroll_pixels(rows, speed=speed, **kwargs)
+
+    class WaitingModule(FakeModule):
+        def say(self, text, *, voice=None):
+            assert scroll_started.wait(timeout=2.0), "the scroll had not started"
+            order.append("say")
+            super().say(text, voice=voice)
+
+    cube = FakeCube({"speaker": WaitingModule()})
+    cube.display = OverlapDisplay()
+    instance = clock.AmbientClock(cube, brightness=clock.build_curve())
+    instance.hourly_chime(datetime.datetime(2026, 10, 23, 14, 0, 1))
+    assert order == ["scroll", "say"]
+    assert len(cube.display.scrolled_pixels) == 1
+
+
+def test_speak_first_announces_before_scrolling(monkeypatch) -> None:
+    monkeypatch.setattr(clock, "HOURLY_ORDER", "speak-first")
+    monkeypatch.setattr(clock, "HOURLY_SPEAK", True)
+    monkeypatch.setattr(clock, "HOURLY_SCROLL", True)
+    order: list[str] = []
+
+    class OrderedDisplay(FakeDisplay):
+        def scroll_pixels(self, rows, *, speed=1.0, **kwargs):
+            order.append("scroll")
+            super().scroll_pixels(rows, speed=speed, **kwargs)
+
+    class OrderedModule(FakeModule):
+        def say(self, text, *, voice=None):
+            order.append("say")
+            super().say(text, voice=voice)
+
+    cube = FakeCube({"speaker": OrderedModule()})
+    cube.display = OrderedDisplay()
+    instance = clock.AmbientClock(cube, brightness=clock.build_curve())
+    instance.hourly_chime(datetime.datetime(2026, 10, 23, 14, 0, 1))
+    assert order == ["say", "scroll"]
+
+
+def test_scroll_first_is_still_available(monkeypatch) -> None:
+    """The old behaviour, kept so the two can be compared by ear."""
+    monkeypatch.setattr(clock, "HOURLY_ORDER", "scroll-first")
+    monkeypatch.setattr(clock, "HOURLY_SPEAK", True)
+    monkeypatch.setattr(clock, "HOURLY_SCROLL", True)
+    order: list[str] = []
+
+    class OrderedDisplay(FakeDisplay):
+        def scroll_pixels(self, rows, *, speed=1.0, **kwargs):
+            order.append("scroll")
+            super().scroll_pixels(rows, speed=speed, **kwargs)
+
+    class OrderedModule(FakeModule):
+        def say(self, text, *, voice=None):
+            order.append("say")
+            super().say(text, voice=voice)
+
+    cube = FakeCube({"speaker": OrderedModule()})
+    cube.display = OrderedDisplay()
+    instance = clock.AmbientClock(cube, brightness=clock.build_curve())
+    instance.hourly_chime(datetime.datetime(2026, 10, 23, 14, 0, 1))
+    assert order == ["scroll", "say"]
+
+
+def test_an_unknown_hourly_order_falls_back_to_speaking_first(monkeypatch) -> None:
+    monkeypatch.setattr(clock, "HOURLY_ORDER", "toegther")
+    assert clock._normalise_order() == "speak-first"   # noqa: SLF001
+
+
+def test_the_shipping_order_speaks_before_it_scrolls(monkeypatch) -> None:
+    """`together` starves the speech; measured, not guessed.
+
+    A second connection redrawing the matrix while the daemon streams audio
+    pushed 6.84 s of speech to 31 s of wall time with 154 inter-chunk gaps (see
+    `scripts/ambient_clock.py`), so the announcement goes first.
+    """
+    monkeypatch.setattr(clock, "HOURLY_ORDER", "speak-first")   # the default
+    assert clock._normalise_order() == "speak-first"            # noqa: SLF001
 
 
 def test_the_chime_speaks_twelve_hour_words(monkeypatch) -> None:
