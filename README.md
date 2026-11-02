@@ -441,7 +441,7 @@ uv run pytest          # with uv
 pytest                 # with an activated venv
 ```
 
-**718 tests**, fully offline — no hardware required. Besides COBS, CRC,
+**729 tests**, fully offline — no hardware required. Besides COBS, CRC,
 framing, FlatDictionary, UAVCAN `messageId` encoding, an end-to-end handshake
 against a fake serial emulator and the compat shim's coordinate mappings
 (pinned to the upstream daemon's formulae so the shim cannot silently drift),
@@ -486,7 +486,7 @@ src/pylumicube/
         font.py          # 5x7 ASCII bitmap font for scroll_text
         cli.py           # lumicube-run CLI
 
-tests/                   # offline pytest suite (718 tests)
+tests/                   # offline pytest suite (729 tests)
 scripts/
     ambient_clock.py     # the clock: dimming, chime, buttons, temp chart
     ambient_clock_config.py.example   # every setting it has
@@ -533,13 +533,14 @@ time (top), reboot (middle, `ALLOW_REBOOT`) and draw a CPU-temperature
 chart on the secondary LCD (bottom — press again, or any other button, to
 blank it). At the top of the hour it speaks the time *and* scrolls it;
 `HOURLY_ORDER` decides how the two share the moment — `speak-first` (default:
-the announcement first, then the ~13 s scroll), `scroll-first` (the old
-behaviour, where the "o'clock" arrived 13 s late), or `together`, which starts
-both at :00 over two connections. `together` sounds worse than it reads: a
-second client redrawing the matrix while the daemon streams audio starves the
-speech (measured: 6.84 s of speech took **31 s** with 154 inter-chunk gaps,
-against 6.89 s alone), because both are Python threads in one process and the
-display's byte-building holds the interpreter. The speaker volume is pinned on
+the announcement at :00, then the ~13 s scroll) or `scroll-first` (the old
+behaviour, where the "o'clock" arrived 13 s late). `together` is still accepted
+and now behaves as `speak-first`: the two cannot overlap at all. Scrolling while
+speaking starves the speech (measured: 6.84 s of speech took **31 s** with 154
+inter-chunk gaps, against 6.89 s alone) because both are Python threads in one
+process, so the daemon hands the display out to one owner at a time — the
+static clock is paused while it scrolls, and an announcement waits for a scroll
+to finish before it speaks (see `PROTOCOL.md` §9.10). The speaker volume is pinned on
 startup (`SPEAKER_VOLUME`), because the firmware powers up at full blast. Configuration goes in `scripts/ambient_clock_config.py`
 (copy the `.example`) or in any file passed as `--config`; run it with
 
@@ -583,7 +584,10 @@ the cube's buttons as event entities.
 Commands are plain payloads where that makes sense and JSON where they need
 options — `lumicube/speaker/say` takes `"hello"` or
 `{"text": ..., "language": "de", "volume": 60}`, and
-`lumicube/display/scroll` takes `{"text": ..., "speed": 1.0, "times": 5}`.
+`lumicube/display/scroll` takes `{"text": ..., "speed": 1.0, "times": 5}`. A
+scroll from Home Assistant waits for the clock's own scroll or announcement to
+finish (they share one media lock) and is dropped with a log line if it cannot
+have the matrix within 15 s, rather than interleaving frames with it.
 The *settable* values publish their state on the bare topic and take commands
 on `/set` (`speaker/volume/set`, `display/brightness/set`,
 `display/scroll/speed/set`, `display/scroll/times/set`,

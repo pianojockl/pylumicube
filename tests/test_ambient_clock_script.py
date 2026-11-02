@@ -615,37 +615,101 @@ def test_hourly_chime_ignores_other_minutes() -> None:
     assert cube.display.scrolls == []
 
 
-def test_together_starts_the_scroll_while_the_announcement_plays(monkeypatch) -> None:
-    """The default: the scroll must not delay the "o'clock" by ~13 s.
+def test_together_now_speaks_first(monkeypatch) -> None:
+    """"together" cannot overlap any more, so it means what "speak-first" means.
 
-    The scroll runs on its own thread, so the announcement can start at :00
-    and the scroll alongside it. The fake `say` waits for the scroll to have
-    started — a sequential chime would time out here.
+    A scroll and a stream share the daemon's media lock (running them at once
+    took 6.8 s of speech to 31 s of wall time), so starting both at :00 could
+    only ever delay the announcement by the length of the scroll — the bug
+    "together" was introduced to fix. It is still accepted, and logs why.
     """
     monkeypatch.setattr(clock, "HOURLY_ORDER", "together")
+    assert clock._normalise_order() == "speak-first"      # noqa: SLF001
+
     monkeypatch.setattr(clock, "HOURLY_SPEAK", True)
     monkeypatch.setattr(clock, "HOURLY_SCROLL", True)
-    scroll_started = threading.Event()
     order: list[str] = []
 
-    class OverlapDisplay(FakeDisplay):
+    class OrderedDisplay(FakeDisplay):
         def scroll_pixels(self, rows, *, speed=1.0, **kwargs):
-            scroll_started.set()
             order.append("scroll")
             super().scroll_pixels(rows, speed=speed, **kwargs)
 
-    class WaitingModule(FakeModule):
+        def scroll_text(self, text, colour=0xFFFFFF, speed=1.0, **kwargs):
+            order.append("scroll")
+            super().scroll_text(text, colour, speed, **kwargs)
+
+    class OrderedModule(FakeModule):
         def say(self, text, *, voice=None):
-            assert scroll_started.wait(timeout=2.0), "the scroll had not started"
             order.append("say")
             super().say(text, voice=voice)
 
-    cube = FakeCube({"speaker": WaitingModule()})
-    cube.display = OverlapDisplay()
+    cube = FakeCube({"speaker": OrderedModule()})
+    cube.display = OrderedDisplay()
     instance = clock.AmbientClock(cube, brightness=clock.build_curve())
     instance.hourly_chime(datetime.datetime(2026, 10, 23, 14, 0, 1))
-    assert order == ["scroll", "say"]
-    assert len(cube.display.scrolled_pixels) == 1
+    assert order == ["say", "scroll"]
+
+
+def test_the_static_clock_is_paused_while_it_scrolls() -> None:
+    """A scroll writes only what it changes, so a frame in the middle of one
+    is never painted over: the clock must not draw at all while scrolling."""
+    instance, cube, _curve = _clock()
+    seen: list[bool] = []
+
+    class WatchingDisplay(FakeDisplay):
+        def scroll_pixels(self, rows, *, speed=1.0, **kwargs):
+            seen.append(instance._scrolling)               # noqa: SLF001
+            cube.display.panels.clear()
+            assert instance.render(datetime.datetime(2026, 10, 23, 14, 0, 1),
+                                   1.0, force=True) is False
+            assert cube.display.panels == [], "the clock drew during a scroll"
+            super().scroll_pixels(rows, speed=speed, **kwargs)
+
+    cube.display = WatchingDisplay()
+    instance.scroll_time(datetime.datetime(2026, 10, 23, 14, 0, 1))
+    assert seen == [True], "the scroll did not mark the display as taken"
+    assert instance._scrolling is False                 # noqa: SLF001
+    assert instance.render(datetime.datetime(2026, 10, 23, 14, 0, 1),
+                           1.0) is True                 # and it draws again
+
+
+def test_a_scroll_drains_the_display_before_it_starts() -> None:
+    """The panels are written by a background thread: a frame still queued
+    when the scroll starts lands in the middle of it."""
+    instance, cube, _curve = _clock()
+    flushes_at_scroll: list[int] = []
+
+    class WatchingDisplay(FakeDisplay):
+        def scroll_pixels(self, rows, *, speed=1.0, **kwargs):
+            flushes_at_scroll.append(cube.display.flushes)
+            super().scroll_pixels(rows, speed=speed, **kwargs)
+
+    cube.display = WatchingDisplay()
+    instance.render(datetime.datetime(2026, 10, 23, 14, 0, 1), 1.0, force=True)
+    instance.scroll_time(datetime.datetime(2026, 10, 23, 14, 0, 1))
+    assert flushes_at_scroll == [1], "the display was not drained first"
+
+
+def test_the_scroll_is_one_request_when_the_daemon_offers_one() -> None:
+    """Through the daemon the whole animation is atomic, so nothing can be
+    drawn into it and an announcement waits for it instead of partitioning it."""
+    calls: list[tuple] = []
+
+    class AnimatingCube(FakeCube):
+        def animate(self, rows=None, *, speed=1.0, times=1, **kwargs):
+            calls.append((rows, speed, times))
+            return {"ok": True, "seconds": 0.0, "aborted": False}
+
+    cube = AnimatingCube()
+    instance = clock.AmbientClock(cube, brightness=clock.build_curve())
+    instance.render(datetime.datetime(2026, 10, 23, 14, 0, 1), 1.0, force=True)
+    instance.scroll_time(datetime.datetime(2026, 10, 23, 14, 0, 1))
+    assert len(calls) == 1
+    rows, speed, times = calls[0]
+    assert rows and speed == clock.SCROLL_SPEED and times == clock.SCROLL_TIMES
+    assert cube.display.scrolled_pixels == [], "it animated locally as well"
+    assert cube.display.flushes == 1, "the queued frame was not drained"
 
 
 def test_speak_first_announces_before_scrolling(monkeypatch) -> None:

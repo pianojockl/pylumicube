@@ -44,6 +44,24 @@ from .display import DEFAULT_SCROLL_TIMES, MAX_BRIGHTNESS
 
 log = logging.getLogger(__name__)
 
+
+class _Skipped(Exception):
+    """The daemon was busy; the command is dropped rather than queued."""
+
+
+class _Held:
+    """Context manager that releases the daemon's media lock."""
+
+    def __init__(self, lock: Any) -> None:
+        self._lock = lock
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc: object) -> bool:
+        self._lock.release()
+        return False
+
 #: The light sensor's analog readings move almost every tick, so they are
 #: throttled (see `MqttBridge._publish_state`). `within_proximity` is a flag
 #: and already change-gated, so it stays on the fast tick.
@@ -68,6 +86,12 @@ SCROLL_FRAME_TIMEOUT = 0.25
 #: the bridge publishes — and a single command can still override either.
 SCROLL_SPEED_DEFAULT = 1.5
 SCROLL_SPEED_RANGE = (0.25, 5.0)
+
+#: How long a bridge command waits for the display/speaker, which the daemon
+#: hands out one owner at a time (see `pylumicube.control`'s `media_lock`).
+#: Bounded because these run on the MQTT client's thread: dropping a command is
+#: better than stalling every other topic behind a 13 s scroll.
+MEDIA_WAIT = 15.0
 SCROLL_TIMES_RANGE = (1, 20)
 
 
@@ -202,19 +226,51 @@ class MqttBridge:
         the speaker. It used to hold the speaker's lock to keep the two apart
         (run together they starved each other: a 21-character message was
         still scrolling 90 s later while the announcement dropped every
-        chunk). The link's queue is ordered by frame class now, so speech is
-        served first on its own merits and the scroll simply takes longer —
-        which is the right trade, and it keeps an announcement from waiting
-        for a scroll to finish. The short frame timeout keeps a contended
-        scroll from retrying its way through the whole alphabet.
+        chunk).
+
+        Now it takes the daemon's *media* lock for the same span: a scroll and
+        a stream never overlap (measured, the overlap took 6.8 s of speech to
+        31 s of wall time), and the clock's animation takes that lock too, so
+        this scroll waits for it (up to `MEDIA_WAIT`) and is dropped rather
+        than interleaved with it — a scroll sends only the pixels it changes,
+        so a frame from another writer would stay on the matrix. The short
+        frame timeout keeps a contended scroll from retrying its way through
+        the whole alphabet.
 
         `times` multiplies all of that: five passes of a long sentence holds
         the link for half a minute, so the caller is told (the bridge logs
         the pair it is about to use) and the count is clamped.
         """
-        self.cube.display.scroll_text(text, colour, background, speed,
-                                      times=times,
-                                      timeout=SCROLL_FRAME_TIMEOUT)
+        try:
+            with self._media_slot("display/scroll"):
+                self.cube.display.scroll_text(text, colour, background, speed,
+                                              times=times,
+                                              timeout=SCROLL_FRAME_TIMEOUT)
+        except _Skipped:
+            return
+
+    def _media_slot(self, what: str):
+        """Hold the daemon's media lock, or skip the command.
+
+        A bridge handler runs on the MQTT client's thread: blocking it for the
+        length of a scroll (or of an announcement waiting for one) is worse
+        than dropping the command, so the wait is bounded and a failure is
+        logged.
+        """
+        server = getattr(self.daemon, "server", None)
+        lock = getattr(server, "media_lock", None)
+        if lock is None:
+            class _NoLock:
+                def __enter__(self) -> None:
+                    return None
+
+                def __exit__(self, *exc: object) -> bool:
+                    return False
+            return _NoLock()
+        if not lock.acquire(timeout=MEDIA_WAIT):
+            log.info("dropping %s: the display or the speaker is busy", what)
+            raise _Skipped()
+        return _Held(lock)
 
     def _command_topics(self) -> tuple[str, ...]:
         """The topics we listen on — commands only, never our own state.
@@ -339,7 +395,11 @@ class MqttBridge:
             return
 
         if suffix == "display/fill":
-            cube.display.fill(parse_colour(str(payload)))
+            try:
+                with self._media_slot("display/fill"):
+                    cube.display.fill(parse_colour(str(payload)))
+            except _Skipped:
+                pass
             return
 
         if suffix in ("display/scroll/speed/set", "display/scroll/speed"):

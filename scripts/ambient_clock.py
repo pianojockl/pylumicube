@@ -96,8 +96,10 @@ HOURLY_SPEAK = True        # ...and speak it, if a speaker is available
 #: audio first, so this is the GIL, not the ordering). Measured on the cube:
 #: 6.84 s of speech took 6.89 s alone against **31 s with the scroll running**,
 #: with 154 inter-chunk gaps over the 63 ms the firmware's buffer can cover —
-#: audibly chopped. "together" still starts both at :00 for anyone who wants
-#: to hear for themselves; "scroll-first" is what the clock used to do.
+#: audibly chopped. "scroll-first" is what the clock used to do; "together" is
+#: still accepted but behaves as "speak-first", because the daemon now gives the
+#: display to one owner at a time (see `pylumicube.control`), so the two cannot
+#: overlap at all.
 HOURLY_ORDER = "speak-first"
 SCROLL_SPEED = 0.7
 SCROLL_TIMES = DEFAULT_SCROLL_TIMES   # how many times the time scrolls past;
@@ -105,9 +107,6 @@ SCROLL_TIMES = DEFAULT_SCROLL_TIMES   # how many times the time scrolls past;
                                       # script re-scrolled for a whole minute)
 SCROLL_FONT = "digits"     # "digits" = the clock's own 3x5 glyphs;
                            # "firmware" = the built-in 5x7 font (taller)
-#: How long the hour chime waits for a background scroll to finish before
-#: carrying on with the clock (the scroll itself is ~13 s at the defaults).
-SCROLL_JOIN_TIMEOUT = 120.0
 SPEAKER_VOLUME = 100       # 0..200; the firmware powers up loud, so set it
 DISPLAY_BRIGHTNESS = 100   # the matrix's own brightness (0..100 — the firmware
                            # clamps there). It boots at 65, which multiplies
@@ -192,10 +191,21 @@ HOURLY_ORDERS = ("together", "speak-first", "scroll-first")
 
 
 def _normalise_order() -> str:
-    """Coerce `HOURLY_ORDER` to a known value, warning once about a typo."""
+    """Coerce `HOURLY_ORDER` to a known value, warning once about a typo.
+
+    "together" is accepted but maps to "speak-first": the two cannot overlap
+    any more (a scroll and a stream share the daemon's media lock, because
+    running them at once starved the audio — 6.8 s of speech took 31 s), so
+    the only thing "together" can now mean is "delay the o'clock until the
+    scroll finishes", which is the behaviour it was introduced to fix.
+    """
     global HOURLY_ORDER
     order = str(HOURLY_ORDER).strip().lower()
-    if order not in HOURLY_ORDERS:
+    if order == "together":
+        log.info("HOURLY_ORDER 'together' now speaks first: a scroll and an "
+                 "announcement cannot overlap")
+        order = "speak-first"
+    elif order not in HOURLY_ORDERS:
         log.warning("HOURLY_ORDER %r is not one of %s; using 'speak-first'",
                     HOURLY_ORDER, ", ".join(HOURLY_ORDERS))
         order = "speak-first"
@@ -356,6 +366,11 @@ class AmbientClock:
         self.cube = cube
         self.curve = brightness
         self._rendered: tuple[str, str, int] | None = None
+        #: Set while a scroll owns the matrix. `render` returns early then: a
+        #: scroll sends only the pixels it changes, so a static frame landing
+        #: in the middle of one is never painted over, and the digits would sit
+        #: on top of the animation until it ended.
+        self._scrolling = False
         self._last_counts: dict[str, int] = {}
         self._last_hour_chime: int | None = None
         self._last_raw: int | None = None
@@ -458,7 +473,15 @@ class AmbientClock:
 
     def render(self, now: datetime.datetime, brightness: float,
                *, force: bool = False) -> bool:
-        """Draw the current time. Returns True if anything was written."""
+        """Draw the current time. Returns True if anything was written.
+
+        Does nothing while a scroll owns the matrix (see `_scrolling`): the
+        animation writes only what it changes, so a static frame in the middle
+        of one would stay on top of it. The next pass redraws in any case,
+        because `scroll_time` forgets what was rendered.
+        """
+        if self._scrolling:
+            return False
         hours = now.strftime("%H")
         minutes = now.strftime("%M")
         quantised = int(brightness * 100)
@@ -479,20 +502,40 @@ class AmbientClock:
     def scroll_time(self, now: datetime.datetime, *, display=None) -> None:
         """Send the time scrolling past. `display` defaults to the cube's.
 
-        The hour chime passes its own connection's display, so the scroll can
-        run while the announcement is playing.
+        The static clock is *paused* for the duration (`_scrolling`), and any
+        frame still in flight from the last render is drained first: those come
+        from the display's background writer, so without the flush one can land
+        in the middle of the animation.
+
+        Through the daemon this is one request (`cube.animate`), which the
+        daemon runs under its media lock — nothing else can draw into it, and
+        an announcement waits for it rather than chopping it up. Connected
+        straight to the serial port there is no daemon to arbitrate, so it
+        animates locally.
         """
         display = self.cube.display if display is None else display
         colour = scale_colour(hsv_colour(0.25, 1.0, 1.0), self.brightness())
-        if SCROLL_FONT == "firmware":
-            display.scroll_text(now.strftime("%H:%M"), colour,
-                                speed=SCROLL_SPEED,
-                                times=SCROLL_TIMES)
-        else:
-            display.scroll_pixels(
-                render_scroll_rows(now.strftime("%H:%M"), colour),
-                speed=SCROLL_SPEED, times=SCROLL_TIMES)
-        self._rendered = None      # the scroll overwrote the digits
+        rows = render_scroll_rows(now.strftime("%H:%M"), colour)
+        animate = getattr(self.cube, "animate", None)
+        self._scrolling = True
+        try:
+            try:
+                display.flush(timeout=2.0)
+            except Exception:  # noqa: BLE001 — cosmetic; never skip the scroll
+                log.debug("could not drain the display before scrolling",
+                          exc_info=True)
+            if animate is not None and display is self.cube.display:
+                animate(rows, speed=SCROLL_SPEED, times=SCROLL_TIMES)
+            elif SCROLL_FONT == "firmware":
+                display.scroll_text(now.strftime("%H:%M"), colour,
+                                    speed=SCROLL_SPEED,
+                                    times=SCROLL_TIMES)
+            else:
+                display.scroll_pixels(rows, speed=SCROLL_SPEED,
+                                      times=SCROLL_TIMES)
+        finally:
+            self._scrolling = False
+            self._rendered = None      # the scroll overwrote the digits
 
     def say(self, text: str) -> None:
         """Speak `text` if a speaker is available (else log and move on).
@@ -663,9 +706,13 @@ class AmbientClock:
         """Speak (and/or scroll) the time once, at the top of the hour.
 
         The scroll takes ~13 s, so doing it first made the "o'clock" arrive
-        late — the announcement is what belongs at :00. `HOURLY_ORDER` picks:
-        "together" (both start now, the scroll on its own connection),
-        "speak-first", or "scroll-first" (what the clock used to do).
+        late — the announcement is what belongs at :00. `HOURLY_ORDER` picks
+        "speak-first" (the default), "scroll-first" (what the clock used to
+        do), or "together", which is normalised to "speak-first": the two
+        cannot run at once anyway (a scroll and a stream share the daemon's
+        media lock, and overlapping them took 6.8 s of speech to 31 s of wall
+        time), so "together" would only delay the announcement by the length
+        of the scroll.
         """
         if now.minute != 0 or now.hour == self._last_hour_chime:
             return
@@ -675,73 +722,16 @@ class AmbientClock:
         if not (speak or scroll):
             return
         phrase = CHIME_PHRASE.format(hour=HOUR_WORDS[now.hour % 12])
-        order = str(HOURLY_ORDER).lower()
-        if order == "scroll-first" or not speak:
-            if scroll:
-                self.scroll_time(now)
+        order = _normalise_order()
+        if order == "scroll-first" and scroll:
+            self.scroll_time(now)
             if speak:
                 self.say(phrase)
             return
-        if order != "together" or not scroll:
-            if speak:
-                self.say(phrase)
-            if scroll:
-                self.scroll_time(now)
-            return
-        thread = self._scroll_in_background(now)
-        try:
-            self.say(phrase)
-        finally:
-            if thread is not None:
-                thread.join(timeout=SCROLL_JOIN_TIMEOUT)
-                if thread.is_alive():
-                    log.warning("the hourly scroll is still running after %.0fs",
-                                SCROLL_JOIN_TIMEOUT)
-
-    def _scroll_in_background(self, now: datetime.datetime):
-        """Start the hourly scroll on its own connection; return its thread.
-
-        A second connection is what makes the overlap real: the daemon serves
-        one client's requests in order, so a scroll issued on *this* client
-        would simply queue behind the announcement. The announcement never has
-        to wait for the scroll, and the link's queue keeps audio ahead of the
-        display frames anyway.
-
-        Returns None when no second connection can be made (the scroll then
-        does not happen at all — the announcement matters more, and the next
-        top of the hour is only an hour away).
-        """
-        target = self.cube
-        client = None
-        path = None if isinstance(target, LumiCube) else getattr(target, "path", None)
-        if path is not None:
-            # A daemon client: the server serves one connection's requests in
-            # order, so the scroll needs its own connection to overlap.
-            try:
-                from pylumicube.client import CubeClient
-                client = CubeClient(path)
-            except Exception:  # noqa: BLE001 — fall back to no scroll
-                log.warning("could not open a second connection for the "
-                            "hourly scroll; skipping it", exc_info=True)
-                return None
-            target = client
-
-        def worker() -> None:
-            try:
-                self.scroll_time(now, display=target.display)
-            except Exception:  # noqa: BLE001 — the clock must keep running
-                log.warning("the hourly scroll failed", exc_info=True)
-            finally:
-                if client is not None:
-                    try:
-                        client.close()
-                    except Exception:  # noqa: BLE001 — best effort
-                        log.debug("closing the scroll's connection failed",
-                                  exc_info=True)
-
-        thread = threading.Thread(target=worker, name="hourly-scroll", daemon=True)
-        thread.start()
-        return thread
+        if speak:
+            self.say(phrase)            # at :00, before anything takes the time
+        if scroll:
+            self.scroll_time(now)
 
 
 def _open_light_log(path: str | None = None):

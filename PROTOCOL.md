@@ -1376,7 +1376,7 @@ the highest rate this link demonstrably feeds. If the firmware's frame service
 is ever fixed, 32000 becomes worth re-testing — `--speaker-rate 32000` is the
 whole experiment.
 
-#### What competes with the audio
+#### What competes with the audio: one owner at a time
 
 The queue orders frames audio → control → display (§9.2), so a display frame
 never jumps ahead of an audio frame. That is not enough, because the frames are
@@ -1390,14 +1390,47 @@ filling the matrix at ~12 fps (a scroll) while the daemon spoke one sentence:
 | idle | 6.89 s | 0 |
 | scrolling (~12 matrix writes/s) | **30.99 s** | **154** |
 
-The sound follows: 154 holes the firmware's buffer cannot cover is the audible
-stutter. So the clock's hourly chime speaks *first* and scrolls afterwards
-(`HOURLY_ORDER = "speak-first"`); its `together` mode does both at :00 and is
-the one to avoid. A general fix would be to make display writes cheaper
-(build the flat dictionary once and reuse it) or to defer them while a stream
-is active — neither is done.
+154 holes the firmware's buffer cannot cover is the audible stutter, so the
+daemon does not let the two run together. `ControlServer` has a **media lock**
+(`media_lock`) held for a whole utterance *or* a whole animation; every
+`say`/`tone`/`play`/`animate` takes it first, and the order is always
+`media_lock` → `write_lock`, so there is no cycle.
 
-Two related rough edges, for the record: a client that is killed mid-utterance
-leaves the daemon streaming to completion, so the next announcement waits for
-it (up to tens of seconds) and, if it overlaps, both sound bad; `stop_audio`
-clears it.
+- **An animation is one request.** The `animate` op takes `rows` (an 8-row
+  bitmap, one colour per column) or `text` (firmware font), plus `colour`,
+  `speed`, `times`, `with_gap`, `max_seconds` (hard bound, default 90 s) and
+  `timeout`; the daemon runs the scroll itself under both locks and replies
+  `{seconds, aborted, aborted_by}`. Frame-by-frame from a client can never be
+  safe: every frame is its own request, so another writer can land between two
+  of them — and a scroll sends only the pixels it *changes*, so the intruder's
+  frame is never painted over. It sits on the matrix until the animation ends,
+  which is exactly "the clock's digits showing through the scroll".
+- **A frame waits, or is refused.** `write` / `frame` / `run` take
+  `write_lock` with a 250 ms grace (`FRAME_WAIT_FOR_ANIMATION`) and fail with
+  `code: "busy"` while an animation holds it. The clock does not even try: it
+  sets `_scrolling`, `render()` returns early, and the next pass repaints (see
+  `scripts/ambient_clock.py`). It also drains the display (`flush`) before
+  starting, because the panels are written by a background thread — one queued
+  frame is enough to spoil the animation.
+- **The voice wins ties, but waits its turn.** An announcement waits up to
+  `AUDIO_WAIT_FOR_DISPLAY` (20 s: longer than a ~13 s scroll, shorter than
+  anything wedged). If the animation is *still* running it is cut short —
+  `should_stop` is polled once per frame, and the animation still sends its
+  final full frame — and the announcement proceeds. An announcement is never
+  dropped and never overlapped.
+- **The MQTT bridge plays by the same rules.** `display/scroll` and
+  `display/fill` take the media lock too (they used to animate in-process with
+  no lock at all, so a Home Assistant scroll and the clock's scroll could
+  interleave). It waits up to `MEDIA_WAIT` (15 s) and drops the command with a
+  log line rather than stalling the MQTT client thread.
+
+Two consequences worth knowing. `HOURLY_ORDER = "together"` no longer starts
+both at :00 — with the strict rule it could only delay the announcement by the
+length of the scroll, so it is normalised to `speak-first`. And an announcement
+that arrives during a long scroll waits for it: `stats` → `media`
+(`animating`, `animating_for`, `audio_busy`) says who holds the stage, so a
+caller can look before it blocks.
+
+One rough edge remains, for the record: a client killed mid-utterance leaves the
+daemon streaming to completion, so the next announcement waits for it (up to
+tens of seconds); `stop_audio` clears it.

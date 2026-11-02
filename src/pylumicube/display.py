@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Optional
 
@@ -297,7 +297,8 @@ class Display:
     def scroll_text(self, text: str, colour: int = 0xFFFFFF,
                     background_colour: int = 0x000000, speed: float = 1.0,
                     with_gap: bool = True, *, times: int = 1,
-                    timeout: float = 2.0) -> None:
+                    timeout: float = 2.0,
+                    should_stop: Optional[Callable[[], bool]] = None) -> bool:
         """Scroll ``text`` across the 16x8 LED area (blocking), ``times`` over.
 
         Renders with the built-in 5x7 font (`pylumicube.font`) — upstream
@@ -314,19 +315,21 @@ class Display:
         """
         glyph_rows = font.render_text(text)
         if not glyph_rows or not glyph_rows[0]:
-            return
+            return True
         blank_row = [0] * len(glyph_rows[0])
         rows = [blank_row] + [[colour if pixel else 0 for pixel in row]
                               for row in glyph_rows]
-        self.scroll_pixels(rows, speed=speed, with_gap=with_gap,
-                           background_colour=background_colour, times=times,
-                           timeout=timeout)
+        return self.scroll_pixels(rows, speed=speed, with_gap=with_gap,
+                                  background_colour=background_colour,
+                                  times=times, timeout=timeout,
+                                  should_stop=should_stop)
 
     def scroll_pixels(self, rows: Sequence[Sequence[int]], *,
                       speed: float = 1.0, with_gap: bool = True,
                       background_colour: int = 0x000000,
                       times: int = 1,
-                      timeout: float = 2.0) -> None:
+                      timeout: float = 2.0,
+                      should_stop: Optional[Callable[[], bool]] = None) -> bool:
         """Scroll a pre-rendered bitmap across the 16x8 LED area (blocking).
 
         ``rows`` is up to 8 rows of colours, top row first, one entry per
@@ -352,27 +355,45 @@ class Display:
         Repeating costs real time on the serial link: the scroll holds it
         for ``times`` passes, and the clock's frames and the light-sensor
         telemetry time out meanwhile. Five passes of "16:00" is about 19 s.
+
+        ``should_stop`` is polled once per frame: when it returns True the
+        animation gives up its remaining passes and returns False (it still
+        sends its final full frame, so the matrix is left in a known state).
+        That is how an announcement takes the display back
+        (`pylumicube.control`), and how a hung animation is bounded.
+
+        Returns True when every pass ran, False when it was cut short.
         """
         width = max((len(row) for row in rows), default=0)
         if width == 0:
-            return
+            return True
         pad = 16
         padded = [list(row) + [0] * (width - len(row)) for row in rows]
         padded = [[0] * pad + row + [0] * pad for row in padded]
         total = width + pad * 2
         period = 0.05 / max(speed, 0.0001)
         for _ in range(max(1, int(times))):
-            self._scroll_pass(padded, total, period, with_gap,
-                              background_colour, timeout)
+            if not self._scroll_pass(padded, total, period, with_gap,
+                                     background_colour, timeout, should_stop):
+                return False
+        return True
 
     def _scroll_pass(self, padded: Sequence[Sequence[int]], total: int,
                      period: float, with_gap: bool, background_colour: int,
-                     timeout: float) -> None:
-        """One pass of `scroll_pixels`: in from the right, out to the left."""
+                     timeout: float,
+                     should_stop: Optional[Callable[[], bool]] = None) -> bool:
+        """One pass of `scroll_pixels`: in from the right, out to the left.
+
+        Returns False when `should_stop` cut it short.
+        """
         inflight: list[Future] = []
         previous: dict[tuple[int, int], int] = {}
         current: dict[tuple[int, int], int] = {}
+        stopped = False
         for shift in range(total - 15):
+            if should_stop is not None and should_stop():
+                stopped = True
+                break
             frame_start = time.monotonic()
             values: dict[int, int] = {}
             current = {}
@@ -414,6 +435,7 @@ class Display:
             final[SHOW_KEY] = 1
             self._send_set_fields(final, timeout)
         self.flush(timeout=timeout)
+        return not stopped
 
     def _drain_one(self, future: Future, timeout: float) -> None:
         try:
@@ -503,11 +525,20 @@ class Display:
         if prev is not None:
             try:
                 prev.result()
-            except Exception:  # noqa: BLE001
+            except Exception as error:  # noqa: BLE001
                 # Log but don't propagate: the failure belonged to a frame
                 # the caller already moved on from. The next call's result
                 # is what they care about.
-                log.warning("previous async display write failed", exc_info=True)
+                #
+                # `busy` is not a fault: the daemon hands the display to one
+                # owner at a time, so an animation elsewhere refuses this
+                # frame on purpose (`pylumicube.control`). A traceback per
+                # refused frame would drown the log during a scroll.
+                if getattr(error, "code", None) == "busy":
+                    log.debug("display frame refused: an animation has it")
+                else:
+                    log.warning("previous async display write failed",
+                                exc_info=True)
 
         fut = executor.submit(self._send_set_fields, values, timeout)
         with self._lock:

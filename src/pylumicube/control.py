@@ -31,7 +31,8 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -140,6 +141,21 @@ def _b64decode(text: str) -> bytes:
     return base64.b64decode(text.encode("ascii"))
 
 
+#: How long an announcement waits for a running animation before it takes the
+#: display back. A scroll is ~13 s at the defaults; anything longer means the
+#: animation is wedged, and an announcement is the time-sensitive one.
+AUDIO_WAIT_FOR_DISPLAY = 20.0
+
+#: How long a single frame write waits for a running animation. Long enough for
+#: an in-flight frame to land, short enough that a caller retries rather than
+#: blocking its own connection for the length of a scroll.
+FRAME_WAIT_FOR_ANIMATION = 0.25
+
+#: Hard bound on one animation, so a wedged scroll cannot sit on the media lock
+#: forever. `SCROLL_TIMES` can be raised to 20, which is ~76 s at the defaults.
+MAX_ANIMATION_SECONDS = 90.0
+
+
 def _audio_stats(cube: Any) -> dict[str, Any]:
     """Report the speech path's counters, so smoothness stays checkable.
 
@@ -238,13 +254,27 @@ class ControlServer:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._connections: set[_Connection] = set()
-        #: Serialises writes that must not interleave (a scroll animation and
-        #: a frame update from another client).
+        #: Serialises display *frames*. Anyone writing the matrix holds it for
+        #: one request, so two clients cannot interleave half a frame each.
         self.write_lock = threading.RLock()
-        #: Held for a whole utterance, so two clients cannot talk over each
-        #: other — and deliberately *not* the write lock, so a three-second
-        #: announcement does not stall the clock's display updates.
-        self.audio_lock = threading.RLock()
+        #: Held for a whole utterance **or** a whole animation — never both at
+        #: once, which is the point: scrolling while the speaker plays starves
+        #: the audio (measured: 6.8 s of speech took 31 s with a scroll
+        #: running), so the two queue behind each other instead.
+        #:
+        #: Deliberately not the same lock as `write_lock` for audio: an
+        #: announcement must not stall a single frame write, and a frame write
+        #: must not wait out a three-second utterance.
+        self.media_lock = threading.RLock()
+        #: Set while an animation runs, so an announcement can cut it short
+        #: (`_run_audio`) and `stats` can say what is going on.
+        self._animating = threading.Event()
+        self._animation_stop = threading.Event()
+        self._animation_started = 0.0
+        #: Set while an utterance holds the media lock. An Event rather than
+        #: asking the lock: `RLock.locked()` only arrived in Python 3.14 and
+        #: the cube runs 3.11.
+        self._audio_busy = threading.Event()
         self._audio_stopped = threading.Event()
         self._last_audio_op = 0.0
         self._started = time.time()
@@ -517,7 +547,7 @@ class ControlServer:
             values = request.get("values") or {}
             if not isinstance(values, Mapping):
                 raise ControlError("values must be an object", code="bad_request")
-            with self.write_lock:
+            with self._frame_slot():
                 cube.write_named(module, values,
                                  timeout=float(request.get("timeout", 2.0)),
                                  await_response=bool(request.get("await_response", True)),
@@ -555,13 +585,13 @@ class ControlServer:
                 self._last_audio_op = now
                 if self._audio_stopped.is_set():
                     return {"ok": True, "dropped": True}
-                with self.audio_lock:
+                with self.media_lock:
                     cube.write_run(module, field, samples,
                                    timeout=float(request.get("timeout", 2.0)),
                                    await_response=bool(request.get("await_response", True)),
                                    wait=bool(request.get("wait", True)))
                 return {"ok": True}
-            with self.write_lock:
+            with self._frame_slot():
                 cube.write_run(module, field, samples,
                                timeout=float(request.get("timeout", 2.0)),
                                await_response=bool(request.get("await_response", True)),
@@ -569,7 +599,7 @@ class ControlServer:
             return {"ok": True}
 
         if op == "frame":
-            with self.write_lock:
+            with self._frame_slot():
                 future = cube.transport.send_request(
                     dest_id=int(request["dest_id"]),
                     type_id=int(request["type_id"]),
@@ -630,6 +660,9 @@ class ControlServer:
             return {"ok": True, "dropped": report.get("dropped", 0),
                     "stream": report}
 
+        if op == "animate":
+            return self._animate(request)
+
         if op == "stop_audio":
             self._audio_stopped.set()
             try:
@@ -646,6 +679,12 @@ class ControlServer:
                        "telemetry": telemetry.stats() if hasattr(telemetry, "stats") else {},
                        "subscriptions": sorted(connection.subscriptions)}
             payload["audio"] = _audio_stats(cube)
+            payload["media"] = {
+                "animating": self._animating.is_set(),
+                "animating_for": (round(time.monotonic() - self._animation_started, 1)
+                                  if self._animating.is_set() else 0.0),
+                "audio_busy": self._audio_busy.is_set(),
+            }
             payload["link"] = (cube.link_stats()
                                if hasattr(cube, "link_stats") else {})
             return payload
@@ -655,26 +694,125 @@ class ControlServer:
 
         raise ControlError(f"unknown op {op!r}", code="no_op")
 
+    @contextmanager
+    def _frame_slot(self) -> Iterator[None]:
+        """Take the display for one frame, or refuse with `busy`.
+
+        An animation holds `write_lock` for its whole run (see `_animate`),
+        and it writes *deltas*: a frame from another client landing in the
+        middle of one is not repaired by the rest of the animation, so the
+        caller at fault is the one that has to wait. Half a second is long
+        enough for an in-flight frame to land and short enough that a caller
+        retries rather than pinning its connection for the length of a scroll.
+        """
+        if not self.write_lock.acquire(timeout=FRAME_WAIT_FOR_ANIMATION):
+            raise ControlError("the display is animating", code="busy")
+        try:
+            yield
+        finally:
+            self.write_lock.release()
+
     # ---------------- audio + tuning helpers ----------------
 
     def _run_audio(self, function: Any) -> dict[str, Any]:
-        """Run one audio op under the speaker lock; return its stream report.
+        """Run one audio op with the speaker to itself; return its stream report.
 
         Everything that talks to the speaker goes through here, so a caller
         gets the timing of *its own* stream back (and never another client's):
         the speaker keeps the last report, and this delta-checks the counters
         around it.
+
+        An animation holds `media_lock` for its whole run, so an announcement
+        waits for a scroll to finish rather than chopping it up — measured, a
+        scroll running alongside speech took 6.8 s of audio to 31 s of wall
+        time. If the animation is still going after `AUDIO_WAIT_FOR_DISPLAY`
+        it is cut short instead: the announcement is the time-sensitive one,
+        and the scroll has a final frame of its own.
         """
         speaker = getattr(self.cube, "speaker", None)
         dropped_before = getattr(speaker, "dropped_chunks", 0)
         streams_before = getattr(speaker, "stream_count", 0)
-        with self.audio_lock:
+        if not self.media_lock.acquire(timeout=AUDIO_WAIT_FOR_DISPLAY):
+            log.warning("the display is still animating after %.0f s; cutting "
+                        "it short for an announcement", AUDIO_WAIT_FOR_DISPLAY)
+            self._animation_stop.set()
+            if not self.media_lock.acquire(timeout=5.0):
+                raise ControlError("the display is busy", code="busy")
+        self._audio_busy.set()
+        try:
             function()
+        finally:
+            self._audio_busy.clear()
+            self.media_lock.release()
         report = getattr(speaker, "last_stream", None)
         payload = report.as_dict() if report is not None else {}
         if getattr(speaker, "stream_count", 0) != streams_before:
             payload["dropped"] = getattr(speaker, "dropped_chunks", 0) - dropped_before
         return payload
+
+    def _animate(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Run one scroll to completion with the display to itself.
+
+        This is what makes an animation atomic. Doing it frame by frame from a
+        client cannot work: the frames are separate requests, so any other
+        writer can land between them, and because a scroll sends only the
+        pixels it changes, a stray frame is not painted over — it stays on the
+        matrix until the animation ends. The daemon therefore runs the whole
+        thing under `write_lock` (so other writers get `busy`) and
+        `media_lock` (so an announcement cannot overlap it), and returns what
+        it did.
+        """
+        rows = request.get("rows")
+        text = request.get("text")
+        if not rows and not text:
+            raise ControlError("rows or text is required", code="bad_request")
+        display = getattr(self.cube, "display", None)
+        if display is None:
+            raise ControlError("this cube has no display", code="no_display")
+        colour = int(request.get("colour", 0xFFFFFF)) & 0xFFFFFF
+        background = int(request.get("background_colour", 0)) & 0xFFFFFF
+        speed = float(request.get("speed", 1.0))
+        times = max(1, int(request.get("times", 1)))
+        with_gap = bool(request.get("with_gap", True))
+        timeout = float(request.get("frame_timeout",
+                                   request.get("timeout", 2.0)))
+        budget = min(float(request.get("max_seconds", MAX_ANIMATION_SECONDS)),
+                     MAX_ANIMATION_SECONDS)
+
+        started = time.monotonic()
+        deadline = started + budget
+        self._animation_stop.clear()
+        if not self.media_lock.acquire(timeout=budget):
+            raise ControlError("the speaker is still playing", code="busy")
+        self._animating.set()
+        self._animation_started = started
+        aborted = False
+        try:
+            def should_stop() -> bool:
+                return (self._animation_stop.is_set()
+                        or time.monotonic() > deadline)
+
+            with self.write_lock:
+                if text:
+                    completed = display.scroll_text(
+                        str(text), colour, background, speed, with_gap,
+                        times=times, timeout=timeout, should_stop=should_stop)
+                else:
+                    completed = display.scroll_pixels(
+                        [[int(pixel) for pixel in row] for row in rows],
+                        speed=speed, with_gap=with_gap,
+                        background_colour=background, times=times,
+                        timeout=timeout, should_stop=should_stop)
+            aborted = not completed
+        finally:
+            self._animating.clear()
+            self.media_lock.release()
+        seconds = round(time.monotonic() - started, 2)
+        if aborted:
+            log.info("animation cut short after %.1f s", seconds)
+        return {"ok": True, "seconds": seconds, "aborted": aborted,
+                "aborted_by": ("audio" if self._animation_stop.is_set()
+                               else "deadline" if aborted else None)}
 
     def _config_view(self) -> dict[str, Any]:
         """Current values of the live-tunable knobs (see ``op == "config"``)."""

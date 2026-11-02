@@ -45,7 +45,7 @@ Every name is optional. The ones worth knowing about:
 | `ADAPT`, `LOW`, `HIGH` | auto-range the dimming curve, or pin the light range |
 | `BRIGHTNESS_MIN` | floor in a dark room — `0.02` is a barely-visible glow |
 | `SPEAKER_VOLUME` | 0..200; the firmware powers up at full blast |
-| `HOURLY_ORDER` | `speak-first` (default: the announcement, then the scroll), `scroll-first`, or `together` (both at :00 — scrolling while speaking starves the speech, `PROTOCOL.md` §9.10) |
+| `HOURLY_ORDER` | `speak-first` (default: the announcement at :00, then the scroll) or `scroll-first` (what it used to do). `together` is accepted and behaves as `speak-first`: the daemon gives the display and the speaker to one owner at a time (`PROTOCOL.md` §9.10) |
 | `SCROLL_TIMES`, `SCROLL_SPEED` | how many times the time scrolls past at the top of the hour and on the top button (5 is ~19 s; the old script scrolled for a whole minute), and how fast |
 | `ALLOW_REBOOT` | whether the middle button reboots the Pi |
 | `TEMP_SAMPLE_SECONDS`, `TEMP_HISTORY` | CPU-temperature chart on the LCD |
@@ -127,6 +127,12 @@ Commands are plain payloads where that makes sense:
 | `lumicube/display/scroll/speed/set` | 0.25..5 (state on `lumicube/display/scroll/speed`) — how fast, default 1.5 |
 | `lumicube/display/scroll/times/set` | 1..20 (state on `lumicube/display/scroll/times`) — how many times the message travels past, default 5 |
 | `lumicube/display/brightness/set` | 0..100 (state on `lumicube/display/brightness`) — the LED matrix's global level, which the firmware clamps to 100 |
+
+An announcement that arrives while a scroll is running waits for it (up to 20 s,
+after which the scroll is cut short), and a scroll requested during an
+announcement waits the same way: the two never overlap, because running them
+together took 6.8 s of speech to 31 s. A scroll that cannot have the matrix
+within 15 s is dropped with a log line rather than interleaved.
 
 `lumicube/display/scroll` holds the serial link for the whole scroll (one frame
 per column, and the firmware services one request at a time), so with the

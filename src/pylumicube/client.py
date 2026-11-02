@@ -19,7 +19,7 @@ import contextlib
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future
 from typing import Any
 
@@ -478,6 +478,36 @@ class CubeClient:
         if profile is not None:
             fields["profile"] = profile
         return self.control.request("play", timeout=600.0, **fields)
+
+    def animate(self, rows: Sequence[Sequence[int]] | None = None, *,
+                text: str | None = None, colour: int = 0xFFFFFF,
+                background_colour: int = 0, speed: float = 1.0,
+                times: int = 1, with_gap: bool = True,
+                max_seconds: float = 90.0,
+                frame_timeout: float = 2.0) -> dict[str, Any]:
+        """Scroll on the daemon's matrix, with the display to itself.
+
+        The daemon runs the whole animation under its media lock, so no other
+        client can draw into it and an announcement cannot overlap it — a
+        scroll sends only the pixels it changes, so a frame from elsewhere is
+        not painted over and stays on the matrix until the scroll ends.
+
+        `rows` is an 8-row bitmap (one colour per column, 0 = background);
+        `text` uses the firmware font instead. Returns the daemon's report:
+        ``{seconds, aborted, aborted_by}``.
+        """
+        if not rows and not text:
+            raise ValueError("rows or text is required")
+        fields: dict[str, Any] = {
+            "colour": colour, "background_colour": background_colour,
+            "speed": speed, "times": times, "with_gap": with_gap,
+            "max_seconds": max_seconds, "frame_timeout": frame_timeout}
+        if text:
+            fields["text"] = text
+        else:
+            fields["rows"] = [[int(pixel) for pixel in row] for row in rows or []]
+        return self.control.request("animate",
+                                    timeout=max_seconds + 30.0, **fields)
 
     def configure(self, **values: Any) -> dict[str, Any]:
         """Read or change the daemon's live tuning (see `op == "config"`).

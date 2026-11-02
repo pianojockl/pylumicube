@@ -116,6 +116,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not even restart.
 
 ### Fixed
+- **The display has one owner at a time, and never during speech.** The matrix
+  was shared by whoever asked: the clock's static face could appear *through* a
+  scroll (a scroll writes only the pixels it changes, so the intruder's frame
+  is never painted over and stays until the animation ends), and two scrolls
+  could interleave. `ControlServer` now has a **media lock** held for a whole
+  utterance or a whole animation, and a new **`animate` op** runs a scroll to
+  completion under it — one request instead of ~250, so nothing can land
+  between two frames. Frame writes take the display with a 250 ms grace and
+  fail with `code: "busy"` while an animation owns it; the MQTT bridge's
+  `display/scroll` and `display/fill` take the same lock (they took none, so a
+  Home Assistant scroll could interleave with the clock's). `stats` grew
+  `media` (`animating`, `animating_for`, `audio_busy`).
+- **An announcement waits for a scroll instead of talking over it.** Running
+  the two together starved the audio (6.84 s of speech took 30.99 s with 154
+  inter-chunk gaps), so `say`/`tone`/`play` take the media lock too, waiting up
+  to 20 s; past that the *scroll* is cut short (`should_stop`, polled once per
+  frame) and the announcement proceeds — audio is never dropped and never
+  overlapped. The clock pauses its static display while it scrolls, drains any
+  frame still queued by the display's background writer before starting, and
+  repaints afterwards. `HOURLY_ORDER = "together"` is normalised to
+  `speak-first`: with the strict rule it could only delay the announcement by
+  the length of the scroll, which is the bug it was introduced to fix.
 - **The chime speaks first now, because scrolling starves the speech.** The
   frame queue already puts audio ahead of display traffic, but the frames are
   built by Python threads in one process: a second connection redrawing the
